@@ -1,0 +1,204 @@
+import {
+  Color,
+  DoubleSide,
+  MeshStandardMaterial,
+  type WebGLProgramParametersWithUniforms,
+} from 'three';
+
+/** 表示モードを切り替えるための共有 uniform。 */
+export const viewUniforms = {
+  /** 1 で診断表示 (勾配・曲率の色分け) を有効にする。 */
+  uDiagnostics: { value: 0 },
+  /** 地形の等高線の間隔 [m]。0 で非表示。 */
+  uContour: { value: 10 },
+  /** 1 で地形を傾斜のヒートマップにする。 */
+  uSlopeHeat: { value: 0 },
+};
+
+/**
+ * 診断表示 (勾配・曲率) を注入したマテリアルを作る。
+ *
+ * 各頂点の `diag` は (勾配の規格比, 曲率の規格比)。1 を超えると規格超過なので
+ * 緑 → 黄 → 赤へ変化させる。
+ */
+export function createSurfaceMaterial(options?: {
+  transparent?: boolean;
+  opacity?: number;
+  depthWrite?: boolean;
+  polygonOffsetUnits?: number;
+  side?: typeof DoubleSide | undefined;
+}): MeshStandardMaterial {
+  const material = new MeshStandardMaterial({
+    vertexColors: true,
+    roughness: 0.94,
+    metalness: 0.0,
+    transparent: options?.transparent ?? false,
+    opacity: options?.opacity ?? 1,
+    depthWrite: options?.depthWrite ?? true,
+    polygonOffset: true,
+    polygonOffsetFactor: -1,
+    polygonOffsetUnits: options?.polygonOffsetUnits ?? -2,
+    side: options?.side ?? undefined,
+  });
+
+  material.onBeforeCompile = (shader: WebGLProgramParametersWithUniforms) => {
+    shader.uniforms.uDiagnostics = viewUniforms.uDiagnostics;
+    shader.vertexShader = shader.vertexShader
+      .replace(
+        '#include <common>',
+        `#include <common>
+attribute vec2 diag;
+varying vec2 vDiag;`,
+      )
+      .replace(
+        '#include <begin_vertex>',
+        `#include <begin_vertex>
+vDiag = diag;`,
+      );
+    shader.fragmentShader = shader.fragmentShader
+      .replace(
+        '#include <common>',
+        `#include <common>
+uniform float uDiagnostics;
+varying vec2 vDiag;
+
+vec3 riskColor(float risk) {
+  // 0 = 余裕, 1 = 規格ちょうど, 1.4 以上 = 大幅超過。
+  vec3 ok = vec3(0.24, 0.72, 0.36);
+  vec3 warn = vec3(0.95, 0.79, 0.20);
+  vec3 bad = vec3(0.90, 0.22, 0.18);
+  if (risk < 0.75) return mix(ok, warn, risk / 0.75);
+  return mix(warn, bad, clamp((risk - 0.75) / 0.45, 0.0, 1.0));
+}`,
+      )
+      .replace(
+        '#include <dithering_fragment>',
+        `#include <dithering_fragment>
+if (uDiagnostics > 0.5) {
+  float risk = max(vDiag.x, vDiag.y);
+  gl_FragColor.rgb = mix(gl_FragColor.rgb, riskColor(risk), 0.82);
+}`,
+      );
+  };
+  material.customProgramCacheKey = () => 'surface-diag';
+  return material;
+}
+
+/**
+ * 地形マテリアル。傾斜による色分け、標高による色味、等高線を入れる。
+ */
+export function createTerrainMaterial(): MeshStandardMaterial {
+  const material = new MeshStandardMaterial({
+    color: new Color(1, 1, 1),
+    roughness: 1.0,
+    metalness: 0.0,
+  });
+
+  material.onBeforeCompile = (shader: WebGLProgramParametersWithUniforms) => {
+    shader.uniforms.uContour = viewUniforms.uContour;
+    shader.uniforms.uSlopeHeat = viewUniforms.uSlopeHeat;
+    shader.vertexShader = shader.vertexShader
+      .replace(
+        '#include <common>',
+        `#include <common>
+varying vec3 vWorldPos;
+varying vec3 vWorldNormal;`,
+      )
+      .replace(
+        '#include <worldpos_vertex>',
+        `#include <worldpos_vertex>
+vWorldPos = (modelMatrix * vec4(transformed, 1.0)).xyz;
+vWorldNormal = normalize(mat3(modelMatrix) * objectNormal);`,
+      );
+
+    shader.fragmentShader = shader.fragmentShader
+      .replace(
+        '#include <common>',
+        `#include <common>
+uniform float uContour;
+uniform float uSlopeHeat;
+varying vec3 vWorldPos;
+varying vec3 vWorldNormal;
+
+vec3 slopeHeat(float slopeDeg) {
+  vec3 flat0 = vec3(0.16, 0.52, 0.78);
+  vec3 mid = vec3(0.98, 0.85, 0.30);
+  vec3 steep = vec3(0.85, 0.17, 0.20);
+  float t = clamp(slopeDeg / 45.0, 0.0, 1.0);
+  return t < 0.5 ? mix(flat0, mid, t * 2.0) : mix(mid, steep, (t - 0.5) * 2.0);
+}
+
+vec3 terrainColor(float slopeDeg, float height) {
+  vec3 grass = vec3(0.34, 0.47, 0.24);
+  vec3 grassDry = vec3(0.46, 0.50, 0.28);
+  vec3 dirt = vec3(0.45, 0.36, 0.24);
+  vec3 rock = vec3(0.42, 0.41, 0.40);
+  vec3 sand = vec3(0.62, 0.58, 0.44);
+
+  vec3 c = mix(grass, grassDry, clamp(height / 70.0, 0.0, 1.0));
+  c = mix(c, dirt, smoothstep(12.0, 26.0, slopeDeg));
+  c = mix(c, rock, smoothstep(28.0, 42.0, slopeDeg));
+  c = mix(sand, c, smoothstep(-1.0, 3.0, height));
+  return c;
+}`,
+      )
+      .replace(
+        '#include <color_fragment>',
+        `#include <color_fragment>
+{
+  float slopeDeg = degrees(acos(clamp(normalize(vWorldNormal).y, -1.0, 1.0)));
+  vec3 base = terrainColor(slopeDeg, vWorldPos.y);
+  base = mix(base, slopeHeat(slopeDeg), uSlopeHeat);
+
+  if (uContour > 0.0) {
+    float major = uContour;
+    float minorStep = major / 5.0;
+    float dh = fwidth(vWorldPos.y) + 1e-4;
+    float fMajor = abs(fract(vWorldPos.y / major - 0.5) - 0.5) * major;
+    float fMinor = abs(fract(vWorldPos.y / minorStep - 0.5) - 0.5) * minorStep;
+    float lineMajor = 1.0 - smoothstep(0.0, dh * 1.5, fMajor);
+    float lineMinor = 1.0 - smoothstep(0.0, dh * 1.2, fMinor);
+    base = mix(base, base * 0.72, lineMinor * 0.5);
+    base = mix(base, base * 0.5, lineMajor * 0.7);
+  }
+  diffuseColor.rgb *= base;
+}`,
+      );
+  };
+  material.customProgramCacheKey = () => 'terrain-slope';
+  return material;
+}
+
+/** 路面標示など、路面のすぐ上に重ねる薄い面のマテリアル。 */
+export function createOverlayMaterial(): MeshStandardMaterial {
+  const material = new MeshStandardMaterial({
+    vertexColors: true,
+    roughness: 0.8,
+    metalness: 0.0,
+    polygonOffset: true,
+    polygonOffsetFactor: -4,
+    polygonOffsetUnits: -8,
+  });
+  return material;
+}
+
+/** 構造物・小物用。両面表示にしてトンネル内側も見えるようにする。 */
+export function createPropMaterial(): MeshStandardMaterial {
+  return new MeshStandardMaterial({
+    vertexColors: true,
+    roughness: 0.85,
+    metalness: 0.05,
+    side: DoubleSide,
+  });
+}
+
+/** 建設プレビュー用の半透明マテリアル。 */
+export function createPreviewMaterial(): MeshStandardMaterial {
+  const material = createSurfaceMaterial({
+    transparent: true,
+    opacity: 0.72,
+    depthWrite: false,
+    polygonOffsetUnits: -16,
+  });
+  return material;
+}

@@ -1,0 +1,28 @@
+{
+  "name": "trackbuilder",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Cities Skylines 風の、道路と線路を自由な線形で敷設できる 3D ネットワークエディタ",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "earcut": "^3.0.1",
+    "lil-gui": "^0.21.0",
+    "simplex-noise": "^4.0.3",
+    "three": "^0.185.1"
+  },
+  "devDependencies": {
+    "@types/earcut": "^3.0.0",
+    "@types/three": "^0.185.0",
+    "typescript": "^5.9.3",
+    "vite": "^7.0.0",
+    "vitest": "^3.0.0"
+  }
+}
