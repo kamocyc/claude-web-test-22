@@ -226,6 +226,29 @@ export class Network {
     return node;
   }
 
+  /**
+   * 2 つのノードを 1 つに統合する。自動交差点生成で、両方のセグメントを
+   * 分割してできた 2 つのノードを 1 つにまとめるのに使う。
+   */
+  mergeNodes(keep: NodeId, drop: NodeId): NetNode {
+    if (keep === drop) return this.getNode(keep);
+    const target = this.getNode(keep);
+    const source = this.nodes.get(drop);
+    if (!source) return target;
+
+    target.pos.lerp(source.pos, 0.5);
+    for (const segId of source.segments) {
+      const seg = this.segments.get(segId);
+      if (!seg) continue;
+      if (seg.a === drop) seg.a = keep;
+      if (seg.b === drop) seg.b = keep;
+      if (!target.segments.includes(segId)) target.segments.push(segId);
+    }
+    this.nodes.delete(drop);
+    this.touch();
+    return target;
+  }
+
   private restoreNode(id: NodeId, xzPos: XZ, y: number): NetNode {
     const node: NetNode = { id, pos: new Vector3(xzPos.x, y, xzPos.y), segments: [] };
     this.nodes.set(id, node);

@@ -20,9 +20,7 @@ import { buildCatenary, buildTrack, buildTrackConnection } from '../build/rail';
 import {
   alignmentSamplesInRange,
   buildBridge,
-  buildRetainingWalls,
   buildTunnel,
-  cutDepthAt,
   structureFootprintHalfWidth,
 } from '../build/structures';
 import {
@@ -39,7 +37,12 @@ import type { NetworkClass } from '../network/classes';
 import { findCrossings, type Crossing } from '../network/crossings';
 import { solveJunctions, type Approach, type Junction } from '../network/junction';
 import type { Network, NodeId, SegmentId } from '../network/network';
-import { computeStructureProfile, classify, type StructureRun } from '../network/structure';
+import {
+  classify,
+  computeStructureProfile,
+  forceRunMode,
+  type StructureRun,
+} from '../network/structure';
 import { evaluateAlignment, type SegmentDiagnostics } from '../network/validation';
 import { TerrainGrading } from '../terrain/grading';
 import type { Heightfield } from '../terrain/heightfield';
@@ -81,6 +84,10 @@ export interface BuildResult {
   warnings: WorldWarning[];
   stats: WorldStats;
   diagnostics: Map<SegmentId, SegmentDiagnostics>;
+  /** 交差点でトリムしたあとの、実際に描画された弧長範囲。 */
+  ranges: Map<SegmentId, { s0: number; s1: number }>;
+  /** 区間ごとの構造形式。 */
+  structures: Map<SegmentId, StructureRun[]>;
 }
 
 /**
@@ -158,7 +165,31 @@ export class WorldBuilder {
       structures.set(seg.id, computeStructureProfile(alignment, this.field, range));
     }
 
-    this.applyGrading(junctions, structures);
+    // 立体交差の上側は、盛土になる高さでも橋にする。そうしないと下をくぐる
+    // 線形が盛土に埋まってしまう。
+    for (const crossing of crossings) {
+      if (crossing.kind !== 'separated' && crossing.kind !== 'insufficient') continue;
+      const lowerClass = network.classOf(network.getSegment(crossing.lower));
+      this.forceBridgeAround(
+        structures,
+        ranges,
+        crossing.upper,
+        crossing.sUpper,
+        lowerClass.halfWidth + 10,
+      );
+    }
+
+    // 踏切では舗装が優先なので、線路側の整地は道路側に任せる。
+    const gradingSkips = new Map<SegmentId, { s0: number; s1: number }[]>();
+    for (const crossing of crossings) {
+      if (crossing.kind !== 'level' || !crossing.rail || !crossing.road) continue;
+      const span = crossing.road.cls.halfWidth + 6;
+      const list = gradingSkips.get(crossing.rail.segment) ?? [];
+      list.push({ s0: crossing.rail.s - span, s1: crossing.rail.s + span });
+      gradingSkips.set(crossing.rail.segment, list);
+    }
+
+    this.applyGrading(junctions, structures, gradingSkips);
     this.terrainMesh.update();
 
     const surface = new MeshBuilder();
@@ -216,7 +247,53 @@ export class WorldBuilder {
     this.replaceGeometry(this.overlayMesh, overlay);
     this.replaceGeometry(this.structureMesh, structure);
 
-    return { warnings, stats, diagnostics };
+    return { warnings, stats, diagnostics, ranges, structures };
+  }
+
+  /**
+   * ある地点を中心に、前後 `span` [m] を橋にする。
+   *
+   * 交点がセグメントの端に近いときは、隣接するセグメントへ跨いで続ける。
+   * 交点がちょうどノード上にある場合 (跨線橋の中間ノードなど) でも、
+   * 下をくぐる線形の上が途切れずに橋になる。
+   */
+  private forceBridgeAround(
+    structures: Map<SegmentId, StructureRun[]>,
+    ranges: Map<SegmentId, { s0: number; s1: number }>,
+    segment: SegmentId,
+    station: number,
+    span: number,
+  ): void {
+    const apply = (id: SegmentId, s0: number, s1: number): { before: number; after: number } => {
+      const runs = structures.get(id);
+      const range = ranges.get(id);
+      if (!runs || !range) return { before: 0, after: 0 };
+      const lo = Math.max(range.s0, s0);
+      const hi = Math.min(range.s1, s1);
+      if (hi > lo) structures.set(id, forceRunMode(runs, lo, hi, 'bridge'));
+      return { before: Math.max(0, range.s0 - s0), after: Math.max(0, s1 - range.s1) };
+    };
+
+    const leftover = apply(segment, station - span, station + span);
+    const seg = this.network.segments.get(segment);
+    if (!seg) return;
+
+    // 端からはみ出した分を、そのノードに繋がる同種のセグメントへ引き継ぐ。
+    const spill = (nodeId: NodeId, remaining: number): void => {
+      if (remaining <= 0.5) return;
+      const node = this.network.nodes.get(nodeId);
+      if (!node) return;
+      for (const other of node.segments) {
+        if (other === segment) continue;
+        const otherSeg = this.network.segments.get(other);
+        const range = ranges.get(other);
+        if (!otherSeg || !range) continue;
+        if (otherSeg.a === nodeId) apply(other, range.s0, range.s0 + remaining);
+        else apply(other, range.s1 - remaining, range.s1);
+      }
+    };
+    spill(seg.a, leftover.before);
+    spill(seg.b, leftover.after);
   }
 
   // ---------------------------------------------------------------- 整地
@@ -224,6 +301,8 @@ export class WorldBuilder {
   private applyGrading(
     junctions: Map<NodeId, Junction>,
     structures: Map<SegmentId, StructureRun[]>,
+    /** 整地から除外する弧長の範囲 (踏切で道路側に譲る部分)。 */
+    skips: Map<SegmentId, { s0: number; s1: number }[]>,
   ): void {
     const grading = this.grading;
     grading.reset();
@@ -249,10 +328,13 @@ export class WorldBuilder {
       const alignment = this.network.alignmentOf(seg.id);
       const half = gradingHalfWidth(cls);
       const drop = gradingDrop(cls);
+      const skipRanges = skips.get(seg.id) ?? [];
       for (const run of structures.get(seg.id) ?? []) {
         if (run.mode !== 'ground') continue;
         const samples = alignmentSamplesInRange(alignment, run.s0, run.s1, 3);
         for (let i = 0; i + 1 < samples.length; i++) {
+          const mid = (samples[i].s + samples[i + 1].s) / 2;
+          if (skipRanges.some((r) => mid >= r.s0 && mid <= r.s1)) continue;
           const a = gradingEdges(samples[i], half, drop);
           const b = gradingEdges(samples[i + 1], half, drop);
           grading.stampQuad(a.left, b.left, b.right, a.right);
@@ -308,10 +390,6 @@ export class WorldBuilder {
       } else if (run.mode === 'tunnel') {
         stats.tunnelLength += run.s1 - run.s0;
         buildTunnel(structure, samples, cls, this.field);
-      } else {
-        // 深い切土は法面ではなく擁壁にして、掘割らしい見た目にする。
-        const deep = samples.some((sample) => cutDepthAt(sample, this.field) > 3.0);
-        if (deep) buildRetainingWalls(structure, samples, cls, this.field);
       }
 
       if (cls.kind === 'rail' && run.mode !== 'tunnel') {

@@ -266,66 +266,9 @@ function buildPortal(
   }
 }
 
-/**
- * 掘割 (トンネル坑口までのアプローチ) の擁壁。
- * 切土が深いところで、法面の代わりに垂直な壁を立てる。
- */
-export function buildRetainingWalls(
-  mb: MeshBuilder,
-  samples: AlignmentSample[],
-  cls: NetworkClass,
-  field: Heightfield,
-  minDepth = 2.5,
-): void {
-  const hw = cls.halfWidth + 0.4;
-  for (const side of [-1, 1]) {
-    let run: AlignmentSample[] = [];
-    const flush = (): void => {
-      if (run.length >= 2) {
-        const heights = run.map((sample) => {
-          const x = sample.pos.x + sample.right.x * side * hw;
-          const z = sample.pos.z + sample.right.z * side * hw;
-          return field.baseHeightAt(x, z) - sample.pos.y;
-        });
-        const sections = run.map((sample, i) => {
-          const cx = sample.pos.x + sample.right.x * side * hw;
-          const cz = sample.pos.z + sample.right.z * side * hw;
-          const top = sample.pos.y + Math.min(heights[i], 14) + 0.4;
-          const bottom = sample.pos.y - 1.2;
-          const t = 0.35;
-          const rx = sample.right.x * t;
-          const rz = sample.right.z * t;
-          return [
-            new Vector3(cx - rx, top, cz - rz),
-            new Vector3(cx + rx, top, cz + rz),
-            new Vector3(cx + rx, bottom, cz + rz),
-            new Vector3(cx - rx, bottom, cz - rz),
-          ];
-        });
-        addTube(mb, sections, CONCRETE_DARK, true);
-      }
-      run = [];
-    };
-
-    for (const sample of samples) {
-      const x = sample.pos.x + sample.right.x * side * hw;
-      const z = sample.pos.z + sample.right.z * side * hw;
-      const depth = field.baseHeightAt(x, z) - sample.pos.y;
-      if (depth > minDepth) run.push(sample);
-      else flush();
-    }
-    flush();
-  }
-}
-
 /** 橋・トンネルの footprint (整地を遮断する範囲)。 */
 export function structureFootprintHalfWidth(cls: NetworkClass, mode: 'bridge' | 'tunnel'): number {
   return mode === 'tunnel' ? cls.halfWidth + 12 : cls.halfWidth + 3;
-}
-
-/** 掘割で擁壁を出すかどうかの判定に使う、地表区間の切土深さ。 */
-export function cutDepthAt(sample: AlignmentSample, field: Heightfield): number {
-  return field.baseHeightAt(sample.pos.x, sample.pos.z) - sample.pos.y;
 }
 
 export function alignmentSamplesInRange(

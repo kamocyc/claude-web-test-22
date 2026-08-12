@@ -1,5 +1,5 @@
 import { Vector3 } from 'three';
-import { MAP_SIZE, TERRAIN_CELL, TERRAIN_CELLS, clamp } from '../core/units';
+import { TERRAIN_CELL, TERRAIN_CELLS, clamp } from '../core/units';
 
 /**
  * 地形の高さ場。
@@ -21,7 +21,8 @@ export class Heightfield {
   constructor(cells = TERRAIN_CELLS, cell = TERRAIN_CELL) {
     this.cells = cells;
     this.cell = cell;
-    this.origin = -MAP_SIZE / 2;
+    // 原点はマップ中心。格子の大きさから決めるので、既定以外の解像度でも合う。
+    this.origin = -(cells * cell) / 2;
     this.stride = cells + 1;
     const n = this.stride * this.stride;
     this.base = new Float32Array(n);

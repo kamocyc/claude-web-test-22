@@ -103,6 +103,33 @@ export function mergeShortRuns(input: StructureRun[], minLength = MIN_STRUCTURE_
   return runs;
 }
 
+/**
+ * 指定した弧長の範囲を、強制的にある構造形式にする。
+ *
+ * 立体交差の上側は、盛土の高さに満たなくても橋にしないと、下をくぐる
+ * 線形が盛土に埋まってしまう。そうした「地形との高低差では決まらない」
+ * 事情を後から反映するために使う。
+ */
+export function forceRunMode(
+  runs: StructureRun[],
+  s0: number,
+  s1: number,
+  mode: StructureMode,
+): StructureRun[] {
+  if (s1 <= s0) return runs;
+  const out: StructureRun[] = [];
+  for (const run of runs) {
+    if (run.s1 <= s0 || run.s0 >= s1) {
+      out.push({ ...run });
+      continue;
+    }
+    if (run.s0 < s0) out.push({ mode: run.mode, s0: run.s0, s1: s0 });
+    out.push({ mode, s0: Math.max(run.s0, s0), s1: Math.min(run.s1, s1) });
+    if (run.s1 > s1) out.push({ mode: run.mode, s0: s1, s1: run.s1 });
+  }
+  return coalesce(out).filter((r) => r.s1 - r.s0 > 1e-6);
+}
+
 function coalesce(runs: StructureRun[]): StructureRun[] {
   const out: StructureRun[] = [];
   for (const r of runs) {

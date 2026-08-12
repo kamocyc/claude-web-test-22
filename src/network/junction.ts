@@ -129,6 +129,15 @@ function solveNode(network: Network, nodeId: NodeId, branches: Branch[]): Juncti
   const kind = classifyNode(branches, kinds);
 
   const n = branches.length;
+  for (let i = 0; i < n; i++) {
+    for (let j = i + 1; j < n; j++) {
+      // ほぼ同じ向きに出ている枝どうしは重なってしまう。
+      if (branches[i].dir.dot(branches[j].dir) > 0.999) {
+        warnings.push('同じ向きに重なった線形があります。どちらかの向きを変えてください。');
+      }
+    }
+  }
+
   const approaches: Approach[] = branches.map((branch) => ({
     branch,
     trim: 0,
@@ -217,6 +226,8 @@ function borderIntersection(bi: Branch, bj: Branch): { ti: number; tj: number } 
   const di = bi.dir;
   const dj = bj.dir;
   const det = -(di.x * dj.y - di.y * dj.x);
+  // 平行な 2 枝は路端線が交わらない。一直線に繋がる場合はトリム不要、
+  // 同じ向きに重なっている場合は形状を決めようがないので触らない。
   if (Math.abs(det) < 1e-6) return null;
 
   const ni = perp(di).multiplyScalar(bi.cls.halfWidth);

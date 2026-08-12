@@ -33,23 +33,29 @@ export const SURFACE_SKIRT = 0.45;
 /** 路面標示を路面から浮かせる量 [m]。 */
 export const MARKING_LIFT = 0.012;
 
-/** 切土で許容する法面勾配 (高さ/水平距離)。約 35 度。 */
-export const CUT_SLOPE = 0.70;
+/** 切土で許容する法面勾配 (高さ/水平距離)。約 44 度。 */
+export const CUT_SLOPE = 0.95;
 
-/** 盛土で許容する法面勾配 (高さ/水平距離)。約 30 度。 */
-export const FILL_SLOPE = 0.58;
+/** 盛土で許容する法面勾配 (高さ/水平距離)。約 32 度。 */
+export const FILL_SLOPE = 0.62;
 
 /** 整地対象に含める路肩の余裕幅 [m]。 */
 export const GRADING_MARGIN = 2.0;
 
-/** 高架と判定する路面下の空き高さ [m]。 */
-export const BRIDGE_THRESHOLD = 1.2;
+/**
+ * 高架と判定する盛土高さ [m]。
+ * これ以下なら盛土で地形を持ち上げ、超えたら橋にする。
+ */
+export const BRIDGE_THRESHOLD = 8.0;
 
-/** トンネルと判定する路面上の土被り [m]。 */
-export const TUNNEL_THRESHOLD = 3.0;
+/**
+ * トンネルと判定する土被り [m]。
+ * これ以下なら切土 (掘割) で地形を削り、超えたらトンネルにする。
+ */
+export const TUNNEL_THRESHOLD = 12.0;
 
 /** 橋・トンネル区間として採用する最小延長 [m]。これ未満は前後に吸収する。 */
-export const MIN_STRUCTURE_RUN = 16;
+export const MIN_STRUCTURE_RUN = 25;
 
 /** 平面交差 (踏切) とみなす道路とレールの高低差 [m]。 */
 export const LEVEL_CROSSING_TOLERANCE = 0.25;

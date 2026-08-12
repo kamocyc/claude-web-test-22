@@ -27,6 +27,8 @@ export function createSurfaceMaterial(options?: {
   depthWrite?: boolean;
   polygonOffsetUnits?: number;
   side?: typeof DoubleSide | undefined;
+  /** 診断表示の on/off を制御する uniform。既定は全体共有のもの。 */
+  diagnostics?: { value: number };
 }): MeshStandardMaterial {
   const material = new MeshStandardMaterial({
     vertexColors: true,
@@ -38,11 +40,11 @@ export function createSurfaceMaterial(options?: {
     polygonOffset: true,
     polygonOffsetFactor: -1,
     polygonOffsetUnits: options?.polygonOffsetUnits ?? -2,
-    side: options?.side ?? undefined,
+    ...(options?.side ? { side: options.side } : {}),
   });
 
   material.onBeforeCompile = (shader: WebGLProgramParametersWithUniforms) => {
-    shader.uniforms.uDiagnostics = viewUniforms.uDiagnostics;
+    shader.uniforms.uDiagnostics = options?.diagnostics ?? viewUniforms.uDiagnostics;
     shader.vertexShader = shader.vertexShader
       .replace(
         '#include <common>',
@@ -80,7 +82,10 @@ if (uDiagnostics > 0.5) {
 }`,
       );
   };
-  material.customProgramCacheKey = () => 'surface-diag';
+  // uniform の束ね方が違うマテリアル同士でプログラムを共有しないよう、
+  // 診断 uniform を差し替えた場合はキーも変える。
+  const key = options?.diagnostics ? 'surface-diag-forced' : 'surface-diag';
+  material.customProgramCacheKey = () => key;
   return material;
 }
 
@@ -129,16 +134,17 @@ vec3 slopeHeat(float slopeDeg) {
 }
 
 vec3 terrainColor(float slopeDeg, float height) {
-  vec3 grass = vec3(0.34, 0.47, 0.24);
-  vec3 grassDry = vec3(0.46, 0.50, 0.28);
-  vec3 dirt = vec3(0.45, 0.36, 0.24);
+  vec3 grass = vec3(0.28, 0.45, 0.19);
+  vec3 grassDry = vec3(0.40, 0.47, 0.23);
+  vec3 dirt = vec3(0.44, 0.35, 0.22);
   vec3 rock = vec3(0.42, 0.41, 0.40);
-  vec3 sand = vec3(0.62, 0.58, 0.44);
+  vec3 sand = vec3(0.66, 0.61, 0.46);
 
-  vec3 c = mix(grass, grassDry, clamp(height / 70.0, 0.0, 1.0));
-  c = mix(c, dirt, smoothstep(12.0, 26.0, slopeDeg));
-  c = mix(c, rock, smoothstep(28.0, 42.0, slopeDeg));
-  c = mix(sand, c, smoothstep(-1.0, 3.0, height));
+  vec3 c = mix(grass, grassDry, clamp(height / 60.0, 0.0, 1.0));
+  c = mix(c, dirt, smoothstep(14.0, 27.0, slopeDeg));
+  c = mix(c, rock, smoothstep(29.0, 42.0, slopeDeg));
+  // 水際だけ砂浜にする。
+  c = mix(sand, c, smoothstep(0.0, 1.6, height));
   return c;
 }`,
       )
@@ -192,13 +198,16 @@ export function createPropMaterial(): MeshStandardMaterial {
   });
 }
 
-/** 建設プレビュー用の半透明マテリアル。 */
+/**
+ * 建設プレビュー用の半透明マテリアル。規格違反がすぐ分かるよう、
+ * 全体設定にかかわらず常に診断色で表示する。
+ */
 export function createPreviewMaterial(): MeshStandardMaterial {
-  const material = createSurfaceMaterial({
+  return createSurfaceMaterial({
     transparent: true,
-    opacity: 0.72,
+    opacity: 0.75,
     depthWrite: false,
     polygonOffsetUnits: -16,
+    diagnostics: { value: 1 },
   });
-  return material;
 }

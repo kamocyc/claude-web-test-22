@@ -23,7 +23,7 @@ export interface TerrainOptions {
 
 export const DEFAULT_TERRAIN: TerrainOptions = {
   seed: 20260812,
-  amplitude: 55,
+  amplitude: 42,
   valley: true,
 };
 
@@ -46,15 +46,16 @@ export function generateTerrain(field: Heightfield, options: TerrainOptions = DE
     for (let ix = 0; ix < n; ix++) {
       const x = field.worldX(ix);
 
-      // fBm。周波数を倍にしながら振幅を半分にしていく。
+      // fBm。周波数を倍にしながら振幅を減らしていく。道路の規格勾配で
+      // 追える程度の起伏にしたいので、高周波成分は控えめにする。
       let h = 0;
       let amp = 1;
-      let freq = 1 / 620;
+      let freq = 1 / 700;
       let norm = 0;
-      for (let o = 0; o < 6; o++) {
+      for (let o = 0; o < 5; o++) {
         h += noise(x * freq, z * freq) * amp;
         norm += amp;
-        amp *= 0.5;
+        amp *= 0.42;
         freq *= 2.05;
       }
       h /= norm;

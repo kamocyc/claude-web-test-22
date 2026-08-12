@@ -104,7 +104,31 @@ export function findCrossings(network: Network): Crossing[] {
     }
   }
 
-  return crossings;
+  return dedupeCrossings(crossings);
+}
+
+/** 同じ交差を指す重複を 1 つにまとめるときの距離 [m]。 */
+const MERGE_DISTANCE = 2.5;
+
+/**
+ * 同じ交差が重複して検出されるのを取り除く。
+ *
+ * 折れ線の頂点上で交わると隣り合う辺の組で二重に当たる。交点がちょうど
+ * ノード位置にあると、分割された前後 2 本がそれぞれ当たるため、双方が
+ * 分割されていると 4 通りの組み合わせが出てくる。数メートル以内で同種の
+ * 交差は、物理的には 1 箇所とみなしてよい。
+ */
+function dedupeCrossings(crossings: Crossing[]): Crossing[] {
+  const kept: Crossing[] = [];
+  for (const candidate of crossings) {
+    const duplicate = kept.some(
+      (existing) =>
+        existing.kind === candidate.kind &&
+        existing.point.distanceTo(candidate.point) < MERGE_DISTANCE,
+    );
+    if (!duplicate) kept.push(candidate);
+  }
+  return kept;
 }
 
 interface Hit {
@@ -155,6 +179,13 @@ function intersectPolylines(a: PolylinePoint[], b: PolylinePoint[]): Hit[] {
 function classifyCrossing(network: Network, idA: SegmentId, idB: SegmentId, hit: Hit): Crossing {
   const clsA = network.classOf(network.getSegment(idA));
   const clsB = network.classOf(network.getSegment(idB));
+
+  // 高さは折れ線の補間ではなく線形から取り直す。折れ線は縦断曲線を
+  // 弦で近似しているので、そのままだと数十 cm ずれ、踏切かどうかの
+  // 判定が揺らぐ。
+  hit.yA = network.alignmentOf(idA).sampleAt(hit.sA).pos.y;
+  hit.yB = network.alignmentOf(idB).sampleAt(hit.sB).pos.y;
+
   const dy = hit.yA - hit.yB;
   const point = new Vector3(hit.x, Math.max(hit.yA, hit.yB), hit.z);
 
