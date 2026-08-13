@@ -169,6 +169,28 @@ describe('サンプルネットワーク', () => {
     expect(structural).toBeGreaterThan(20);
   });
 
+  it('踏切のまわりでレールが地形に埋まらない', () => {
+    const { field, network, world } = buildWorld();
+
+    // 舗装の下でレールが隠れるのは仕様なので、道路の幅の外だけを見る。
+    for (const crossing of world.crossings) {
+      if (crossing.kind !== 'level' || !crossing.rail || !crossing.road) continue;
+      const alignment = network.alignmentOf(crossing.rail.segment);
+      const skip = crossing.road.cls.halfWidth + 1.5;
+      let checked = 0;
+      for (let d = -40; d <= 40; d += 1) {
+        if (Math.abs(d) <= skip) continue;
+        const s = crossing.rail.s + d;
+        if (s < 0 || s > alignment.length) continue;
+        const railhead = alignment.sampleAt(s).pos;
+        // レール頭頂面より地形が上に来てはいけない。
+        expect(field.heightAt(railhead.x, railhead.z)).toBeLessThan(railhead.y);
+        checked++;
+      }
+      expect(checked).toBeGreaterThan(20);
+    }
+  });
+
   it('地形を作り直しても同じシードなら同じ結果になる', () => {
     const a = buildWorld(1234);
     const b = buildWorld(1234);
