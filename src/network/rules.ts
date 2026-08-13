@@ -7,6 +7,7 @@ import {
   DEG,
   LEVEL_CROSSING_TOLERANCE,
 } from '../core/units';
+import { MAX_CROSSING_LIFT } from '../build/crossing';
 import type { NetworkClass } from './classes';
 import { intersectPolylines, toPolyline, type PolylinePoint } from './crossings';
 import type { Anchor } from './editing';
@@ -133,8 +134,10 @@ function checkOverlaps(ctx: PlacementContext, connected: Set<SegmentId>): string
     let shallow = false;
     let tooClose = 0;
     let worstClearance = Infinity;
+    let worstCrossing = 0;
     let lowerKindOfWorst: 'road' | 'rail' = other.kind;
-    const otherLength = network.alignmentOf(seg.id).length;
+    const otherAlignment = network.alignmentOf(seg.id);
+    const otherLength = otherAlignment.length;
 
     // 交点での高さで判定する。横にずれた点どうしを比べると、勾配のある
     // 道路では実際より低い / 高い桁下を読んでしまう。
@@ -145,6 +148,22 @@ function checkOverlaps(ctx: PlacementContext, connected: Set<SegmentId>): string
       if (Math.abs(dy) <= LEVEL_CROSSING_TOLERANCE) {
         // 同一平面。道路 × 線路は踏切、同じ種別どうしは交差点になる。
         if (sin < Math.sin(MIN_CROSSING_ANGLE)) shallow = true;
+        if (cls.kind !== other.kind) {
+          // 踏切。路面を線路の面に合わせるので、交差角が浅く道路の勾配が
+          // 急だと、道路に何十 m もの平坦部を刻むことになる。
+          const need = crossingDeformation(
+            cls.kind === 'road' ? cls : other,
+            cls.kind === 'road' ? other : cls,
+            sin,
+            cls.kind === 'road'
+              ? ctx.alignment.vertical.gradeAt(hit.sA)
+              : otherAlignment.vertical.gradeAt(hit.sB),
+            cls.kind === 'rail'
+              ? ctx.alignment.vertical.gradeAt(hit.sA)
+              : otherAlignment.vertical.gradeAt(hit.sB),
+          );
+          if (need > MAX_CROSSING_LIFT) worstCrossing = Math.max(worstCrossing, need);
+        }
         if (cls.kind === other.kind) {
           // 交差点は取り付き部の分だけ両側の線形を食べる。端に近すぎると
           // 交差点どうしが重なるので置かせない。
@@ -188,6 +207,12 @@ function checkOverlaps(ctx: PlacementContext, connected: Set<SegmentId>): string
     if (shallow) {
       out.push(`交差角が浅すぎます (${(MIN_CROSSING_ANGLE / DEG).toFixed(0)}° 以上必要)。`);
     }
+    if (worstCrossing > 0) {
+      out.push(
+        `踏切にできません。路面を線路に合わせるのに ±${worstCrossing.toFixed(1)} m の` +
+          `すり付けが要ります (交差角を大きくするか、道路の勾配を緩めてください)。`,
+      );
+    }
     if (!shallow && overlapLength > reach * 2.5) {
       out.push('既存の線形と重なって並走しています。');
     }
@@ -200,6 +225,28 @@ function checkOverlaps(ctx: PlacementContext, connected: Set<SegmentId>): string
     }
   }
   return out;
+}
+
+/**
+ * 踏切で道路をどれだけ変形させることになるか [m]。
+ *
+ * 舗装が線路に接するのは、道路の弧長で見て「線路の半幅 / sin + 道路の
+ * 半幅 / tan」の範囲。その端で、道路の本来の縦断と線路の面がどれだけ
+ * 離れるかを見る。交差角が浅いほど、道路の勾配が急なほど大きくなる。
+ */
+function crossingDeformation(
+  roadCls: NetworkClass,
+  railCls: NetworkClass,
+  sin: number,
+  roadGrade: number,
+  railGrade: number,
+): number {
+  const s = Math.max(0.26, sin);
+  const cos = Math.sqrt(Math.max(0, 1 - s * s));
+  const reach = railCls.halfWidth / s + roadCls.halfWidth * (cos / s);
+  // 道路の弧長方向に見た、線路の面の勾配との差。
+  const slope = Math.abs(railGrade * cos - roadGrade);
+  return reach * slope;
 }
 
 function boundsOf(line: Sample[]): { minX: number; maxX: number; minZ: number; maxZ: number } {

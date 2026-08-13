@@ -1,4 +1,4 @@
-import type { Vector3 } from 'three';
+import { Vector3 } from 'three';
 import type { NetworkKind } from './classes';
 import type { Junction } from './junction';
 import type { Network, NodeId, SegmentId } from './network';
@@ -82,18 +82,30 @@ export class Occupancy {
     network: Network,
     options: {
       junctions?: Map<NodeId, Junction>;
+      /**
+       * 描画高さの補正 (踏切に合わせた道路の上下)。索引の高さが実際に
+       * 描かれた路面とずれると、その高さで問い合わせた小物が舗装を
+       * 素通りしてしまう。急勾配の道路が踏切を渡る所で 2 m 以上ずれる。
+       */
+      heightOffset?: (segment: SegmentId, s: number, y: number) => number;
     } = {},
   ) {
+    const offsetAt = options.heightOffset ?? ((): number => 0);
     for (const seg of network.segments.values()) {
       const cls = network.classOf(seg);
       const alignment = network.alignmentOf(seg.id);
+      const at = (s: number): Vector3 => {
+        const pos = alignment.sampleAt(s).pos.clone();
+        pos.y += offsetAt(seg.id, s, pos.y);
+        return pos;
+      };
       // 描画された範囲だけでなく、交差点に飲み込まれたトリム区間も含める。
       // 鋭角の交差点ではリングの形が乱れることがあり、リングの内外判定
       // だけでは交差点の内側を取りこぼすため。
       const steps = Math.max(1, Math.ceil(alignment.length / 4));
-      let prev = alignment.sampleAt(0).pos;
+      let prev = at(0);
       for (let i = 1; i <= steps; i++) {
-        const p = alignment.sampleAt((alignment.length * i) / steps).pos;
+        const p = at((alignment.length * i) / steps);
         this.addSpan({
           segment: seg.id,
           kind: cls.kind,

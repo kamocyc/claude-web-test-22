@@ -133,7 +133,7 @@ describe('サンプルネットワーク', () => {
           // 踏切のまわりでは、道路が線路に合わせて上下し断面も平らになる。
           // 描画に使ったのと同じ高さを期待値にする。
           const blends = result.blends.get(seg.id) ?? [];
-          const { dy } = surfaceBlendAt(blends, s);
+          const { dy } = surfaceBlendAt(blends, s, sample.pos.y);
           const scale = surfaceHeightScale(blends, s);
           const expected = sample.pos.y + dy + edgeHeight * scale;
           // 埋まる (地形が上に出る) ことも、浮く (地形が下に離れる) こともない。

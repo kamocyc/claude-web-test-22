@@ -1,13 +1,18 @@
 import { describe, expect, it } from 'vitest';
 import { MeshBasicMaterial, Vector3 } from 'three';
 import { buildDemoNetwork } from '../src/app/demo';
-import { buildCatenary } from '../src/build/rail';
+import { surfaceBlendAt, surfaceHeightScale } from '../src/build/crossing';
+import { CATENARY_PITCH, buildCatenary } from '../src/build/rail';
 import {
   buildPowerLine,
   planUtilityPoles,
   type PolePlan,
   type PowerSpan,
 } from '../src/build/streetside';
+import {
+  alignmentSamplesInRange,
+  structureFootprintHalfWidth,
+} from '../src/build/structures';
 import { profileFor } from '../src/build/surface';
 import { MeshBuilder } from '../src/core/meshbuilder';
 import { SURFACE_LIFT } from '../src/core/units';
@@ -191,10 +196,16 @@ interface Nearest {
   dist: number;
   s: number;
   y: number;
+  /**
+   * 中心線からの**符号付き**横距離 [m] (進行方向の右手が正)。
+   * 踏切の横断勾配 (`roll`) を効かせるのに符号が要る。
+   * `Alignment.sampleAt` の `right` は `perp(t) = (-t.z, t.x)` なので同じ式を使う。
+   */
+  lateral: number;
 }
 
 function nearestOnPoly(x: number, z: number, poly: Poly): Nearest {
-  let best: Nearest = { dist: Infinity, s: 0, y: 0 };
+  let best: Nearest = { dist: Infinity, s: 0, y: 0, lateral: 0 };
   for (let i = 0; i + 1 < poly.pts.length; i++) {
     const a = poly.pts[i];
     const b = poly.pts[i + 1];
@@ -208,7 +219,10 @@ function nearestOnPoly(x: number, z: number, poly: Poly): Nearest {
     }
     const d = Math.hypot(x - (a.x + dx * t), z - (a.z + dz * t));
     if (d < best.dist) {
-      best = { dist: d, s: a.s + (b.s - a.s) * t, y: a.y + (b.y - a.y) * t };
+      const len = Math.sqrt(len2) || 1;
+      const lateral =
+        ((x - (a.x + dx * t)) * -dz) / len + ((z - (a.z + dz * t)) * dx) / len;
+      best = { dist: d, s: a.s + (b.s - a.s) * t, y: a.y + (b.y - a.y) * t, lateral };
     }
   }
   return best;
@@ -318,6 +332,44 @@ function profileHeightAt(cls: NetworkClass, offset: number): number {
     }
   }
   return best;
+}
+
+// ------------------------------------------- 踏切の補正込みの「実際に描かれた路面」
+
+/**
+ * 踏切の高さ補正を含んだ、実際に描画された路面の高さ。
+ *
+ * `WorldBuilder.buildSegment` は
+ *   `applySurfaceBlend(samples, blends)` → `buildRibbon(..., heightScale)`
+ * の順で帯を作り、`buildRibbon` は `profilePointAt` で
+ *   `y = pos.y + height * scale + SURFACE_LIFT + offset * roll`
+ * を積む。ここではそれと同じ式を、`BuildResult.blends` から組み直す。
+ *
+ * 線形の生の Y (`Poly.pts[].y`) をそのまま路面として扱うと、踏切のそばでは
+ * 実測で 2 m 以上ずれる (下の「Occupancy の高さ」の検査を参照)。
+ */
+function drawnSurfaceY(s: Scene, segment: SegmentId, station: number, lateral: number): number {
+  const alignment = s.network.alignmentOf(segment);
+  const cls = s.network.classOf(s.network.getSegment(segment));
+  const st = Math.max(0, Math.min(alignment.length, station));
+  const blends = s.result.blends.get(segment) ?? [];
+  const raw = alignment.sampleAt(st).pos.y;
+  const { dy, roll } = surfaceBlendAt(blends, st, raw);
+  const scale = surfaceHeightScale(blends, st);
+  return (
+    raw +
+    dy +
+    lateral * roll +
+    profileHeightAt(cls, lateral) * scale +
+    SURFACE_LIFT
+  );
+}
+
+/** その弧長で踏切の補正がどれだけ効いているか (0 = 効いていない)。 */
+function blendAmount(s: Scene, segment: SegmentId, station: number): number {
+  const blends = s.result.blends.get(segment) ?? [];
+  if (blends.length === 0) return 0;
+  return 1 - surfaceHeightScale(blends, station);
 }
 
 /** セグメント同士がノードを共有しているか (同じ道路の続き)。 */
@@ -779,6 +831,22 @@ const FLOAT_TOLERANCE = 0.35;
 /** 埋まりの許容量 [m]。小物は意図的に 0.05〜0.15 m 埋めて置かれる。 */
 const SINK_TOLERANCE = 0.4;
 
+/**
+ * 遮断機の足元と、その横位置の路面との許容差 [m]。
+ *
+ * 遮断機は路端の 0.5 m 外に立ち、足元は整地後の地形から 0.05 m 埋める。
+ * 路肩は路面よりわずかに低く整地されるので、その分 (実測 0.2 m 前後) を
+ * 飲み込める値として 0.5 m を採る。これを超えると、傾いた舗装に対して
+ * 遮断機だけが取り残されている (浮く・埋まる) ことになる。
+ */
+const GATE_FOOT_TOLERANCE = 0.5;
+
+/**
+ * ノードの継ぎ目で許す路面の段差 [m]。同じ点を共有しているはずなので
+ * 本来 0。断面の量子化を見込んで 0.05 m を採る。
+ */
+const SEAM_TOLERANCE = 0.05;
+
 function checkFootHeight(s: Scene): Violation[] {
   const out: Violation[] = [];
   for (const r of footReports(s)) {
@@ -959,6 +1027,21 @@ function ridge(center: number, width: number, depth: number): (x: number) => num
 function smoothstep01(t: number): number {
   const x = t < 0 ? 0 : t > 1 ? 1 : t;
   return x * x * (3 - 2 * x);
+}
+
+/**
+ * 楕円形の丘 / 窪み。`halfZ` を小さくすると、z = 0 を通る道路だけが
+ * トンネル (橋) になり、少し離れて並走する道路は地表のままになる。
+ */
+function bump(
+  halfX: number,
+  halfZ: number,
+  amplitude: number,
+): (x: number, z: number) => number {
+  return (x, z) =>
+    amplitude *
+    (1 - smoothstep01(Math.min(1, Math.abs(x) / halfX))) *
+    (1 - smoothstep01(Math.min(1, Math.abs(z) / halfZ)));
 }
 
 /** 2 本の線形を指定角度で交差させる。`span` を小さくすると交点の近くにノードができる。 */
@@ -1260,6 +1343,139 @@ const SCENARIOS: Scenario[] = [
     name: '急カーブ (半径 120 m) の道路',
     build: (n, f) => {
       draw(n, f, 'road_small', [{ x: 0, z: -30 }, { x: 0, z: 0 }, { x: -120, z: 120 }]);
+    },
+  },
+
+  // ---- ここから: 「踏切では線路が優先で道路が上下・傾斜する」に対する検証 ----
+
+  {
+    // 舗装が線路の面に合わせて**傾く** (roll != 0) 配置。斜めなので
+    // 補正の範囲 (core) が道路方向に長く伸びる。
+    name: '勾配 3% の線路を斜め 30 度で渡る踏切',
+    build: (n, f) => {
+      draw(n, f, 'rail_double', [
+        { x: -300, z: 0, y: -9 },
+        { x: 300, z: 0, y: 9 },
+      ], { straight: true });
+      const a = (30 * Math.PI) / 180;
+      draw(n, f, 'road_medium', [
+        { x: -250 * Math.cos(a), z: -250 * Math.sin(a) },
+        { x: 250 * Math.cos(a), z: 250 * Math.sin(a) },
+      ], { straight: true });
+    },
+  },
+  {
+    // 道路の方が大きく持ち上がる (下がる) 配置。舗装の高さが線形の生の
+    // 高さから最も離れるので、Occupancy・小物の足元の穴が出るならここ。
+    name: '急勾配 (12%) の生活道路が平坦な複線を 25 度で渡る',
+    build: (n, f) => {
+      draw(n, f, 'rail_double', [{ x: -300, z: 0, y: 0 }, { x: 300, z: 0, y: 0 }], {
+        straight: true,
+      });
+      const a = (25 * Math.PI) / 180;
+      draw(n, f, 'road_small', [
+        { x: -200 * Math.cos(a), z: -200 * Math.sin(a), y: 22 },
+        { x: 0, z: 0, y: 0 },
+        { x: 200 * Math.cos(a), z: 200 * Math.sin(a), y: 22 },
+      ], { straight: true });
+    },
+  },
+  {
+    // 歩道がないので `halfWidth == carriagewayHalfWidth`。踏切では縁石の
+    // 段差 (0) を潰す余地もない。遮断機を寄せる余地もない側の挙動を見る。
+    name: '勾配のある線路を歩道なしの自動車専用道が渡る',
+    build: (n, f) => {
+      draw(n, f, 'rail_double', [
+        { x: -300, z: 0, y: -6 },
+        { x: 300, z: 0, y: 6 },
+      ], { straight: true });
+      draw(n, f, 'road_highway', [{ x: 0, z: -250 }, { x: 0, z: 250 }], { straight: true });
+    },
+  },
+  {
+    // 踏切が道路のノードのすぐ近く (10 m) に来る。補正が隣のセグメントへ
+    // 溢れるので、継ぎ目で路面が段差にならないかを見る。
+    name: '踏切のすぐ脇 (10 m) に道路のノード (勾配のある線路)',
+    build: (n, f) => {
+      draw(n, f, 'rail_double', [
+        { x: -300, z: 0, y: -9 },
+        { x: 300, z: 0, y: 9 },
+      ], { straight: true });
+      draw(n, f, 'road_medium', [
+        { x: 0, z: -250 },
+        { x: 0, z: 10 },
+        { x: 0, z: 250 },
+      ], { straight: true });
+    },
+  },
+  {
+    // 浅い角度の踏切。舗装が線路に沿って長く伸びるので、線路の路肩
+    // (架線柱の建つ位置) がまるごと道路の中に入る。
+    name: '浅い角度 (14 度) の踏切',
+    build: crossing('rail_double', 'road_large', 14),
+  },
+
+  // ---- ここから: 大きくなった分岐器のまわり ----
+
+  {
+    name: '分岐器 (30 度) と並走する道路',
+    build: (n, f) => {
+      draw(n, f, 'rail_double', [{ x: -300, z: 0 }, { x: 300, z: 0 }], { straight: true });
+      const target = [...n.segments.keys()][0];
+      n.splitSegment(target, n.alignmentOf(target).length / 2);
+      draw(n, f, 'rail_double', [{ x: 0, z: 0 }, { x: 260, z: 150 }], { straight: true });
+      draw(n, f, 'road_medium', [{ x: -300, z: -16 }, { x: 300, z: -16 }], { straight: true });
+    },
+  },
+  {
+    // 分岐角が浅いほどトリム (= 交差点に取り込む長さ) が
+    // `minRadius * tan(角/2)` で長くなる。架線柱の建つ範囲が大きく削られる。
+    name: '分岐器 (10 度・トリムが最大)',
+    build: (n, f) => {
+      draw(n, f, 'rail_double', [{ x: -300, z: 0 }, { x: 300, z: 0 }], { straight: true });
+      const target = [...n.segments.keys()][0];
+      n.splitSegment(target, n.alignmentOf(target).length / 2);
+      const a = (10 * Math.PI) / 180;
+      draw(n, f, 'rail_double', [
+        { x: 0, z: 0 },
+        { x: 300 * Math.cos(a), z: 300 * Math.sin(a) },
+      ], { straight: true });
+    },
+  },
+  {
+    // 分岐器のすぐ先 (30 m) に踏切。分岐器の交差点面と踏切の舗装が近接する。
+    name: '分岐器の 30 m 先に踏切',
+    build: (n, f) => {
+      draw(n, f, 'rail_double', [{ x: -300, z: 0 }, { x: 300, z: 0 }], { straight: true });
+      const target = [...n.segments.keys()][0];
+      n.splitSegment(target, n.alignmentOf(target).length / 2);
+      draw(n, f, 'rail_double', [{ x: 0, z: 0 }, { x: 250, z: 140 }], { straight: true });
+      draw(n, f, 'road_medium', [{ x: 30, z: -200 }, { x: 30, z: 200 }], { straight: true });
+    },
+  },
+
+  // ---- ここから: 配電線が地中に潜りすぎていないか ----
+
+  {
+    // 橋の脇を 20 m 離れて並走する道路。相手の橋を跨がないのに
+    // 自分の径間まで地中になっていないかを見る。
+    name: '谷を跨ぐ橋の脇 20 m を並走する道路',
+    terrain: (f) => shapeTerrain(f, bump(90, 8, -22)),
+    build: (n, f) => {
+      draw(n, f, 'road_medium', [{ x: -200, z: 0, y: 0 }, { x: 200, z: 0, y: 0 }], {
+        straight: true,
+      });
+      draw(n, f, 'road_medium', [{ x: -200, z: 20, y: 0 }, { x: 200, z: 20, y: 0 }], {
+        straight: true,
+      });
+    },
+  },
+  {
+    name: 'トンネルの脇 20 m を並走する道路',
+    terrain: (f) => shapeTerrain(f, bump(90, 8, 26)),
+    build: (n, f) => {
+      draw(n, f, 'road_medium', [{ x: -200, z: 0 }, { x: 200, z: 0 }], { straight: true });
+      draw(n, f, 'road_medium', [{ x: -200, z: 20 }, { x: 200, z: 20 }], { straight: true });
     },
   },
 ];
@@ -1586,6 +1802,327 @@ describe('小物の配置 (敵対的検証)', () => {
   });
 
 
+  // ------------------------------------------------ 踏切で動いた路面に対する検証
+
+  /**
+   * 踏切の補正量そのものを実測して出す。以降の検査の前提 (補正が本当に
+   * 効いている配置がある / どれだけ動くか) を数字で押さえる。
+   */
+  it('踏切の高さ補正が実際に効いていて、その大きさを把握できている', () => {
+    const rows: string[] = [];
+    let maxAbs = 0;
+    let scenesWithBlend = 0;
+    for (const s of built().scenes) {
+      let worst = 0;
+      let at = { segment: -1 as unknown as SegmentId, s: 0 };
+      for (const [segment, list] of s.result.blends) {
+        if (list.length === 0) continue;
+        const alignment = s.network.alignmentOf(segment);
+        for (let st = 0; st <= alignment.length; st += 0.5) {
+          const { dy } = surfaceBlendAt(list, st, alignment.sampleAt(st).pos.y);
+          if (Math.abs(dy) > Math.abs(worst)) {
+            worst = dy;
+            at = { segment, s: st };
+          }
+        }
+      }
+      if (worst === 0) continue;
+      scenesWithBlend++;
+      maxAbs = Math.max(maxAbs, Math.abs(worst));
+      rows.push(`[${s.name}] 最大 dy = ${worst.toFixed(3)} m @ seg#${at.segment} s=${at.s.toFixed(1)}`);
+    }
+    // 検査が空振りしていないこと。
+    expect(scenesWithBlend, `踏切の補正が効いているシナリオがない`).toBeGreaterThan(5);
+    expect(maxAbs, `補正が全く効いていない: \n${rows.join('\n')}`).toBeGreaterThan(0.5);
+    // 参考値として必ず出す (失敗時だけでなく、想定より大きくなったら気づけるように)。
+    console.log(`踏切の高さ補正 dy: ${scenesWithBlend} シナリオ / 最大 ${maxAbs.toFixed(3)} m\n${rows.join('\n')}`);
+  }, 60000);
+
+  /**
+   * `Occupancy` は線形の**生の**高さで索引を作る。一方、踏切のまわりの
+   * 舗装は `blends` の分だけ上下している。小物の可否判定は「足を置く
+   * 高さ」で問い合わせるので、両者のずれが鉛直許容 (2.0 m) を超えると、
+   * **実在する舗装の真上が「空いている」と答えられる**。
+   *
+   * ここでは道路自身の中心線を、描画に使った高さで問い合わせる。索引が
+   * その道路を見つけられなければ、その地点は穴になっている。
+   */
+  it('Occupancy が、描画に使った高さで問うても舗装を見つけられる', () => {
+    const holes: string[] = [];
+    let probes = 0;
+    let blended = 0;
+    for (const s of built().scenes) {
+      if (s.result.blends.size === 0) continue;
+      const occ = new Occupancy(s.network, { junctions: s.world.junctions });
+      for (const [segment, list] of s.result.blends) {
+        if (list.length === 0) continue;
+        const alignment = s.network.alignmentOf(segment);
+        const range = s.result.ranges.get(segment) ?? { s0: 0, s1: alignment.length };
+        for (let st = range.s0; st <= range.s1; st += 1) {
+          const p = alignment.sampleAt(st).pos;
+          const drawn = drawnSurfaceY(s, segment, st, 0);
+          probes++;
+          if (blendAmount(s, segment, st) > 0.01) blended++;
+          if (occ.at(p.x, p.z, { y: drawn }) !== null) continue;
+          holes.push(
+            `[${s.name}] seg#${segment} s=${st.toFixed(1)} @ (${p.x.toFixed(1)}, ${p.z.toFixed(1)}): ` +
+              `描画路面 ${drawn.toFixed(2)} m で問うと索引が空を返す ` +
+              `(索引の高さ ${p.y.toFixed(2)} m / ずれ ${(drawn - p.y).toFixed(2)} m)`,
+          );
+        }
+      }
+    }
+    const unique = [...new Set(holes.map((h) => h.split(' s=')[0]))];
+    expect(
+      holes.slice(0, 8),
+      `\n索引の穴 ${holes.length} 点 (${unique.length} セグメント)\n${holes.slice(0, 8).join('\n')}\n`,
+    ).toEqual([]);
+    expect(probes, '踏切のある道路が 1 つもない (検査が空振り)').toBeGreaterThan(500);
+    expect(blended, '補正が効いている検査点がない (検査が空振り)').toBeGreaterThan(100);
+  }, 60000);
+
+  /**
+   * 遮断機は踏切の手前 (補正が全量かかっている範囲) に立つ。足元は
+   * 「傾いた路面のすぐ上」でなければならない。基準は中心線の高さではなく、
+   * **その横位置での**路面 (`roll` と段差の潰し込みを含む) から測る。
+   */
+  it('踏切の遮断機が、傾いた路面のすぐ上に載っている', () => {
+    const bad: string[] = [];
+    let gates = 0;
+    let tilted = 0;
+    for (const s of built().scenes) {
+      for (const prop of s.result.props) {
+        if (prop.kind !== 'crossingGate') continue;
+        gates++;
+        // 遮断機はノードを越えて隣のセグメントに置かれることがあるので、
+        // 道路のセグメント全体から最も近い中心線を探す。
+        let best: { poly: Poly; near: Nearest } | null = null;
+        for (const poly of drawnCenterlines(s)) {
+          if (poly.cls.kind !== 'road') continue;
+          const near = nearestOnPoly(prop.position.x, prop.position.z, poly);
+          if (!best || near.dist < best.near.dist) best = { poly, near };
+        }
+        if (!best) continue;
+        const { poly, near } = best;
+        const surface = drawnSurfaceY(s, poly.segment, near.s, near.lateral);
+        const amount = blendAmount(s, poly.segment, near.s);
+        if (amount > 0.5) tilted++;
+        const delta = prop.position.y - surface;
+        // 足元は意図的に 0.05 m 埋める。路肩は路面よりわずかに低い。
+        if (Math.abs(delta) <= GATE_FOOT_TOLERANCE) continue;
+        bad.push(
+          `[${s.name}] 遮断機 (${prop.position.x.toFixed(1)}, ${prop.position.z.toFixed(1)}) ` +
+            `足元 ${prop.position.y.toFixed(2)} m に対し seg#${poly.segment} の描画路面 ` +
+            `${surface.toFixed(2)} m (横 ${near.lateral.toFixed(2)} m, 補正 ${(amount * 100).toFixed(0)}%): ` +
+            `差 ${delta.toFixed(2)} m`,
+        );
+      }
+    }
+    expect(bad, `\n${bad.slice(0, 12).join('\n')}\n... 計 ${bad.length} 件\n`).toEqual([]);
+    expect(gates, '遮断機が 1 本も立っていない (検査が空振り)').toBeGreaterThan(10);
+    expect(tilted, '補正のかかった路面に立つ遮断機がない (検査が空振り)').toBeGreaterThan(5);
+  }, 60000);
+
+  /**
+   * 架線柱が踏切の舗装の上に立っていないか。
+   *
+   * 線路の路肩 (架線柱は `halfWidth - 0.6` に建つ) は、踏切では
+   * そのまま道路の舗装の中に入る。高さの比較は**描画に使った路面**で行う。
+   * 生の線形の高さで見ると、踏切のそばでは最大 2 m 以上ずれて
+   * 「高さが違うから干渉していない」と誤判定してしまう。
+   */
+  it('架線柱が道路の舗装 (踏切を含む) の上に立たない', () => {
+    const bad: string[] = [];
+    let poles = 0;
+    // 検査が空振りでないことの証拠。
+    //  covered: 道路の舗装に覆われた軌道の弧長 [m] (踏切の舗装が線路の路肩を
+    //           飲み込んでいる = 「そこに架線柱を建てたら舗装の上」という状況)。
+    //  skipped: 実際に柱の並びが 1 本以上飛んでいて、その飛んだ位置が舗装の中。
+    let covered = 0;
+    let skipped = 0;
+    for (const s of built().scenes) {
+      const roads = drawnCenterlines(s).filter((p) => p.cls.kind === 'road');
+      const onRoad = (x: number, z: number, y: number): Poly | null => {
+        for (const poly of roads) {
+          const near = nearestOnPoly(x, z, poly);
+          if (near.dist >= poly.cls.halfWidth) continue;
+          const surface = drawnSurfaceY(s, poly.segment, near.s, near.lateral);
+          if (Math.abs(y - surface) > VERTICAL_GATE) continue;
+          return poly;
+        }
+        return null;
+      };
+
+      // 舗装に覆われた軌道の長さ。
+      for (const poly of drawnCenterlines(s)) {
+        if (poly.cls.kind !== 'rail') continue;
+        for (let i = 0; i + 1 < poly.pts.length; i++) {
+          const p = poly.pts[i];
+          if (onRoad(p.x, p.z, p.y)) covered += poly.pts[i + 1].s - p.s;
+        }
+      }
+
+      // 飛んだ架線柱の候補が、舗装の中にあるか。
+      const byRail = new Map<SegmentId, number[]>();
+      for (const prop of s.result.props) {
+        if (prop.kind !== 'catenaryPole' || prop.segment === undefined) continue;
+        poles++;
+        const poly = fullCenterline(s, prop.segment);
+        const list = byRail.get(prop.segment) ?? [];
+        list.push(nearestOnPoly(prop.position.x, prop.position.z, poly).s);
+        byRail.set(prop.segment, list);
+
+        for (const road of roads) {
+          const near = nearestOnPoly(prop.position.x, prop.position.z, road);
+          if (near.dist >= road.cls.halfWidth) continue;
+          const surface = drawnSurfaceY(s, road.segment, near.s, near.lateral);
+          if (Math.abs(prop.position.y - surface) > VERTICAL_GATE) continue;
+          bad.push(
+            `[${s.name}] 架線柱 (${prop.position.x.toFixed(1)}, ${prop.position.z.toFixed(1)}) が ` +
+              `seg#${road.segment} (${road.cls.id}) の舗装内: 中心線から ${near.dist.toFixed(2)} m ` +
+              `(半幅 ${road.cls.halfWidth.toFixed(2)} m) / 柱 ${prop.position.y.toFixed(2)} m vs ` +
+              `描画路面 ${surface.toFixed(2)} m (踏切の補正 ${(blendAmount(s, road.segment, near.s) * 100).toFixed(0)}%)`,
+          );
+        }
+      }
+      for (const [segment, stations] of byRail) {
+        stations.sort((a, b) => a - b);
+        const alignment = s.network.alignmentOf(segment);
+        for (let i = 0; i + 1 < stations.length; i++) {
+          const gap = stations[i + 1] - stations[i];
+          if (gap < CATENARY_PITCH * 1.5) continue;
+          // 飛んだ候補の位置 (ピッチの格子上) を辿る。
+          for (let st = stations[i] + CATENARY_PITCH; st < stations[i + 1] - 1; st += CATENARY_PITCH) {
+            const p = alignment.sampleAt(st).pos;
+            if (onRoad(p.x, p.z, p.y)) skipped++;
+          }
+        }
+      }
+    }
+    expect(bad, `\n${bad.slice(0, 12).join('\n')}\n... 計 ${bad.length} 件\n`).toEqual([]);
+    expect(poles, '架線柱が 1 本も立っていない (検査が空振り)').toBeGreaterThan(50);
+    expect(
+      covered,
+      '道路の舗装に覆われた軌道が 1 m もない (踏切を踏んでいない = 検査が空振り)',
+    ).toBeGreaterThan(50);
+    expect(
+      skipped,
+      '舗装に当たって飛ばされた架線柱の候補が 1 つもない (検査が空振り)',
+    ).toBeGreaterThan(0);
+    console.log(
+      `架線柱 ${poles} 本 / 舗装に覆われた軌道 ${covered.toFixed(0)} m / ` +
+        `舗装に当たって飛ばされた候補 ${skipped} 本`,
+    );
+  }, 60000);
+
+  /**
+   * 小物の足元を、**描画に使った路面**で見直す。
+   *
+   * 既存の「浮かない/埋まらない」検査は線形の生の高さを路面としている。
+   * 踏切のまわりでは実際の舗装がそこから上下しているので、生の高さが
+   * 実際より高ければ浮きを見逃す。ここでは補正込みの高さで測り直す。
+   */
+  it('小物の足元が、踏切で動いた路面から浮かない', () => {
+    const bad: Violation[] = [];
+    let checked = 0;
+    for (const s of built().scenes) {
+      for (const prop of s.result.props) {
+        const x = prop.position.x;
+        const z = prop.position.z;
+        let pavement: number | null = null;
+        let where: SegmentId | null = null;
+        for (const poly of drawnCenterlines(s)) {
+          const near = nearestOnPoly(x, z, poly);
+          if (near.dist > poly.cls.halfWidth) continue;
+          const y = drawnSurfaceY(s, poly.segment, near.s, near.lateral);
+          if (pavement === null || y > pavement) {
+            pavement = y;
+            where = poly.segment;
+          }
+        }
+        for (const junction of s.world.junctions.values()) {
+          const ring = junction.ring;
+          if (ring.length < 3 || ring.some((p) => !p)) continue;
+          if (!pointInRing(x, z, ring)) continue;
+          const y = ring.reduce((acc, p) => Math.max(acc, p.y), -Infinity) + SURFACE_LIFT;
+          if (pavement === null || y > pavement) {
+            pavement = y;
+            where = null;
+          }
+        }
+        const support = Math.max(s.field.heightAt(x, z), pavement ?? -Infinity);
+        checked++;
+        if (prop.position.y - support <= FLOAT_TOLERANCE) continue;
+        bad.push({
+          scene: s.name,
+          rule: '足元が描画路面から浮いている',
+          kind: prop.kind,
+          amount: prop.position.y - support,
+          x,
+          z,
+          detail:
+            `地形 ${s.field.heightAt(x, z).toFixed(2)} m / 描画路面 ` +
+            `${pavement === null ? 'なし' : `${pavement.toFixed(2)} m (seg#${where})`} に対して ` +
+            `足元 ${prop.position.y.toFixed(2)} m`,
+        });
+      }
+    }
+    expect(bad.map(fmt), report(bad)).toEqual([]);
+    expect(checked, '小物が 1 つも無い (検査が空振り)').toBeGreaterThan(200);
+  }, 60000);
+
+  /**
+   * 踏切の補正が道路のノードを越えるとき、継ぎ目で路面が段差にならないか。
+   *
+   * `collectCrossingBlends` は隣のセグメントへ補正を溢れさせるとき、
+   * 弧長の向きに応じて `slope` と `roll` の符号を反転させる。符号を
+   * 間違えると、継ぎ目のところで路面が V 字に折れる (片側が沈む)。
+   */
+  it('踏切の補正がノードを越えても路面が段差にならない', () => {
+    const bad: string[] = [];
+    let seams = 0;
+    for (const s of built().scenes) {
+      if (s.result.blends.size === 0) continue;
+      for (const node of s.network.nodes.values()) {
+        const roads = [...node.segments].filter(
+          (id) => s.network.classOf(s.network.getSegment(id)).kind === 'road',
+        );
+        if (roads.length !== 2) continue;
+        const frames = roads.map((id) => {
+          const seg = s.network.getSegment(id);
+          const alignment = s.network.alignmentOf(id);
+          const st = seg.a === node.id ? 0 : alignment.length;
+          return { id, st, sample: alignment.sampleAt(st) };
+        });
+        // ほぼ一直線に繋がっている継ぎ目だけを見る (折れている所は別問題)。
+        const dot = frames[0].sample.right.dot(frames[1].sample.right);
+        if (Math.abs(dot) < 0.98) continue;
+        const amount = Math.max(
+          blendAmount(s, frames[0].id, frames[0].st),
+          blendAmount(s, frames[1].id, frames[1].st),
+        );
+        if (amount < 0.05) continue;
+        const cls = s.network.classOf(s.network.getSegment(frames[0].id));
+        if (cls.id !== s.network.classOf(s.network.getSegment(frames[1].id)).id) continue;
+        for (const offset of [-cls.carriagewayHalfWidth, 0, cls.carriagewayHalfWidth]) {
+          seams++;
+          const a = drawnSurfaceY(s, frames[0].id, frames[0].st, offset);
+          // 相手側では右手の向きが反転していることがある。
+          const b = drawnSurfaceY(s, frames[1].id, frames[1].st, offset * Math.sign(dot));
+          if (Math.abs(a - b) <= SEAM_TOLERANCE) continue;
+          bad.push(
+            `[${s.name}] node#${node.id} (${node.pos.x.toFixed(1)}, ${node.pos.z.toFixed(1)}) ` +
+              `横 ${offset.toFixed(1)} m で seg#${frames[0].id} は ${a.toFixed(3)} m、` +
+              `seg#${frames[1].id} は ${b.toFixed(3)} m (差 ${Math.abs(a - b).toFixed(3)} m、` +
+              `補正 ${(amount * 100).toFixed(0)}%)`,
+          );
+        }
+      }
+    }
+    expect(bad, `\n${bad.slice(0, 12).join('\n')}\n... 計 ${bad.length} 件\n`).toEqual([]);
+    expect(seams, '踏切の補正が跨ぐ継ぎ目が 1 つもない (検査が空振り)').toBeGreaterThan(5);
+  }, 60000);
+
   it('1 つの道路網の電柱が 1 つの電力系統に繋がる', () => {
     // 地中区間も辺として数える。橋・トンネルや交差点を跨いでも、行き来
     // できる道路の上の電柱は 1 系統でなければならない。
@@ -1796,6 +2333,129 @@ describe('小物の配置 (敵対的検証)', () => {
     const unique = [...new Set(bad)];
     expect(unique, `\n${unique.slice(0, 12).join('\n')}\n`).toEqual([]);
     expect(checked, '架空区間が 1 つもない (検査が空振り)').toBeGreaterThan(20);
+  }, 120000);
+
+  /**
+   * 地中化が過剰になっていないか。
+   *
+   * `spanBlocked` は橋・トンネル区間を「点と半径」の列にして、径間が
+   * その円に入ったら地中にする。半径は整地の footprint
+   * (`structureFootprintHalfWidth` = 橋で `halfWidth + 3`、トンネルで
+   * `halfWidth + 12`) なので、**構造物の脇を並走するだけ**の径間まで
+   * 地中に落ちうる。柱を建てられないのは footprint の中だが、その上を
+   * 電線が跨ぐかどうかは別で、跨ぐのは桁 (床版) の上を通るときだけ。
+   *
+   * ここで暴きたいのは**他人の構造物による巻き添え**なので、契約を
+   * 「地中にしてよいのは、径間が
+   *   (a) 柱を飛ばした区間 (index が不連続) か
+   *   (b) セグメントを跨ぐ引き込み (両端の柱が別の道路) か
+   *   (c) 橋・トンネルの**構造物本体** (`halfWidth + 2` 以内) を実際に通るか
+   *   (d) 線路の上を通るか
+   *   (e) 行き来できる同じ道路網の構造物 (= 自分の坑口・橋台の手前) に
+   *       footprint で当たったか
+   * のいずれか」とする。(e) を許すのは、自分の道路が橋・トンネルに入る
+   * 直前の径間まで地中にするのは方針として理解できるため。逆に、
+   * **繋がってもいない別の道路の橋・トンネル**の footprint に入っただけで
+   * 地中になるのは、跨いでいない以上やり過ぎ。
+   */
+  it('別の道路の橋・トンネルの脇を通っただけで地中にならない', () => {
+    const bad: string[] = [];
+    let overhead = 0;
+    let underground = 0;
+    let structural = 0;
+    let ownPortal = 0;
+    for (const s of built().scenes) {
+      const occ = new Occupancy(s.network, { junctions: s.world.junctions });
+      const obstacles: {
+        x: number;
+        z: number;
+        footprint: number;
+        body: number;
+        segment: SegmentId;
+        label: string;
+      }[] = [];
+      for (const [id, runs] of s.result.structures) {
+        const seg = s.network.segments.get(id);
+        if (!seg) continue;
+        const cls = s.network.classOf(seg);
+        const alignment = s.network.alignmentOf(id);
+        for (const run of runs) {
+          if (run.mode === 'ground') continue;
+          structural++;
+          const footprint = structureFootprintHalfWidth(cls, run.mode);
+          for (const sample of alignmentSamplesInRange(alignment, run.s0, run.s1, 4)) {
+            obstacles.push({
+              x: sample.pos.x,
+              z: sample.pos.z,
+              footprint,
+              body: cls.halfWidth + 2,
+              segment: id,
+              label: `seg#${id} ${run.mode} (本体半幅 ${(cls.halfWidth + 2).toFixed(1)} m / footprint 半径 ${footprint.toFixed(1)} m)`,
+            });
+          }
+        }
+      }
+
+      for (const span of s.result.power.spans) {
+        if (!span.underground) {
+          overhead++;
+          continue;
+        }
+        underground++;
+        if (span.b.index !== span.a.index + 1) continue; // (a)
+        const segment = poleSegmentOf(s, span.a);
+        if (segment === undefined || segment !== poleSegmentOf(s, span.b)) continue; // (b)
+        const component = s.result.connectivity.componentOf.get(segment);
+
+        let crossesBody = false;
+        let onRail = false;
+        let ownBlock = false;
+        let nearest = Infinity;
+        let nearestLabel = '';
+        const foreign = new Set<string>();
+        for (const p of sampleSpan(span)) {
+          if (occ.at(p.x, p.z, { kinds: ['rail'], margin: 2 })) onRail = true; // (d)
+          for (const o of obstacles) {
+            const d = Math.hypot(p.x - o.x, p.z - o.z);
+            if (d <= o.body) crossesBody = true; // (c)
+            if (d > o.footprint) continue;
+            const same = s.result.connectivity.componentOf.get(o.segment) === component;
+            if (same) ownBlock = true; // (e)
+            else {
+              foreign.add(o.label);
+              if (d - o.body < nearest) {
+                nearest = d - o.body;
+                nearestLabel = o.label;
+              }
+            }
+          }
+        }
+        if (crossesBody || onRail) continue;
+        if (ownBlock) {
+          ownPortal++;
+          continue;
+        }
+        if (foreign.size === 0) continue;
+        bad.push(
+          `[${s.name}] 径間 (${span.a.base.x.toFixed(0)}, ${span.a.base.z.toFixed(0)})〜` +
+            `(${span.b.base.x.toFixed(0)}, ${span.b.base.z.toFixed(0)}) [seg#${segment}] が地中: ` +
+            `繋がっていない ${nearestLabel} の footprint に入っただけで、` +
+            `構造物本体までは最短 ${nearest.toFixed(1)} m の余裕がある`,
+        );
+      }
+    }
+    expect(
+      bad,
+      `\n架空 ${overhead} 径間 / 地中 ${underground} 径間 (うち自分の坑口・橋台の手前 ${ownPortal} 径間)\n` +
+        `${bad.slice(0, 12).join('\n')}\n... 計 ${bad.length} 件\n`,
+    ).toEqual([]);
+    expect(underground, '地中区間が 1 つもない (検査が空振り)').toBeGreaterThan(3);
+    expect(structural, '橋・トンネルが 1 つもない (検査が空振り)').toBeGreaterThan(3);
+    console.log(
+      `配電線: 架空 ${overhead} 径間 / 地中 ${underground} 径間 ` +
+        `(地中率 ${((underground / Math.max(1, overhead + underground)) * 100).toFixed(0)}%、` +
+        `うち自分の坑口・橋台の手前 ${ownPortal} 径間)`,
+    );
   }, 120000);
 
   it('柱が飛ばされた区間には電線を張らない', () => {
