@@ -1,7 +1,7 @@
 import { Vector3 } from 'three';
 import type { AlignmentSample } from '../core/alignment';
 import type { MeshBuilder } from '../core/meshbuilder';
-import { SURFACE_LIFT } from '../core/units';
+import { PROP_MAX_RISE, SURFACE_LIFT } from '../core/units';
 import type { NetworkClass } from '../network/classes';
 import { addBox, addWire } from './primitives';
 import { interpolateSample } from './rail';
@@ -77,6 +77,11 @@ export function planUtilityPoles(
 ): PolePlan[] {
   if (cls.kind !== 'road' || cls.sidewalkWidth < 1.0 || samples.length < 2) return [];
 
+  // 切土の法面の上には建てない。建てられない所は飛ばして地中で繋げばよい
+  // (橋・トンネルと同じ)。放っておくと電線が法面を突き抜ける。
+  const usable = (pos: Vector3, ground: number): boolean =>
+    ground <= pos.y + PROP_MAX_RISE && options.canPlace(pos.x, pos.z, ground);
+
   const pitch = options.pitch ?? POLE_PITCH;
   const s0 = samples[0].s;
   const total = samples[samples.length - 1].s - s0;
@@ -100,7 +105,7 @@ export function planUtilityPoles(
       // 足元の高さで判定する。路面の高さで問うと、隣の盛土の上に
       // 乗ってしまう場所を「空いている」と誤って答えてしまう。
       const ground = options.groundY(p.pos.x, p.pos.z, p.pos.y);
-      if (options.canPlace(p.pos.x, p.pos.z, ground)) free++;
+      if (usable(p.pos, ground)) free++;
     }
     if (free > bestFree) {
       bestFree = free;
@@ -114,7 +119,7 @@ export function planUtilityPoles(
     const placed = positionAt(samples, station, offset * side);
     if (!placed) return;
     const ground = options.groundY(placed.pos.x, placed.pos.z, placed.pos.y);
-    if (!options.canPlace(placed.pos.x, placed.pos.z, ground)) return;
+    if (!usable(placed.pos, ground)) return;
     poles.push({
       index,
       station,

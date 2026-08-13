@@ -111,6 +111,22 @@ export class Network {
     return seg;
   }
 
+  /**
+   * セグメントの制御点・端点勾配を差し替える。
+   * 端点の位置は変えないので、繋がっている相手を動かさずに線形だけ曲げられる。
+   */
+  updateSegment(
+    id: SegmentId,
+    patch: Partial<Pick<NetSegment, 'ctrlA' | 'ctrlB' | 'gradeA' | 'gradeB'>>,
+  ): void {
+    const seg = this.getSegment(id);
+    if (patch.ctrlA) seg.ctrlA = patch.ctrlA.clone();
+    if (patch.ctrlB) seg.ctrlB = patch.ctrlB.clone();
+    if (patch.gradeA !== undefined) seg.gradeA = patch.gradeA;
+    if (patch.gradeB !== undefined) seg.gradeB = patch.gradeB;
+    this.touch();
+  }
+
   removeSegment(id: SegmentId): void {
     const seg = this.segments.get(id);
     if (!seg) return;

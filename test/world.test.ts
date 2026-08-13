@@ -52,6 +52,29 @@ function draw(network: Network, classId: string, points: Vector3[]): void {
 }
 
 
+/**
+ * 経由点を直線で繋ぐ (折れをなめらかにする処理を通さない)。
+ * 折れ点そのものの形を見たいときに使う。
+ */
+function bend(network: Network, classId: string, points: Vector3[]): void {
+  const nodes = points.map((p) => network.findNodeNear(p, 0.5) ?? network.addNode(p));
+  for (let i = 1; i < nodes.length; i++) {
+    const a = nodes[i - 1].pos;
+    const b = nodes[i].pos;
+    const p0 = new Vector2(a.x, a.z);
+    const p1 = new Vector2(b.x, b.z);
+    network.addSegment({
+      classId,
+      a: nodes[i - 1].id,
+      b: nodes[i].id,
+      ctrlA: p0.clone().lerp(p1, 1 / 3),
+      ctrlB: p0.clone().lerp(p1, 2 / 3),
+      gradeA: 0,
+      gradeB: 0,
+    });
+  }
+}
+
 /** その XZ を覆う面のうち、いちばん高いものの高さ。覆われていなければ null。 */
 function surfaceTopAt(mesh: Mesh, x: number, z: number): number | null {
   const position = mesh.geometry.attributes.position;
@@ -273,7 +296,8 @@ describe('折れ点 (2 枝のノード)', () => {
         field.resetWork();
         const network = new Network();
         const rad = (bendDeg * Math.PI) / 180;
-        draw(network, classId, [
+        // 折れをそのまま残したいので、なめらか化を通さずに直接 2 本繋ぐ。
+        bend(network, classId, [
           new Vector3(0, 40, -200),
           new Vector3(0, 40, 0),
           new Vector3(Math.sin(rad) * 200, 40, Math.cos(rad) * 200),

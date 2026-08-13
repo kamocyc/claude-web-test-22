@@ -1,4 +1,4 @@
-import { Vector2, Vector3 } from 'three';
+import { Vector3 } from 'three';
 import type { Alignment } from '../core/alignment';
 import {
   CLEARANCE_OVER_RAIL,
@@ -6,12 +6,14 @@ import {
   DECK_THICKNESS,
   DEG,
   LEVEL_CROSSING_TOLERANCE,
+  clamp,
 } from '../core/units';
 import { MAX_CROSSING_LIFT } from '../build/crossing';
 import type { NetworkClass } from './classes';
 import { intersectPolylines, toPolyline, type PolylinePoint } from './crossings';
 import type { Anchor } from './editing';
-import type { Network, NodeId, SegmentId } from './network';
+import { CORNER_MARGIN, requiredTrims, type BranchLike } from './junction';
+import type { Branch, Network, NodeId, SegmentId } from './network';
 
 /**
  * 敷設してよいかの判定。
@@ -23,8 +25,10 @@ import type { Network, NodeId, SegmentId } from './network';
 
 /** 交差点として成り立たない浅すぎる交差角。 */
 const MIN_CROSSING_ANGLE = 20 * DEG;
-/** 交差点どうしを離す最小距離 [m] (幅員に加える分)。 */
-const JUNCTION_CLEARANCE = 8;
+/** 交差点 1 つが 1 本のセグメントから取れる長さの上限 (区間長に対する比)。 */
+const MAX_TRIM_RATIO = 0.45;
+/** 交差点 1 つが取り込める長さの上限 [m]。 */
+const MAX_TRIM = 40;
 
 export interface PlacementCheck {
   /** 空なら敷設できる。 */
@@ -69,6 +73,16 @@ export function checkPlacement(ctx: PlacementContext): PlacementCheck {
   };
   for (const anchor of [ctx.start, ctx.end]) {
     if (anchor.node !== undefined) visit(anchor.node, 1);
+    // 途中に取り付く相手も「端点で繋がる相手」。ここを重なりとして数えると、
+    // T 字に取り付くだけで必ず「交差点が近すぎます」になってしまう。
+    // 取り付きの成否は `checkJunctionSpacing` で分割後の形として見る。
+    if (!anchor.split) continue;
+    connected.add(anchor.split.segment);
+    const seg = network.segments.get(anchor.split.segment);
+    if (seg) {
+      visit(seg.a, 0);
+      visit(seg.b, 0);
+    }
   }
   if (ctx.ignore !== undefined) connected.add(ctx.ignore);
 
@@ -165,16 +179,19 @@ function checkOverlaps(ctx: PlacementContext, connected: Set<SegmentId>): string
           if (need > MAX_CROSSING_LIFT) worstCrossing = Math.max(worstCrossing, need);
         }
         if (cls.kind === other.kind) {
-          // 交差点は取り付き部の分だけ両側の線形を食べる。端に近すぎると
-          // 交差点どうしが重なるので置かせない。
-          const trim = (cls.halfWidth + other.halfWidth) / Math.max(0.2, sin) + JUNCTION_CLEARANCE;
-          const room = Math.min(
-            hit.sA,
-            ctx.alignment.length - hit.sA,
-            hit.sB,
-            otherLength - hit.sB,
+          // 交差点は取り付き部の分だけ両側の線形を食べる。取り付きが端から
+          // はみ出すようなら、交差点の形が崩れるので置かせない。
+          // (「余裕をもって離す」ではなく、**実際に要る長さ**で判定する。)
+          const cos = Math.abs(hit.dirA.x * hit.dirB.x + hit.dirA.y * hit.dirB.y);
+          const mine = crossingTrim(cls, other, sin, cos);
+          const theirs = crossingTrim(other, cls, sin, cos);
+          // 交差点はここで両方を分割する。トリムを飲み込めるかは、
+          // 分割してできる**短い方**の長さで決まる。
+          tooClose = Math.max(
+            tooClose,
+            mine - roomFor(Math.min(hit.sA, ctx.alignment.length - hit.sA), 0),
+            theirs - roomFor(Math.min(hit.sB, otherLength - hit.sB), 0),
           );
-          if (room < trim) tooClose = Math.max(tooClose, trim - room);
         }
         continue;
       }
@@ -199,9 +216,9 @@ function checkOverlaps(ctx: PlacementContext, connected: Set<SegmentId>): string
       }
     }
 
-    if (tooClose > 0) {
+    if (tooClose > 0.05) {
       out.push(
-        `交差点が近すぎます (あと ${tooClose.toFixed(0)} m 離すか、既存のノードに繋いでください)。`,
+        `交差点が近すぎます (あと ${Math.max(1, tooClose).toFixed(0)} m 離すか、既存のノードに繋いでください)。`,
       );
     }
     if (shallow) {
@@ -289,69 +306,163 @@ function nearestOn(
 }
 
 /**
- * 交差点が近すぎないか。
+ * 交差点として形が保てるか。
  *
- * 交差点は取り付き部 (トリム) の分だけ線形を食べるので、両端の取り付き長を
- * 足して区間長を超えるようだと形が破綻する。新しくノードを作る場合は、
- * 既存のノードから十分離れていることも見る。
+ * 「何 m 離す」という一律の余裕ではなく、**交差点が実際に食べる長さ**
+ * (トリム) が取れるかどうかで判定する。トリムは交差点を解くときと同じ
+ * 計算 (`requiredTrims`) なので、通った配置は必ず形が保たれ、形が乱れる
+ * ほど詰まった配置は必ず止まる。
+ *
+ * 見るのは 3 通り。
+ *  - 既存ノードに繋ぐ … 集まる枝それぞれがトリムを飲み込めるか
+ *  - 既存セグメントの途中に繋ぐ … 分割してできる 2 本が飲み込めるか
+ *  - 新しいノードを作る … その点が既存の交差点の中に入っていないか
  */
 function checkJunctionSpacing(ctx: PlacementContext): string[] {
   const { network, cls, alignment } = ctx;
   const out: string[] = [];
   const length = alignment.length;
+  const mineAt: number[] = [0, 0];
 
-  let needed = 0;
-  for (const [anchor, atStart] of [
+  const ends: [Anchor, boolean][] = [
     [ctx.start, true],
     [ctx.end, false],
-  ] as [Anchor, boolean][]) {
+  ];
+  ends.forEach(([anchor, atStart], index) => {
     const dir = atStart
       ? alignment.sampleAt(0).forwardXZ.clone()
       : alignment.sampleAt(length).forwardXZ.clone().negate();
+    const mine: BranchLike = { dir, cls };
 
     if (anchor.node !== undefined) {
-      needed += requiredTrim(network, anchor.node, dir, cls);
-      continue;
+      const branches = network
+        .branchesAt(anchor.node)
+        .filter((b) => b.segment !== ctx.ignore);
+      const trims = requiredTrims([...branches, mine]);
+      mineAt[index] = trims[trims.length - 1];
+      branches.forEach((branch, k) => {
+        if (trims[k] < 1e-3) return; // 一直線に繋がる枝はトリムしない
+        const shortfall = trims[k] + CORNER_MARGIN - branchRoom(network, branch);
+        if (shortfall > 0.05) out.push(tooClose(shortfall));
+      });
+      return;
     }
-    // 新しいノードを作る場合、既存のノードに近すぎると交差点が重なる。
-    const spacing = cls.halfWidth + JUNCTION_CLEARANCE;
-    const near = network.findNodeNear(anchor.pos, spacing);
-    if (near && network.branchesAt(near.id).length > 0) {
-      const distance = near.pos.distanceTo(anchor.pos);
+
+    if (anchor.split) {
+      const seg = network.segments.get(anchor.split.segment);
+      if (!seg) return;
+      const split = network.alignmentOf(anchor.split.segment);
+      const s = clamp(anchor.split.s, 0, split.length);
+      const tangent = split.sampleAt(s).forwardXZ;
+      const splitCls = network.classOf(seg);
+      // 分割すると、切った点から両側へ 1 本ずつの枝ができる。
+      const halves: { branch: BranchLike; length: number; far: NodeId }[] = [
+        { branch: { dir: tangent.clone().negate(), cls: splitCls }, length: s, far: seg.a },
+        {
+          branch: { dir: tangent.clone(), cls: splitCls },
+          length: split.length - s,
+          far: seg.b,
+        },
+      ];
+      const trims = requiredTrims([...halves.map((h) => h.branch), mine]);
+      mineAt[index] = trims[trims.length - 1];
+      halves.forEach((half, k) => {
+        if (trims[k] < 1e-3) return;
+        const far = trimAt(network, half.far, anchor.split!.segment);
+        const shortfall =
+          trims[k] + CORNER_MARGIN - roomFor(half.length, far + CORNER_MARGIN);
+        if (shortfall > 0.05) out.push(tooClose(shortfall));
+      });
+      return;
+    }
+
+    // 新しいノードを作る場合。既存の交差点の**面の中**に端点を置くと、
+    // 舗装どうしが重なって形が乱れる。逆に交差点の外なら、多少近くても
+    // 形は保たれるので止めない。
+    for (const node of network.nodes.values()) {
+      const distance = node.pos.distanceTo(anchor.pos);
+      if (distance > 60) continue;
+      const reach = junctionReach(network, node.id) + cls.halfWidth * 0.5;
+      if (distance < reach) {
+        out.push(
+          `交差点の中に端点があります (あと ${Math.max(1, reach - distance).toFixed(0)} m 離すか、` +
+            `交差点のノードに繋いでください)。`,
+        );
+      }
+    }
+  });
+
+  // 新しい線形自身が、両端の取り付きを飲み込めるか。
+  // (トリムのいらない端 = 交差点にならない端は見ない。引き始めの
+  //  長さ 0 のプレビューで「区間長が足りない」と言わないため。)
+  mineAt.forEach((trim, index) => {
+    if (trim < 1e-3) return;
+    const shortfall =
+      trim + CORNER_MARGIN - roomFor(length, mineAt[1 - index] + CORNER_MARGIN);
+    if (shortfall > 0.05) {
       out.push(
-        `交差点まで ${distance.toFixed(1)} m しかありません (${spacing.toFixed(0)} m 以上離してください)。`,
+        `交差点の取り付きに ${(trim + CORNER_MARGIN).toFixed(0)} m 必要ですが、` +
+          `区間長が ${length.toFixed(0)} m しかありません。`,
       );
     }
-  }
-
-  if (needed > 0 && needed > length * 0.85) {
-    out.push(
-      `交差点の取り付きに ${needed.toFixed(0)} m 必要ですが、区間長が ${length.toFixed(0)} m しかありません。`,
-    );
-  }
+  });
   return out;
 }
 
+function tooClose(shortfall: number): string {
+  return `交差点が近すぎます (あと ${Math.max(1, shortfall).toFixed(0)} m 離すか、既存のノードに繋いでください)。`;
+}
+
 /**
- * そのノードに取り付くのに必要な長さ。
- * 隣り合う枝との路端線の交点までの距離で、交差角が浅いほど長くなる。
+ * 長さ `length` のセグメントが、反対の端で `farTrim` を取られたうえで
+ * こちらの端に差し出せる長さ [m]。
+ *
+ * 交差点を解くときに掛かる上限 (区間長の 45%・40 m・両端の合計) と
+ * 同じ条件にしてある。これを超える配置は、必ずトリムが頭打ちになって
+ * 形が乱れる。
  */
-function requiredTrim(
-  network: Network,
-  node: NodeId,
-  dir: Vector2,
-  cls: NetworkClass,
+function roomFor(length: number, farTrim: number): number {
+  return Math.min(length * MAX_TRIM_RATIO, MAX_TRIM, length - farTrim - 1);
+}
+
+/** その枝がノード側に差し出せる長さ [m]。 */
+function branchRoom(network: Network, branch: Branch): number {
+  const seg = network.segments.get(branch.segment);
+  if (!seg) return 0;
+  const length = network.alignmentOf(branch.segment).length;
+  const far = trimAt(network, branch.atStart ? seg.b : seg.a, branch.segment);
+  return roomFor(length, far + CORNER_MARGIN);
+}
+
+/** そのノードで、指定したセグメントの枝に必要なトリム量 [m]。 */
+function trimAt(network: Network, node: NodeId, segment: SegmentId): number {
+  const branches = network.branchesAt(node);
+  const index = branches.findIndex((b) => b.segment === segment);
+  if (index < 0) return 0;
+  return requiredTrims(branches)[index];
+}
+
+/** その交差点の面が広がっている範囲 [m] (端点・継ぎ目なら 0)。 */
+function junctionReach(network: Network, node: NodeId): number {
+  const branches = network.branchesAt(node);
+  if (branches.length < 2) return 0;
+  const trims = requiredTrims(branches);
+  const trim = Math.max(...trims);
+  if (trim < 1e-3) return 0;
+  return Math.min(trim + CORNER_MARGIN, MAX_TRIM);
+}
+
+/**
+ * 同一平面で交差する 2 本のうち、片方が交差点に差し出す長さ [m]。
+ * 交差点を解くときの路端線の交点と同じ式。
+ */
+function crossingTrim(
+  own: NetworkClass,
+  other: NetworkClass,
+  sin: number,
+  cos: number,
 ): number {
-  let trim = 0;
-  for (const branch of network.branchesAt(node)) {
-    const sin = Math.abs(dir.x * branch.dir.y - dir.y * branch.dir.x);
-    const cos = dir.dot(branch.dir);
-    // ほぼ一直線に繋がる場合はトリム不要。
-    if (cos < -0.999) continue;
-    if (sin < 1e-3) continue;
-    trim = Math.max(trim, (branch.cls.halfWidth + cls.halfWidth * Math.max(0, cos)) / sin);
-  }
-  return trim;
+  return (other.halfWidth + own.halfWidth * cos) / Math.max(0.05, sin) + CORNER_MARGIN;
 }
 
 function dedupe(list: string[]): string[] {

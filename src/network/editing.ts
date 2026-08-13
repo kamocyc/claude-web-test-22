@@ -1,6 +1,6 @@
 import { Vector2, Vector3 } from 'three';
 import { HorizontalCurve, arcFromTangent, type XZ } from '../core/curve';
-import { clamp } from '../core/units';
+import { DEG, clamp } from '../core/units';
 import type { NetworkClass } from './classes';
 import type { Network, NetNode, NodeId, SegmentId } from './network';
 
@@ -133,6 +133,95 @@ export interface PlaceResult {
   endNode: NodeId;
   /** 自動生成された交差点のノード。 */
   autoJunctions: NodeId[];
+  /** 折れをなめらかにしたノード。 */
+  smoothed: NodeId[];
+}
+
+/** 折れをなめらかにする角度の範囲。これより浅ければ元から折れていない。 */
+const MIN_SMOOTHED_DEFLECTION = 1 * DEG;
+/** これより深い折れは「角にしたい」意図とみなして触らない。 */
+const MAX_SMOOTHED_DEFLECTION = 60 * DEG;
+/** なめらかにする度合い。1 で完全に接線を揃える。 */
+const SMOOTHING_STEPS = [1, 0.7, 0.45, 0.25];
+
+/**
+ * ノードでの折れをなめらかにする。
+ *
+ * 引いたばかりの線形を既存の線形の端に繋ぐと、そこで折れて「角」になる。
+ * 実際の道路は取り付く側だけでなく**既存側も少し振って**繋ぐので、
+ * ここでも両方の端点接線を二等分線へ寄せる。端点の位置は動かさないので、
+ * 繋がっている相手の線形やノードの位置には影響しない。
+ *
+ * 寄せる量は、両方の線形が規格 (最小半径・最大勾配) に収まる範囲まで。
+ * 収まらなければ段階的に控えめにし、それでも駄目なら元のままにする。
+ */
+export function smoothJoint(network: Network, node: NodeId): boolean {
+  const branches = network.branchesAt(node);
+  if (branches.length !== 2) return false;
+  const [b0, b1] = branches;
+  if (b0.cls.kind !== b1.cls.kind) return false;
+
+  const deflection = Math.PI - Math.acos(clamp(b0.dir.dot(b1.dir), -1, 1));
+  if (deflection < MIN_SMOOTHED_DEFLECTION || deflection > MAX_SMOOTHED_DEFLECTION) return false;
+
+  // 二等分線。両方の枝がこの向き (と真逆) を向けば折れが消える。
+  const bisector = b0.dir.clone().sub(b1.dir);
+  if (bisector.lengthSq() < 1e-9) return false;
+  bisector.normalize();
+  const turn = [
+    signedAngle(b0.dir, bisector),
+    signedAngle(b1.dir, bisector.clone().negate()),
+  ];
+  // 縦断も同じように、外向き勾配が符号違いで揃うところを目標にする。
+  const target = (b0.grade - b1.grade) / 2;
+  const gradeShift = [target - b0.grade, -target - b1.grade];
+
+  const before = branches.map((b) => network.getSegment(b.segment));
+  const original = before.map((seg) => ({
+    ctrlA: seg.ctrlA.clone(),
+    ctrlB: seg.ctrlB.clone(),
+    gradeA: seg.gradeA,
+    gradeB: seg.gradeB,
+  }));
+  const restore = (): void => {
+    branches.forEach((b, i) => network.updateSegment(b.segment, original[i]));
+  };
+
+  for (const k of SMOOTHING_STEPS) {
+    branches.forEach((b, i) => {
+      const seg = network.getSegment(b.segment);
+      const origin = network.getNode(node).pos;
+      const pivot = new Vector2(origin.x, origin.z);
+      const handle = (b.atStart ? original[i].ctrlA : original[i].ctrlB).clone().sub(pivot);
+      const rotated = rotate(handle, turn[i] * k).add(pivot);
+      const grade = (b.atStart ? 1 : -1) * (b.grade + gradeShift[i] * k);
+      network.updateSegment(seg.id, b.atStart
+        ? { ctrlA: rotated, gradeA: grade }
+        : { ctrlB: rotated, gradeB: grade });
+    });
+    if (branches.every((b) => withinStandard(network, b.segment, b.cls))) return true;
+    restore();
+  }
+  return false;
+}
+
+function signedAngle(from: Vector2, to: Vector2): number {
+  return Math.atan2(from.x * to.y - from.y * to.x, from.dot(to));
+}
+
+function rotate(v: Vector2, angle: number): Vector2 {
+  const c = Math.cos(angle);
+  const s = Math.sin(angle);
+  return new Vector2(v.x * c - v.y * s, v.x * s + v.y * c);
+}
+
+/** その線形が規格 (最小半径・最大勾配) に収まっているか。 */
+function withinStandard(network: Network, segment: SegmentId, cls: NetworkClass): boolean {
+  const alignment = network.alignmentOf(segment);
+  return (
+    alignment.horizontal.extremeCurvature(48).minRadius >= cls.minRadius - 1e-6 &&
+    alignment.vertical.maxGrade(32) <= cls.maxGrade + 1e-6
+  );
 }
 
 /**
@@ -161,7 +250,15 @@ export function placeSegment(
   });
 
   const autoJunctions = resolveAutoJunctions(network, segment.id);
-  return { segment: segment.id, startNode: startNode.id, endNode: endNode.id, autoJunctions };
+  // 既存の線形の端に繋いだ所は、両方を少し振って折れを消す。
+  const smoothed = [startNode.id, endNode.id].filter((id) => smoothJoint(network, id));
+  return {
+    segment: segment.id,
+    startNode: startNode.id,
+    endNode: endNode.id,
+    autoJunctions,
+    smoothed,
+  };
 }
 
 /**

@@ -278,14 +278,15 @@ export class BuildTool {
       this.preview,
     );
 
-    // 終点を始点にして続けて引けるようにする。
+    // 終点を始点にして続けて引けるようにする。接線は敷設後の線形から
+    // 取り直す (折れをなめらかにした分だけ、プレビューとずれるため)。
     const endNode = this.network.nodes.get(result.endNode);
     if (endNode) {
+      const inherited = anchorFromNode(this.network, endNode, this.cls);
       this.anchor = {
-        pos: endNode.pos.clone(),
-        node: endNode.id,
-        tangent: this.preview.endTangent.clone(),
-        grade: this.preview.endGrade,
+        ...inherited,
+        tangent: inherited.tangent ?? this.preview.endTangent.clone(),
+        grade: inherited.grade ?? this.preview.endGrade,
       };
     } else {
       this.anchor = null;

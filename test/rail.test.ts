@@ -309,4 +309,103 @@ describe('線路の分岐', () => {
       }
     }
   });
+
+  /**
+   * 分岐器の道床は、通り抜ける軌道と同じように曲がっていなければならない。
+   *
+   * 両端の断面を弦で結んだだけの形にすると、曲線のふくらみの分だけ道床が
+   * 外へ張り出し、線路が道床の真ん中から外れて見える。
+   */
+  it('分岐器の道床が軌道に沿って曲がる (弦で結んだ形にならない)', () => {
+    const scene = switchScene(0, 0);
+    const junctions = switchJunctions(scene);
+    expect(junctions.length).toBe(1);
+    const junction = junctions[0];
+
+    // 交差点の中を通る全ての軌道と、取り付く枝の中心線。
+    const paths: { points: Vector3[]; halfWidth: number }[] = [];
+    for (const conn of junction.connections) {
+      const from = junction.approaches.find((a) => a.branch.segment === conn.from)!;
+      const to = junction.approaches.find((a) => a.branch.segment === conn.to)!;
+      const alignment = trackConnectionAlignment(from, to)!;
+      const points: Vector3[] = [];
+      for (let i = 0; i <= 60; i++) points.push(alignment.sampleAt((alignment.length * i) / 60).pos);
+      paths.push({
+        points,
+        halfWidth: Math.max(from.branch.cls.halfWidth, to.branch.cls.halfWidth),
+      });
+    }
+    expect(paths.length).toBeGreaterThanOrEqual(2);
+
+    /** その点から、いちばん近い軌道の路端までの距離 (中に入っていれば負)。 */
+    const beyondTrack = (x: number, z: number): number => {
+      let best = Infinity;
+      for (const path of paths) {
+        for (const p of path.points) {
+          best = Math.min(best, Math.hypot(p.x - x, p.z - z) - path.halfWidth);
+        }
+      }
+      return best;
+    };
+
+    const ballast = junction.rings[junction.rings.length - 1];
+    let inside = 0;
+    let worst = 0;
+    let worstAt = '';
+    const bounds = ballast.reduce(
+      (b, p) => ({
+        minX: Math.min(b.minX, p.x),
+        maxX: Math.max(b.maxX, p.x),
+        minZ: Math.min(b.minZ, p.z),
+        maxZ: Math.max(b.maxZ, p.z),
+      }),
+      { minX: Infinity, maxX: -Infinity, minZ: Infinity, maxZ: -Infinity },
+    );
+    for (let x = bounds.minX; x <= bounds.maxX; x += 0.35) {
+      for (let z = bounds.minZ; z <= bounds.maxZ; z += 0.35) {
+        if (surfaceHeightAt(ballast, x, z) === null) continue;
+        inside++;
+        const beyond = beyondTrack(x, z);
+        if (beyond > worst) {
+          worst = beyond;
+          worstAt = `(${x.toFixed(1)}, ${z.toFixed(1)})`;
+        }
+      }
+    }
+    expect(inside).toBeGreaterThan(500);
+    // 軌道の路端から 1.5 m 以上外まで道床が張り出していたら、それは
+    // 曲線を無視して弦で結んでいる (直前の実装では 4 m 近く出ていた)。
+    expect(`${worst.toFixed(2)} m @ ${worstAt}`).toBe(`${Math.min(worst, 1.5).toFixed(2)} m @ ${worstAt}`);
+  });
+
+  /**
+   * 交差点の道床は、セグメントの道床と同じ色でなければならない。
+   * 種別の代表色をそのまま使うと、断面の道床色とわずかに食い違って
+   * 分岐器の所だけ色が変わって見える。
+   */
+  it('分岐器の道床の色が、線路の道床の色と同じ', () => {
+    const scene = switchScene(0, 0);
+    const junction = switchJunctions(scene)[0];
+    const node = scene.network.getNode(junction.node).pos;
+    const surfaces = scene.meshes.get('surfaces')!;
+    const position = surfaces.geometry.attributes.position;
+    const normal = surfaces.geometry.attributes.normal;
+    const color = surfaces.geometry.attributes.color;
+
+    const tones = new Set<string>();
+    let counted = 0;
+    for (let i = 0; i < position.count; i++) {
+      // 道床の天端 (上向きの面) だけを見る。法面は別の色でよい。
+      if (normal.getY(i) < 0.9) continue;
+      const dx = position.getX(i) - node.x;
+      const dz = position.getZ(i) - node.z;
+      if (dx * dx + dz * dz > 25 * 25) continue;
+      counted++;
+      tones.add(
+        [color.getX(i), color.getY(i), color.getZ(i)].map((v) => v.toFixed(3)).join(','),
+      );
+    }
+    expect(counted).toBeGreaterThan(10);
+    expect([...tones]).toHaveLength(1);
+  });
 });

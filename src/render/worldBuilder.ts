@@ -2,7 +2,7 @@ import { Group, Mesh, Vector3, type Vector2 } from 'three';
 import type { Alignment } from '../core/alignment';
 import { MeshBuilder, signedAreaXZ } from '../core/meshbuilder';
 import { perp } from '../core/curve';
-import { TERRAIN_CELL, lerp, smoothstep } from '../core/units';
+import { PROP_MAX_RISE, TERRAIN_CELL, lerp, smoothstep } from '../core/units';
 import {
   applySurfaceBlend,
   buildFlangeways,
@@ -1138,6 +1138,9 @@ export class WorldBuilder {
         lateral * (sample.roll ?? 0) * sign;
       // 桁の上では地形を見ない (地面は遥か下にある)。
       const baseY = onBridge ? surfaceY : this.propGroundY(x, z, surfaceY);
+      // 切土の法面の上には立てない。地面には接していても、路面から
+      // 何 m も高い所に信号や標識が浮いて見えてしまう。
+      if (baseY - surfaceY > PROP_MAX_RISE) continue;
       if (
         !this.occupancy.isFree(x, z, {
           exceptSegments: [approach.branch.segment],

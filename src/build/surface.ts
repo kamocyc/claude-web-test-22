@@ -351,11 +351,16 @@ export function buildJunctionSurface(
   const profile = profileFor(cls);
   const lifted = rings.map((ring) => ring.map((p) => new Vector3(p.x, p.y + SURFACE_LIFT, p.z)));
   const closed = (i: number): boolean => !openEdge[i];
+  // リング k はセグメント側の断面点 k と同じ高さ・同じ色。いちばん内側の
+  // 面に `cls.surfaceColor` を使うと、線路では道床の色 (BALLAST) と
+  // わずかに食い違って、交差点だけ色が違って見える。
+  const colorAt = (k: number): RGB =>
+    applyTint(profile[Math.min(k, profile.length - 1)].color, tint);
 
-  fillPolygon(mb, lifted[lifted.length - 1], applyTint(cls.surfaceColor, tint), 0.12, 0);
+  fillPolygon(mb, lifted[lifted.length - 1], colorAt(lifted.length - 1), 0.12, 0);
   for (let k = 0; k + 1 < lifted.length; k++) {
-    const color = applyTint(profile[Math.min(k, profile.length - 1)].color, tint);
-    buildRingBand(mb, lifted[k], lifted[k + 1], color, closed);
+    // 帯はセグメント側と同じように、内外の断面色を繋いだ階調にする。
+    buildRingBand(mb, lifted[k], lifted[k + 1], colorAt(k), colorAt(k + 1), closed);
   }
   // 外周の垂れ壁は地面まで届かせる。勾配の違う枝が集まる交差点では、
   // 隅で 2〜3 m の段差ができることがあり、固定長では隠しきれない。
@@ -415,7 +420,8 @@ function buildRingBand(
   mb: MeshBuilder,
   outer: Vector3[],
   inner: Vector3[],
-  color: RGB,
+  outerColor: RGB,
+  innerColor: RGB,
   include: (i: number) => boolean = () => true,
 ): void {
   const n = Math.min(outer.length, inner.length);
@@ -428,14 +434,17 @@ function buildRingBand(
     if (!include(i)) continue;
     const j = (i + 1) % n;
     const quad = [outer[i], outer[j], inner[j], inner[i]];
+    const colors = [outerColor, outerColor, innerColor, innerColor];
     const geometric = newellNormal(quad);
     if (geometric.lengthSq() < 1e-14) continue;
     const normal = orientBandNormal(geometric.clone().normalize(), outer[i], centroid);
     // 面の向き (表裏) は頂点の並び順で決まるので、法線に合わせて並べ直す。
-    const ordered = geometric.dot(normal) < 0 ? [quad[3], quad[2], quad[1], quad[0]] : quad;
+    const flip = geometric.dot(normal) < 0;
+    const ordered = flip ? [quad[3], quad[2], quad[1], quad[0]] : quad;
+    const tones = flip ? [colors[3], colors[2], colors[1], colors[0]] : colors;
     const base = mb.vertexCount;
     for (let k = 0; k < 4; k++) {
-      mb.vertex(ordered[k], normal, k & 1, k >> 1, color);
+      mb.vertex(ordered[k], normal, k & 1, k >> 1, tones[k]);
     }
     mb.quad(base, base + 1, base + 2, base + 3);
   }

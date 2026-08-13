@@ -1,8 +1,14 @@
 import { Vector2, Vector3 } from 'three';
 import { perp } from '../core/curve';
-import { clamp } from '../core/units';
+import { clamp, lerp } from '../core/units';
+import { trackConnectionAlignment } from '../build/rail';
 import { profileFor, type ProfilePoint } from '../build/surface';
-import { MAX_TURNOUT_ANGLE, STRAIGHT_THROUGH_ANGLE, type NetworkKind } from './classes';
+import {
+  MAX_TURNOUT_ANGLE,
+  STRAIGHT_THROUGH_ANGLE,
+  type NetworkClass,
+  type NetworkKind,
+} from './classes';
 import type { Branch, Network, NodeId, SegmentId } from './network';
 
 export type JunctionKind =
@@ -88,7 +94,37 @@ export interface JunctionSolution {
 }
 
 /** 隅角部を丸めるために各接続枝へ追加で与える余裕 [m]。 */
-const CORNER_MARGIN = 0.6;
+export const CORNER_MARGIN = 0.6;
+
+/** ノードに取り付く 1 本の枝 (向きと規格だけ)。取り付き長の計算に使う。 */
+export interface BranchLike {
+  /** ノードから外向きの単位方向 (水平)。 */
+  dir: Vector2;
+  cls: NetworkClass;
+}
+
+/**
+ * ノードに集まる枝それぞれに必要なトリム量 [m] を返す (入力と同じ順序)。
+ *
+ * 見るのは方位角順に**隣り合う組**だけ。向かい合う枝の路端線は交差点の
+ * 形を決めないので、そこまで見ると必要以上に長いトリムになってしまう。
+ */
+export function requiredTrims(branches: BranchLike[]): number[] {
+  const n = branches.length;
+  const trims = new Array<number>(n).fill(0);
+  if (n < 2) return trims;
+  const angle = (i: number): number => Math.atan2(branches[i].dir.y, branches[i].dir.x);
+  const order = branches.map((_, i) => i).sort((a, b) => angle(a) - angle(b));
+  for (let k = 0; k < n; k++) {
+    const i = order[k];
+    const j = order[(k + 1) % n];
+    const solved = borderIntersection(branches[i], branches[j]);
+    if (!solved) continue;
+    trims[i] = Math.max(trims[i], solved.ti);
+    trims[j] = Math.max(trims[j], solved.tj);
+  }
+  return trims;
+}
 
 /**
  * ネットワーク全体の交差点形状を解く。
@@ -142,7 +178,12 @@ export function solveJunctions(
         updateApproachGeometry(network, ap, heightOffset);
       }
     }
-    const built = buildRings(junction);
+    let built = buildRings(junction, true);
+    // 軌道に沿わせた縁が交差してしまう配置 (極端に鋭い分岐など) では、
+    // 従来どおり弦で結んだ形に戻す。ねじれた面よりは膨らんだ面のほうがよい。
+    if (built.curved && selfIntersects(built.rings[0] ?? [])) {
+      built = buildRings(junction, false);
+    }
     junction.rings = built.rings;
     junction.ring = built.rings[0] ?? [];
     junction.openEdge = built.openEdge;
@@ -233,18 +274,11 @@ function solveNode(
     section: [],
   }));
 
-  if (n >= 2) {
-    // 2 枝のときも (0,1) と (1,0) の両方を見る。折れ点では外側だけに隙間ができ、
-    // どちら側にできるかは折れる向きで決まるため。
-    for (let i = 0; i < n; i++) {
-      const j = (i + 1) % n;
-      const solved = borderIntersection(branches[i], branches[j]);
-      if (solved) {
-        approaches[i].trim = Math.max(approaches[i].trim, solved.ti);
-        approaches[j].trim = Math.max(approaches[j].trim, solved.tj);
-      }
-    }
-  }
+  // 2 枝のときも (0,1) と (1,0) の両方を見る。折れ点では外側だけに隙間ができ、
+  // どちら側にできるかは折れる向きで決まるため。
+  requiredTrims(branches).forEach((trim, i) => {
+    approaches[i].trim = Math.max(approaches[i].trim, trim);
+  });
 
   const connections = kind === 'railSwitch' || kind === 'railCrossing' || kind === 'seam'
     ? solveTrackConnections(branches, warnings)
@@ -323,7 +357,7 @@ function angleBetween(a: Vector2, b: Vector2): number {
  * 枝 `i` の「方位角が大きい側」の路端と、枝 `j` の「方位角が小さい側」の
  * 路端が向かい合う。`perp` は方位角が増える向きを指すのでこの対応になる。
  */
-function borderIntersection(bi: Branch, bj: Branch): { ti: number; tj: number } | null {
+function borderIntersection(bi: BranchLike, bj: BranchLike): { ti: number; tj: number } | null {
   const di = bi.dir;
   const dj = bj.dir;
   const det = -(di.x * dj.y - di.y * dj.x);
@@ -435,10 +469,14 @@ function sectionPoint(
  * する 2 次ベジエで隅丸めを入れる。全てのリングは同じ手順・同じ点数で作る
  * ので、隣り合うリングの間を帯で埋めれば交差点の歩道・縁石まで表現できる。
  */
-function buildRings(junction: Junction): { rings: Vector3[][]; openEdge: boolean[] } {
+function buildRings(
+  junction: Junction,
+  /** 軌道の通る区間の縁を、その曲線に沿わせるか。 */
+  followTracks: boolean,
+): { rings: Vector3[][]; openEdge: boolean[]; curved: boolean } {
   const aps = junction.approaches;
   const n = aps.length;
-  const empty = { rings: [], openEdge: [] };
+  const empty = { rings: [], openEdge: [], curved: false };
   if (n < 2 || junction.kind === 'seam' || junction.kind === 'end') return empty;
   if (aps.every((a) => a.trim < 1e-3)) return empty;
 
@@ -455,6 +493,7 @@ function buildRings(junction: Junction): { rings: Vector3[][]; openEdge: boolean
    * 路端線の交点をそのまま角に使えば、両側の帯と隙間なく繋がる。
    */
   const sharpCorner = junction.kind === 'joint' || junction.kind === 'railSwitch';
+  let curved = false;
 
   for (let i = 0; i < n; i++) {
     const cur = aps[i];
@@ -469,27 +508,99 @@ function buildRings(junction: Junction): { rings: Vector3[][]; openEdge: boolean
     // レベルごとに判定すると点数が揃わず、帯が組めなくなる。
     const outerA = sideOf(cur, 0, 'next');
     const outerB = sideOf(next, 0, 'prev');
-    if (outerA.distanceTo(outerB) > 0.05) {
+    if (outerA.distanceTo(outerB) <= 0.05) continue;
+
+    // この 2 枝の間を軌道が通り抜けるなら、縁もその曲線に沿わせる。
+    const steps = followTracks ? trackedBoundarySteps(junction, cur, next) : 0;
+    if (steps > 0) {
       for (let k = 0; k < levels; k++) {
-        const a = sideOf(cur, k, 'next');
-        const b = sideOf(next, k, 'prev');
-        // 内側のリードでは路端線が交わらないことがある。その場合は
-        // 中点を制御点にして、点数だけ揃える。
-        const corner =
-          cornerControl(a, cur.dir, b, next.dir, sharpCorner) ?? a.clone().lerp(b, 0.5);
-        if (sharpCorner) {
-          rings[k].push(corner);
-        } else {
-          for (let t = 1; t <= 3; t++) {
-            rings[k].push(quadratic(a, corner, b, t / 4));
-          }
+        rings[k].push(...trackedBoundary(cur, next, k, steps));
+      }
+      for (let t = 1; t < steps; t++) openEdge.push(false);
+      curved = true;
+      continue;
+    }
+
+    for (let k = 0; k < levels; k++) {
+      const a = sideOf(cur, k, 'next');
+      const b = sideOf(next, k, 'prev');
+      // 内側のリードでは路端線が交わらないことがある。その場合は
+      // 中点を制御点にして、点数だけ揃える。
+      const corner =
+        cornerControl(a, cur.dir, b, next.dir, sharpCorner) ?? a.clone().lerp(b, 0.5);
+      if (sharpCorner) {
+        rings[k].push(corner);
+      } else {
+        for (let t = 1; t <= 3; t++) {
+          rings[k].push(quadratic(a, corner, b, t / 4));
         }
       }
-      openEdge.push(...(sharpCorner ? [false] : [false, false, false]));
     }
+    openEdge.push(...(sharpCorner ? [false] : [false, false, false]));
   }
 
-  return dedupeRings(rings, openEdge);
+  return { ...dedupeRings(rings, openEdge), curved };
+}
+
+/** 曲線に沿わせる縁を何分割するか。0 なら隅の処理に任せる。 */
+const TRACKED_BOUNDARY_SPACING = 5;
+
+/**
+ * 隣り合う 2 枝の間を軌道が通り抜けるか。通り抜けるなら分割数を返す。
+ *
+ * 分岐器の道床を、両端の断面を弦で結んだだけの形にすると、軌道が曲がる
+ * ぶんだけ道床が外へ膨らみ、線路が道床の真ん中から外れて見える。分岐の
+ * 曲線に沿って縁を刻めば、道床は軌道と同じように曲がる。
+ */
+function trackedBoundarySteps(junction: Junction, from: Approach, to: Approach): number {
+  if (junction.kind !== 'railSwitch' && junction.kind !== 'railCrossing') return 0;
+  const conn = junction.connections.find(
+    (c) =>
+      (c.from === from.branch.segment && c.to === to.branch.segment) ||
+      (c.to === from.branch.segment && c.from === to.branch.segment),
+  );
+  // ほぼ直線で繋がる区間は弦との差がないので刻まない。
+  if (!conn || conn.deflection < 2 * (Math.PI / 180)) return 0;
+  const span = from.center.distanceTo(to.center);
+  return clamp(Math.round(span / TRACKED_BOUNDARY_SPACING), 2, 12);
+}
+
+/**
+ * 2 枝を繋ぐ軌道の曲線に沿った、道床の縁の点列 (両端は含まない)。
+ *
+ * 曲線は軌道と同じもの (`trackConnectionAlignment`) を使うので、道床は
+ * レールと同じように曲がる。横距と高さは両端の断面から補間するので、
+ * 種別の違う枝を繋いでも継ぎ目が開かない。
+ */
+function trackedBoundary(from: Approach, to: Approach, k: number, steps: number): Vector3[] {
+  const alignment = trackConnectionAlignment(from, to);
+  const a = sideOf(from, k, 'next');
+  const b = sideOf(to, k, 'prev');
+  if (!alignment) return [];
+
+  // 断面端点を「外向き方向から見た横距」と「中心線からの高さ」に直す。
+  const na = perp(from.dir);
+  const nb = perp(to.dir);
+  const oa = (a.x - from.center.x) * na.x + (a.z - from.center.z) * na.y;
+  const ob = -((b.x - to.center.x) * nb.x + (b.z - to.center.z) * nb.y);
+  const ha = a.y - from.center.y;
+  const hb = b.y - to.center.y;
+
+  const out: Vector3[] = [];
+  for (let i = 1; i < steps; i++) {
+    const t = i / steps;
+    const sample = alignment.sampleAt(t * alignment.length);
+    const offset = lerp(oa, ob, t);
+    // 曲線は from の外向きと逆に進むので、from の「次の枝側」は左手側。
+    out.push(
+      new Vector3(
+        sample.pos.x - sample.right.x * offset,
+        sample.pos.y + lerp(ha, hb, t),
+        sample.pos.z - sample.right.z * offset,
+      ),
+    );
+  }
+  return out;
 }
 
 /** 断面の外側から `k` 番目の点を、指定した側で取り出す。 */
