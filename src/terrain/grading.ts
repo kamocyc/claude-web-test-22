@@ -42,10 +42,16 @@ export interface StampOptions {
   distance?: number;
 }
 
-interface ProtectedDisc {
+/** 道路の舗装が押さえている矩形 (踏切の下)。 */
+interface ProtectedRect {
   x: number;
   z: number;
-  radius: number;
+  /** 道路の進行方向 (単位)。 */
+  ux: number;
+  uz: number;
+  /** 進行方向の半長 / 直交方向の半幅 [m]。 */
+  halfAlong: number;
+  halfAcross: number;
 }
 
 export class TerrainGrading {
@@ -55,7 +61,7 @@ export class TerrainGrading {
   private readonly core: Uint8Array;
   private readonly coreDistance: Float32Array;
   private readonly blocked: Uint8Array;
-  private readonly protectedDiscs: ProtectedDisc[] = [];
+  private readonly protectedRects: ProtectedRect[] = [];
 
   constructor(field: Heightfield) {
     this.field = field;
@@ -72,22 +78,39 @@ export class TerrainGrading {
     this.core.fill(0);
     this.coreDistance.fill(0);
     this.blocked.fill(0);
-    this.protectedDiscs.length = 0;
+    this.protectedRects.length = 0;
   }
 
   /**
    * 「ここは道路の舗装の下なので、他の線形は整地してはいけない」範囲。
    * 踏切で、線路の断面 (道床の法尻) が道路の路面の下を掘るのを防ぐ。
+   *
+   * 円で囲うと舗装の外まで押さえてしまい、その分だけ線路が埋まる。
+   * 道路の向きに沿った矩形で、舗装の幅ぶんだけを押さえる。
    */
-  protect(x: number, z: number, radius: number): void {
-    this.protectedDiscs.push({ x, z, radius });
+  protect(
+    x: number,
+    z: number,
+    direction: { x: number; y: number },
+    halfAlong: number,
+    halfAcross: number,
+  ): void {
+    const len = Math.hypot(direction.x, direction.y) || 1;
+    this.protectedRects.push({
+      x,
+      z,
+      ux: direction.x / len,
+      uz: direction.y / len,
+      halfAlong,
+      halfAcross,
+    });
   }
 
   /** 三角形の範囲の格子点に目標高さを焼き込む。重なった場合は低い方を採用する。 */
   stampTriangle(a: Vector3, b: Vector3, c: Vector3, options: StampOptions = {}): void {
     const core = options.core ?? true;
     const distance = options.distance ?? 0;
-    const respectProtected = !options.ignoreProtected && this.protectedDiscs.length > 0;
+    const respectProtected = !options.ignoreProtected && this.protectedRects.length > 0;
     this.rasterize(a, b, c, (i, y, x, z) => {
       if (respectProtected && this.isProtected(x, z)) return;
       if (!core) {
@@ -113,10 +136,12 @@ export class TerrainGrading {
   }
 
   private isProtected(x: number, z: number): boolean {
-    for (const disc of this.protectedDiscs) {
-      const dx = x - disc.x;
-      const dz = z - disc.z;
-      if (dx * dx + dz * dz <= disc.radius * disc.radius) return true;
+    for (const rect of this.protectedRects) {
+      const dx = x - rect.x;
+      const dz = z - rect.z;
+      const along = dx * rect.ux + dz * rect.uz;
+      const across = -dx * rect.uz + dz * rect.ux;
+      if (Math.abs(along) <= rect.halfAlong && Math.abs(across) <= rect.halfAcross) return true;
     }
     return false;
   }

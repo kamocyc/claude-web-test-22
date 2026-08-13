@@ -1,4 +1,4 @@
-import { Group, Mesh, Vector3 } from 'three';
+import { Group, Mesh, Vector3, type Vector2 } from 'three';
 import type { Alignment } from '../core/alignment';
 import { MeshBuilder, signedAreaXZ } from '../core/meshbuilder';
 import { TERRAIN_CELL, lerp, smoothstep } from '../core/units';
@@ -223,6 +223,9 @@ export class WorldBuilder {
         s: rail.s,
         x: crossing.point.x,
         z: crossing.point.z,
+        roadDir: road.dir,
+        roadHalfWidth: road.cls.halfWidth + 1,
+        railExtent: gradingHalfWidth(rail.cls) + 2,
         inner,
         shoulder: inner + CROSSING_SHOULDER_RAMP,
         outer: inner + CROSSING_SHOULDER_RAMP + CROSSING_SLOPE_RAMP,
@@ -411,7 +414,9 @@ export class WorldBuilder {
     // 踏切の舗装の下は道路のもの。線路や分岐器の整地が入り込まないよう
     // 保護しておく (分岐器の交差点面が踏切を飲み込む配置があるため)。
     for (const zones of crossingZones.values()) {
-      for (const zone of zones) grading.protect(zone.x, zone.z, zone.inner);
+      for (const zone of zones) {
+        grading.protect(zone.x, zone.z, zone.roadDir, zone.railExtent, zone.roadHalfWidth);
+      }
     }
 
     // 路肩の余裕幅は、他の線形の舗装を掘らないよう最後にまとめて焼く。
@@ -751,7 +756,9 @@ export class WorldBuilder {
       const s = approach.branch.atStart ? distance : alignment.length - distance;
       if (s < 0.2 || s > alignment.length - 0.2) continue;
       // 橋の上では床版の外に地面がない。高欄の内側に寄せて立てる。
+      // 歩道のない種別では寄せる余地がないので、その枝には立てない。
       const onBridge = runs.some((run) => run.mode === 'bridge' && s >= run.s0 && s <= run.s1);
+      if (onBridge && cls.halfWidth - 0.6 <= cls.carriagewayHalfWidth + 0.2) continue;
       const lateral = onBridge ? cls.halfWidth - 0.6 : cls.halfWidth + 0.5;
       const sample = alignment.sampleAt(s);
       const sign = approach.branch.atStart ? 1 : -1;
@@ -949,6 +956,12 @@ interface CrossingZone {
   /** 踏切の位置 (整地の保護領域の中心)。 */
   x: number;
   z: number;
+  /** 道路の向き (保護する矩形の長手方向)。 */
+  roadDir: Vector2;
+  /** 保護する矩形の半幅 (道路の舗装 + 1 m)。 */
+  roadHalfWidth: number;
+  /** 保護する矩形の半長 (線路の footprint を覆う長さ)。 */
+  railExtent: number;
   /** 舗装の下。ここまでは道路側に完全に譲る [m]。 */
   inner: number;
   /** ここまでで道床天端の高さまで下げる [m]。 */
