@@ -6,7 +6,7 @@ import type { MeshBuilder } from '../core/meshbuilder';
 import { RAIL_GAUGE, SURFACE_LIFT } from '../core/units';
 import type { NetworkClass } from '../network/classes';
 import type { Approach } from '../network/junction';
-import { addBox } from './primitives';
+import { addBox, addWire } from './primitives';
 import type { RGB } from './surface';
 import { RAIL_TOP_TO_BALLAST } from './surface';
 
@@ -290,30 +290,53 @@ export function ballastTop(): number {
 /** 架線柱を建てる間隔 [m]。 */
 export const CATENARY_PITCH = 45;
 
-/** 架線柱と架線を作る。 */
+export interface CatenaryOptions {
+  /**
+   * その地点に建ててよいか。踏切や立体交差では、線路の路肩がそのまま
+   * 道路の真ん中になることがあるので、置く前に必ず確かめる。
+   */
+  canPlace?: (x: number, z: number) => boolean;
+}
+
+/** 架線柱と架線を作る。建てた柱の足元位置を返す。 */
 export function buildCatenary(
   mb: MeshBuilder,
   samples: AlignmentSample[],
   cls: NetworkClass,
-): void {
-  if (cls.kind !== 'rail' || cls.id === 'rail_yard') return;
+  options: CatenaryOptions = {},
+): Vector3[] {
+  if (cls.kind !== 'rail' || cls.id === 'rail_yard') return [];
   const up = new Vector3(0, 1, 0);
   const poleColor: RGB = [0.42, 0.44, 0.46];
   const wireColor: RGB = [0.2, 0.2, 0.22];
   const total = samples[samples.length - 1].s - samples[0].s;
   const count = Math.floor(total / CATENARY_PITCH);
-  const side = cls.halfWidth - 0.6;
+  const armLength = cls.halfWidth - 0.6;
   const height = 5.6;
+  const canPlace = options.canPlace ?? (() => true);
 
-  const heads: Vector3[] = [];
+  const bases: Vector3[] = [];
+  // 架線は「連続して建った柱の間」だけに張る。間が飛んだ所で張ると、
+  // 踏切や交差点の上を斜めに横切ってしまう。
+  const spans: { a: Vector3; b: Vector3 }[] = [];
+  let previous: { head: Vector3; index: number } | null = null;
+
   for (let i = 0; i <= count; i++) {
     const s = samples[0].s + i * CATENARY_PITCH;
     const sample = interpolateSample(samples, s);
     if (!sample) continue;
+
+    // 線路の左右どちらでも構わないので、空いている側に建てる。
+    const side = pickSide(sample, armLength, canPlace);
+    if (side === 0) {
+      previous = null;
+      continue;
+    }
+    const offset = armLength * side;
     const base = new Vector3(
-      sample.pos.x + sample.right.x * side,
+      sample.pos.x + sample.right.x * offset,
       sample.pos.y - RAIL_TOP_TO_BALLAST,
-      sample.pos.z + sample.right.z * side,
+      sample.pos.z + sample.right.z * offset,
     );
     addBox(
       mb,
@@ -324,40 +347,47 @@ export function buildCatenary(
       { x: 0.11, y: height / 2, z: 0.11 },
       poleColor,
     );
-    // 腕木。
+    // 腕木は軌道の上へ張り出す。
     const armCenter = base
       .clone()
       .add(new Vector3(0, height - 0.4, 0))
-      .addScaledVector(sample.right, -side / 2);
+      .addScaledVector(sample.right, -offset / 2);
     addBox(
       mb,
       armCenter,
       sample.right,
       up,
       sample.forward,
-      { x: side / 2, y: 0.08, z: 0.08 },
+      { x: armLength / 2, y: 0.08, z: 0.08 },
       poleColor,
     );
-    heads.push(base.clone().add(new Vector3(0, height - 0.5, 0)));
+
+    const head = new Vector3(
+      sample.pos.x,
+      sample.pos.y + height - 0.5 - RAIL_TOP_TO_BALLAST,
+      sample.pos.z,
+    );
+    if (previous && i - previous.index === 1) spans.push({ a: previous.head, b: head });
+    previous = { head, index: i };
+    bases.push(base);
   }
 
-  // 隣り合う架線柱の間に架線を 1 本張る。
-  for (let i = 0; i + 1 < heads.length; i++) {
-    const a = heads[i];
-    const b = heads[i + 1];
-    const dir = new Vector3().subVectors(b, a);
-    const len = dir.length();
-    if (len < 1e-3) continue;
-    dir.divideScalar(len);
-    const right = new Vector3().crossVectors(dir, up).normalize();
-    addBox(
-      mb,
-      a.clone().lerp(b, 0.5),
-      right,
-      up,
-      dir,
-      { x: 0.03, y: 0.03, z: len / 2 },
-      wireColor,
-    );
+  for (const span of spans) {
+    addWire(mb, span.a, span.b, 0.25, 0.03, wireColor);
   }
+  return bases;
+}
+
+/** 空いている方の路肩を選ぶ。両方塞がっていれば 0 (建てない)。 */
+function pickSide(
+  sample: AlignmentSample,
+  offset: number,
+  canPlace: (x: number, z: number) => boolean,
+): -1 | 0 | 1 {
+  for (const side of [1, -1] as const) {
+    const x = sample.pos.x + sample.right.x * offset * side;
+    const z = sample.pos.z + sample.right.z * offset * side;
+    if (canPlace(x, z)) return side;
+  }
+  return 0;
 }

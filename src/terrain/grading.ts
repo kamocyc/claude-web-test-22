@@ -1,4 +1,5 @@
 import type { Vector3 } from 'three';
+import { earcutXZ } from '../core/meshbuilder';
 import { CUT_SLOPE, FILL_SLOPE } from '../core/units';
 import type { Heightfield } from './heightfield';
 
@@ -52,11 +53,19 @@ export class TerrainGrading {
     });
   }
 
-  /** 凸とは限らない多角形 (リング) を扇状に分割して焼き込む。 */
+  /**
+   * 多角形 (リング) を焼き込む。
+   *
+   * 扇状の分割だと凹んだリングでは外側まで焼いてしまうので、描画と同じ
+   * earcut で三角形分割する。交差点面の形と整地の形が必ず一致する。
+   */
   stampPolygon(ring: Vector3[]): void {
     if (ring.length < 3) return;
-    for (let i = 1; i + 1 < ring.length; i++) {
-      this.stampTriangle(ring[0], ring[i], ring[i + 1]);
+    const flat: number[] = [];
+    for (const p of ring) flat.push(p.x, p.z);
+    const tris = earcutXZ(flat);
+    for (let i = 0; i + 2 < tris.length; i += 3) {
+      this.stampTriangle(ring[tris[i]], ring[tris[i + 1]], ring[tris[i + 2]]);
     }
   }
 

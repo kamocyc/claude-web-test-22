@@ -74,6 +74,44 @@ const AXIS_Y = new Vector3(0, 1, 0);
 const AXIS_Z = new Vector3(0, 0, 1);
 
 /**
+ * 2 点の間に、たるみを付けた細い線を張る (架線・配電線)。
+ * 放物線を数本の直方体で近似する。
+ */
+export function addWire(
+  mb: MeshBuilder,
+  from: Vector3,
+  to: Vector3,
+  sag: number,
+  radius: number,
+  color: RGB,
+  steps = 4,
+): void {
+  const points: Vector3[] = [];
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps;
+    const p = from.clone().lerp(to, t);
+    p.y -= sag * 4 * t * (1 - t);
+    points.push(p);
+  }
+  const dir = new Vector3();
+  const right = new Vector3();
+  const up = new Vector3();
+  for (let i = 0; i + 1 < points.length; i++) {
+    const a = points[i];
+    const b = points[i + 1];
+    dir.subVectors(b, a);
+    const length = dir.length();
+    if (length < 1e-4) continue;
+    dir.divideScalar(length);
+    right.crossVectors(dir, AXIS_Y);
+    if (right.lengthSq() < 1e-8) right.set(1, 0, 0);
+    right.normalize();
+    up.crossVectors(right, dir).normalize();
+    addBox(mb, a.clone().lerp(b, 0.5), right, up, dir, { x: radius, y: radius, z: length / 2 }, color);
+  }
+}
+
+/**
  * 2 つの断面リング (同じ頂点数) を側面で繋ぐ。
  * トンネル覆工や橋桁のように、断面が一定で経路に沿って動く形状に使う。
  */

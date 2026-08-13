@@ -1,6 +1,7 @@
 import { Vector2, Vector3 } from 'three';
 import { perp } from '../core/curve';
 import { clamp } from '../core/units';
+import { profileFor, type ProfilePoint } from '../build/surface';
 import { MAX_TURNOUT_ANGLE, STRAIGHT_THROUGH_ANGLE, type NetworkKind } from './classes';
 import type { Branch, Network, NodeId, SegmentId } from './network';
 
@@ -29,6 +30,11 @@ export interface Approach {
   /** 車道部だけの断面端点 (横断歩道・停止線の幅に使う)。 */
   carriagewayPrev: Vector3;
   carriagewayNext: Vector3;
+  /**
+   * トリム位置の横断面をワールド座標に展開した点列 (種別の断面と同じ順序)。
+   * 交差点面はこの点を繋いで作るので、セグメント側の帯とぴったり噛み合う。
+   */
+  section: Vector3[];
 }
 
 /** 線路の分岐で接続される 2 本の枝の組。 */
@@ -45,7 +51,13 @@ export interface Junction {
   node: NodeId;
   kind: JunctionKind;
   approaches: Approach[];
-  /** 交差点面のリング (XZ 反時計回り、Y は各点の路面高)。 */
+  /**
+   * 交差点面のリング。断面の点ごとに 1 本ずつ、外側から内側の順に並ぶ。
+   * 道路なら [歩道外端, 縁石上端, 車道端]、線路なら [法尻, 道床天端]。
+   * 全て同じ頂点数なので、隣り合うリングの間を帯で埋められる。
+   */
+  rings: Vector3[][];
+  /** いちばん外側のリング (`rings[0]`)。整地の footprint や当たり判定に使う。 */
   ring: Vector3[];
   /** 信号制御されるか。 */
   signalized: boolean;
@@ -114,7 +126,8 @@ export function solveJunctions(network: Network): JunctionSolution {
         updateApproachGeometry(network, ap);
       }
     }
-    junction.ring = buildRing(junction);
+    junction.rings = buildRings(junction);
+    junction.ring = junction.rings[0] ?? [];
   }
 
   return { junctions, trims };
@@ -147,6 +160,7 @@ function solveNode(network: Network, nodeId: NodeId, branches: Branch[]): Juncti
     edgeNext: new Vector3(),
     carriagewayPrev: new Vector3(),
     carriagewayNext: new Vector3(),
+    section: [],
   }));
 
   if (n >= 2) {
@@ -188,6 +202,7 @@ function solveNode(network: Network, nodeId: NodeId, branches: Branch[]): Juncti
     node: nodeId,
     kind,
     approaches,
+    rings: [],
     ring: [],
     signalized,
     connections,
@@ -252,15 +267,21 @@ function updateApproachGeometry(network: Network, ap: Approach): void {
 
   const normal = perp(outward);
   ap.center.copy(sample.pos);
-  ap.edgeNext.set(
-    sample.pos.x + normal.x * cls.halfWidth,
-    sample.pos.y,
-    sample.pos.z + normal.y * cls.halfWidth,
-  );
+
+  // 断面をそのまま展開する。セグメント側の帯も同じ点を通るので、
+  // 高低差があっても交差点面との継ぎ目が開かない。
+  const profile = profileFor(cls);
+  ap.section = profile.map((p) => sectionPoint(sample.pos, normal, p));
+
   ap.edgePrev.set(
     sample.pos.x - normal.x * cls.halfWidth,
     sample.pos.y,
     sample.pos.z - normal.y * cls.halfWidth,
+  );
+  ap.edgeNext.set(
+    sample.pos.x + normal.x * cls.halfWidth,
+    sample.pos.y,
+    sample.pos.z + normal.y * cls.halfWidth,
   );
   const cw = cls.carriagewayHalfWidth;
   ap.carriagewayNext.set(
@@ -275,43 +296,68 @@ function updateApproachGeometry(network: Network, ap: Approach): void {
   );
 }
 
+function sectionPoint(pos: Vector3, normal: Vector2, p: ProfilePoint): Vector3 {
+  return new Vector3(
+    pos.x + normal.x * p.offset,
+    pos.y + p.height,
+    pos.z + normal.y * p.offset,
+  );
+}
+
 /**
- * 交差点面のリングを作る。各枝の断面端点を方位角順に並べ、隣り合う枝の
- * 間には路端線の交点を制御点とする 2 次ベジエで隅丸めを入れる。
+ * 交差点面のリングを断面の点ごとに 1 本ずつ作る。
+ *
+ * 各枝の断面点を方位角順に並べ、隣り合う枝の間には路端線の交点を制御点と
+ * する 2 次ベジエで隅丸めを入れる。全てのリングは同じ手順・同じ点数で作る
+ * ので、隣り合うリングの間を帯で埋めれば交差点の歩道・縁石まで表現できる。
  */
-function buildRing(junction: Junction): Vector3[] {
+function buildRings(junction: Junction): Vector3[][] {
   const aps = junction.approaches;
   const n = aps.length;
   if (n < 2 || junction.kind === 'seam' || junction.kind === 'end') return [];
   if (aps.every((a) => a.trim < 1e-3)) return [];
 
-  const ring: Vector3[] = [];
+  // 断面の点数は種別によって違う。いちばん多い枝に合わせ、足りない枝は
+  // 内側の点を繰り返して幅 0 の帯にする。
+  const levels = Math.max(...aps.map((a) => Math.max(1, a.section.length >> 1)));
+  const rings: Vector3[][] = Array.from({ length: levels }, () => []);
+
   for (let i = 0; i < n; i++) {
     const cur = aps[i];
     const next = aps[(i + 1) % n];
-    ring.push(cur.edgePrev.clone(), cur.edgeNext.clone());
+    for (let k = 0; k < levels; k++) {
+      rings[k].push(sideOf(cur, k, 'prev'), sideOf(cur, k, 'next'));
+    }
 
-    const corner = cornerControl(cur, next);
-    if (corner) {
-      const a = cur.edgeNext;
-      const b = next.edgePrev;
-      if (a.distanceTo(b) > 0.05) {
-        for (let k = 1; k <= 3; k++) {
-          const t = k / 4;
-          ring.push(quadratic(a, corner, b, t));
-        }
+    for (let k = 0; k < levels; k++) {
+      const a = sideOf(cur, k, 'next');
+      const b = sideOf(next, k, 'prev');
+      const corner = cornerControl(a, cur.dir, b, next.dir);
+      // 隅丸めの点数は全リングで揃える必要がある。外側リングで判定し、
+      // 内側でも同じ数だけ (退化していても) 点を積む。
+      const outerA = sideOf(cur, 0, 'next');
+      const outerB = sideOf(next, 0, 'prev');
+      if (!corner || outerA.distanceTo(outerB) <= 0.05) continue;
+      for (let t = 1; t <= 3; t++) {
+        rings[k].push(quadratic(a, corner, b, t / 4));
       }
     }
   }
-  return dedupe(ring);
+
+  return dedupeRings(rings);
 }
 
-/** 2 枝の路端線の交点 (隅丸めの制御点)。 */
-function cornerControl(cur: Approach, next: Approach): Vector3 | null {
-  const p = cur.edgeNext;
-  const q = next.edgePrev;
-  const dp = cur.dir;
-  const dq = next.dir;
+/** 断面の外側から `k` 番目の点を、指定した側で取り出す。 */
+function sideOf(ap: Approach, k: number, side: 'prev' | 'next'): Vector3 {
+  const P = ap.section.length;
+  if (P === 0) return (side === 'prev' ? ap.edgePrev : ap.edgeNext).clone();
+  const last = Math.max(0, (P >> 1) - 1);
+  const index = Math.min(k, last);
+  return (side === 'prev' ? ap.section[index] : ap.section[P - 1 - index]).clone();
+}
+
+/** 2 枝の路端線 (同じ断面高さ) の交点。隅丸めの制御点になる。 */
+function cornerControl(p: Vector3, dp: Vector2, q: Vector3, dq: Vector2): Vector3 | null {
   const det = dp.x * dq.y - dp.y * dq.x;
   if (Math.abs(det) < 1e-6) return null;
   const rx = q.x - p.x;
@@ -330,14 +376,25 @@ function quadratic(a: Vector3, c: Vector3, b: Vector3, t: number): Vector3 {
   );
 }
 
-function dedupe(points: Vector3[]): Vector3[] {
-  const out: Vector3[] = [];
-  for (const p of points) {
-    const last = out[out.length - 1];
-    if (!last || last.distanceToSquared(p) > 1e-4) out.push(p);
+/**
+ * 重なった点を落とす。どのリングも同じ頂点数でなければ帯が作れないので、
+ * いちばん外側のリングで残す点を決め、全リングに同じ取捨を適用する。
+ */
+function dedupeRings(rings: Vector3[][]): Vector3[][] {
+  const outer = rings[0];
+  if (!outer) return [];
+  const keep: number[] = [];
+  for (let i = 0; i < outer.length; i++) {
+    const last = keep.length > 0 ? outer[keep[keep.length - 1]] : null;
+    if (!last || last.distanceToSquared(outer[i]) > 1e-4) keep.push(i);
   }
-  while (out.length > 1 && out[0].distanceToSquared(out[out.length - 1]) < 1e-4) out.pop();
-  return out;
+  while (
+    keep.length > 1 &&
+    outer[keep[0]].distanceToSquared(outer[keep[keep.length - 1]]) < 1e-4
+  ) {
+    keep.pop();
+  }
+  return rings.map((ring) => keep.map((i) => ring[i]));
 }
 
 /**

@@ -1,13 +1,14 @@
 import { Group, Mesh, Vector3 } from 'three';
 import type { Alignment } from '../core/alignment';
-import { MeshBuilder, fillPolygon } from '../core/meshbuilder';
-import { SURFACE_LIFT } from '../core/units';
+import { MeshBuilder } from '../core/meshbuilder';
+import { lerp, smoothstep } from '../core/units';
 import {
   applyRailBlend,
   buildLevelCrossing,
   computeRailBlend,
   type GateSpec,
   type RailBlend,
+  type RoadSample,
 } from '../build/crossing';
 import {
   buildCrossingStopLine,
@@ -17,6 +18,7 @@ import {
   type ApproachFrame,
 } from '../build/markings';
 import { buildCatenary, buildTrack, buildTrackConnection } from '../build/rail';
+import { buildUtilityPoles } from '../build/streetside';
 import {
   alignmentSamplesInRange,
   buildBridge,
@@ -24,19 +26,21 @@ import {
   structureFootprintHalfWidth,
 } from '../build/structures';
 import {
+  buildJunctionSurface,
   buildRibbon,
   gradingDrop,
   gradingEdges,
   gradingHalfWidth,
+  gradingSection,
+  gradingSectionPoints,
   junctionGradingDrop,
-  junctionSurfaceOffset,
   profileFor,
-  ringSkirt,
 } from '../build/surface';
 import type { NetworkClass } from '../network/classes';
 import { findCrossings, type Crossing } from '../network/crossings';
 import { solveJunctions, type Approach, type Junction } from '../network/junction';
 import type { Network, NodeId, SegmentId } from '../network/network';
+import { Occupancy } from '../network/occupancy';
 import {
   classify,
   computeStructureProfile,
@@ -80,6 +84,16 @@ export interface WorldStats {
   cost: number;
 }
 
+export type PropKind = 'signal' | 'stopSign' | 'crossingGate' | 'catenaryPole' | 'utilityPole';
+
+/** 立てた小物の足元。路上に立ててしまっていないかの検証にも使う。 */
+export interface PropPlacement {
+  kind: PropKind;
+  position: Vector3;
+  /** 起点となった線形 (あれば)。 */
+  segment?: SegmentId;
+}
+
 export interface BuildResult {
   warnings: WorldWarning[];
   stats: WorldStats;
@@ -88,7 +102,12 @@ export interface BuildResult {
   ranges: Map<SegmentId, { s0: number; s1: number }>;
   /** 区間ごとの構造形式。 */
   structures: Map<SegmentId, StructureRun[]>;
+  /** 立てた小物の一覧。 */
+  props: PropPlacement[];
 }
+
+/** 小物を立てるときに、路面から確保する余裕 [m]。 */
+const PROP_CLEARANCE = 0.35;
 
 /**
  * ネットワーク・地形・描画を繋ぐ組み立て役。
@@ -108,6 +127,9 @@ export class WorldBuilder {
 
   private signals: SignalAssembly[] = [];
   private gates: CrossingGate[] = [];
+  private props: PropPlacement[] = [];
+  /** 直近の rebuild で作った占有索引。小物の位置決めに使う。 */
+  private occupancy!: Occupancy;
 
   /** 最後に解いた交差点情報。ツール側のスナップやハイライトで使う。 */
   junctions = new Map<NodeId, Junction>();
@@ -179,18 +201,37 @@ export class WorldBuilder {
       );
     }
 
-    // 踏切では舗装が優先なので、線路側の整地は道路側に任せる。
-    const gradingSkips = new Map<SegmentId, { s0: number; s1: number }[]>();
+    // 踏切のまわりの整地。舗装の下は道路側に任せ、その外側では線路の
+    // 断面 (道床の法尻) へ滑らかに戻す。真下だけ譲って外は放置すると、
+    // 道路と同じ高さのままの地形に道床が埋まってしまう。
+    const crossingZones = new Map<SegmentId, CrossingZone[]>();
     for (const crossing of crossings) {
       if (crossing.kind !== 'level' || !crossing.rail || !crossing.road) continue;
-      const span = crossing.road.cls.halfWidth + 6;
-      const list = gradingSkips.get(crossing.rail.segment) ?? [];
-      list.push({ s0: crossing.rail.s - span, s1: crossing.rail.s + span });
-      gradingSkips.set(crossing.rail.segment, list);
+      const rail = crossing.rail;
+      const road = crossing.road;
+      const sinTheta = Math.abs(road.dir.x * rail.dir.y - road.dir.y * rail.dir.x);
+      const skew = 1 / Math.max(0.26, sinTheta);
+      const inner = road.cls.halfWidth * skew;
+      const railSection = profileFor(rail.cls);
+      const list = crossingZones.get(rail.segment) ?? [];
+      list.push({
+        s: rail.s,
+        inner,
+        shoulder: inner + CROSSING_SHOULDER_RAMP,
+        outer: inner + CROSSING_SHOULDER_RAMP + CROSSING_SLOPE_RAMP,
+        // 舗装の路端と同じ高さ (踏切では線路の描画高 ≒ 道路面)。
+        roadOffset: -gradingDrop(road.cls),
+        // 道床天端のすぐ下。ここまで下げればレールと枕木は埋まらない。
+        shoulderOffset: railSection[Math.min(1, railSection.length - 1)].height - 0.06,
+      });
+      crossingZones.set(rail.segment, list);
     }
 
-    this.applyGrading(junctions, structures, gradingSkips);
+    this.applyGrading(junctions, structures, crossingZones, railBlends);
     this.terrainMesh.update();
+
+    // 小物を置く前に、どこが道路・線路・交差点に覆われているかを索引にする。
+    this.occupancy = new Occupancy(network, { ranges, junctions });
 
     const surface = new MeshBuilder();
     const overlay = new MeshBuilder();
@@ -229,7 +270,7 @@ export class WorldBuilder {
         });
       }
 
-      this.buildSegment(surface, structure, alignment, cls, runs, blends, stats);
+      this.buildSegment(surface, structure, seg.id, alignment, cls, runs, blends, stats);
       if (cls.kind === 'road') {
         buildLaneMarkings(overlay, alignment, range, cls);
       }
@@ -247,7 +288,7 @@ export class WorldBuilder {
     this.replaceGeometry(this.overlayMesh, overlay);
     this.replaceGeometry(this.structureMesh, structure);
 
-    return { warnings, stats, diagnostics, ranges, structures };
+    return { warnings, stats, diagnostics, ranges, structures, props: this.props };
   }
 
   /**
@@ -301,8 +342,9 @@ export class WorldBuilder {
   private applyGrading(
     junctions: Map<NodeId, Junction>,
     structures: Map<SegmentId, StructureRun[]>,
-    /** 整地から除外する弧長の範囲 (踏切で道路側に譲る部分)。 */
-    skips: Map<SegmentId, { s0: number; s1: number }[]>,
+    /** 踏切のまわりで整地目標を道路側に寄せる範囲。 */
+    crossingZones: Map<SegmentId, CrossingZone[]>,
+    railBlends: Map<SegmentId, RailBlend[]>,
   ): void {
     const grading = this.grading;
     grading.reset();
@@ -326,18 +368,29 @@ export class WorldBuilder {
     for (const seg of this.network.segments.values()) {
       const cls = this.network.classOf(seg);
       const alignment = this.network.alignmentOf(seg.id);
-      const half = gradingHalfWidth(cls);
-      const drop = gradingDrop(cls);
-      const skipRanges = skips.get(seg.id) ?? [];
+      const section = gradingSection(cls);
+      const naturalDrop = gradingDrop(cls);
+      const zones = crossingZones.get(seg.id) ?? [];
+      const blends = railBlends.get(seg.id) ?? [];
       for (const run of structures.get(seg.id) ?? []) {
         if (run.mode !== 'ground') continue;
-        const samples = alignmentSamplesInRange(alignment, run.s0, run.s1, 3);
+        // 描画と同じ高さを整地の目標にする。踏切に寄せた分を無視すると、
+        // 道床が地形からわずかに浮いたり沈んだりする。
+        const samples = applyRailBlend(
+          alignmentSamplesInRange(alignment, run.s0, run.s1, 3),
+          blends,
+        );
         for (let i = 0; i + 1 < samples.length; i++) {
           const mid = (samples[i].s + samples[i + 1].s) / 2;
-          if (skipRanges.some((r) => mid >= r.s0 && mid <= r.s1)) continue;
-          const a = gradingEdges(samples[i], half, drop);
-          const b = gradingEdges(samples[i + 1], half, drop);
-          grading.stampQuad(a.left, b.left, b.right, a.right);
+          const drop = crossingDrop(zones, mid, naturalDrop);
+          if (drop === null) continue;
+          // 踏切に寄せる分は断面全体を平行移動する。
+          const shift = drop - naturalDrop;
+          const a = gradingSectionPoints(samples[i], section, shift);
+          const b = gradingSectionPoints(samples[i + 1], section, shift);
+          for (let k = 0; k + 1 < section.length; k++) {
+            grading.stampQuad(a[k], b[k], b[k + 1], a[k + 1]);
+          }
         }
       }
     }
@@ -349,10 +402,8 @@ export class WorldBuilder {
       const node = this.network.getNode(junction.node);
       const terrain = this.field.baseHeightAt(node.pos.x, node.pos.z);
       const mode = classify(node.pos.y, terrain);
-      const ring = expandRing(junction.ring, gradingHalfWidth(cls) - cls.halfWidth);
       if (mode === 'ground') {
-        const drop = junctionGradingDrop(cls);
-        grading.stampPolygon(ring.map((p) => new Vector3(p.x, p.y - drop, p.z)));
+        this.stampJunction(grading, junction, cls);
       } else {
         const blocked = expandRing(junction.ring, 3);
         for (let i = 1; i + 1 < blocked.length; i++) {
@@ -364,11 +415,43 @@ export class WorldBuilder {
     grading.apply();
   }
 
+  /**
+   * 交差点まわりを整地する。
+   *
+   * 交差点面もセグメントと同じで、断面の帯ごとに目標高さが違う。外周の
+   * リングだけで平らに均すと、車道面 (縁石の分だけ低い) が地形に埋まって
+   * しまい、交差点の真ん中に地面が顔を出す。リングの間を 1 段ずつ焼き込み、
+   * 外周より高い所 (線路の道床など) は外周の高さで止める。
+   */
+  private stampJunction(grading: TerrainGrading, junction: Junction, cls: NetworkClass): void {
+    const drop = junctionGradingDrop();
+    const outer = junction.rings[0];
+    if (!outer || outer.length < 3) return;
+    const rings = junction.rings.map((ring) =>
+      ring.map(
+        (p, i) => new Vector3(p.x, Math.min(p.y, outer[i]?.y ?? p.y) - drop, p.z),
+      ),
+    );
+    const bands = [expandRing(rings[0], gradingHalfWidth(cls) - cls.halfWidth), ...rings];
+
+    for (let k = 0; k + 1 < bands.length; k++) {
+      const a = bands[k];
+      const b = bands[k + 1];
+      const n = Math.min(a.length, b.length);
+      for (let i = 0; i < n; i++) {
+        const j = (i + 1) % n;
+        grading.stampQuad(a[i], a[j], b[j], b[i]);
+      }
+    }
+    grading.stampPolygon(bands[bands.length - 1]);
+  }
+
   // ------------------------------------------------------------ セグメント
 
   private buildSegment(
     surface: MeshBuilder,
     structure: MeshBuilder,
+    segment: SegmentId,
     alignment: Alignment,
     cls: NetworkClass,
     runs: StructureRun[],
@@ -376,6 +459,10 @@ export class WorldBuilder {
     stats: WorldStats,
   ): void {
     const profile = profileFor(cls);
+    // 自分自身の上には当然乗るので、判定からは外す。
+    const canPlace = (x: number, z: number): boolean =>
+      this.occupancy.isFree(x, z, { exceptSegments: [segment], margin: PROP_CLEARANCE });
+    let poleSerial = 0;
 
     for (const run of runs) {
       const raw = alignmentSamplesInRange(alignment, run.s0, run.s1, 2.5);
@@ -393,7 +480,23 @@ export class WorldBuilder {
       }
 
       if (cls.kind === 'rail' && run.mode !== 'tunnel') {
-        buildCatenary(structure, samples, cls);
+        for (const base of buildCatenary(structure, samples, cls, { canPlace })) {
+          this.props.push({ kind: 'catenaryPole', position: base, segment });
+        }
+      }
+
+      // 電柱は地面に立てるものなので、橋・トンネルには置かない。
+      if (cls.kind === 'road' && run.mode === 'ground') {
+        const poles = buildUtilityPoles(structure, samples, cls, {
+          canPlace,
+          groundY: (x, z, surfaceY) =>
+            Math.max(this.field.heightAt(x, z), surfaceY + cls.curbHeight),
+          serial: poleSerial,
+        });
+        poleSerial += Math.max(1, Math.ceil((run.s1 - run.s0) / 38));
+        for (const pole of poles) {
+          this.props.push({ kind: 'utilityPole', position: pole.base, segment });
+        }
       }
     }
 
@@ -429,12 +532,7 @@ export class WorldBuilder {
     const cls = junction.approaches[0]?.branch.cls;
     if (!cls) return;
 
-    if (junction.ring.length >= 3) {
-      const dy = SURFACE_LIFT + junctionSurfaceOffset(cls);
-      const lifted = junction.ring.map((p) => new Vector3(p.x, p.y + dy, p.z));
-      fillPolygon(surface, lifted, cls.surfaceColor, 0.12, 0);
-      ringSkirt(surface, lifted, [0.3, 0.28, 0.26]);
-    }
+    buildJunctionSurface(surface, junction.rings, cls);
 
     if (cls.kind === 'rail') {
       for (const connection of junction.connections) {
@@ -479,47 +577,80 @@ export class WorldBuilder {
   private placeSignals(junction: Junction): void {
     junction.approaches.forEach((approach, index) => {
       const cls = approach.branch.cls;
-      const outward = new Vector3(approach.dir.x, 0, approach.dir.y);
-      const right = new Vector3(-approach.dir.y, 0, approach.dir.x);
-      const alignment = this.network.alignmentOf(approach.branch.segment);
-      const distance = approach.trim + 1.4;
-      const s = approach.branch.atStart ? distance : alignment.length - distance;
-      if (s < 0 || s > alignment.length) return;
-      const sample = alignment.sampleAt(s);
-      const base = new Vector3(
-        sample.pos.x + right.x * (cls.halfWidth + 0.4),
-        sample.pos.y,
-        sample.pos.z + right.z * (cls.halfWidth + 0.4),
-      );
+      const post = this.roadsidePost(approach, 1.4);
+      if (!post) return;
       const assembly = createSignal({
-        base,
-        facing: outward,
-        inward: right.clone().negate(),
+        base: post.base,
+        facing: post.outward,
+        inward: post.right.clone().negate(),
         armLength: cls.carriagewayHalfWidth + 1.0,
         phase: index % 2,
       });
       this.signals.push(assembly);
       this.propGroup.add(assembly.object);
+      this.props.push({
+        kind: 'signal',
+        position: post.base,
+        segment: approach.branch.segment,
+      });
     });
   }
 
   private placeStopSigns(junction: Junction): void {
     for (const approach of junction.approaches) {
-      const cls = approach.branch.cls;
-      const outward = new Vector3(approach.dir.x, 0, approach.dir.y);
-      const right = new Vector3(-approach.dir.y, 0, approach.dir.x);
-      const alignment = this.network.alignmentOf(approach.branch.segment);
-      const distance = approach.trim + 1.2;
-      const s = approach.branch.atStart ? distance : alignment.length - distance;
-      if (s < 0 || s > alignment.length) continue;
-      const sample = alignment.sampleAt(s);
-      const base = new Vector3(
-        sample.pos.x + right.x * (cls.halfWidth + 0.4),
-        sample.pos.y,
-        sample.pos.z + right.z * (cls.halfWidth + 0.4),
-      );
-      this.propGroup.add(createStopSign(base, outward));
+      const post = this.roadsidePost(approach, 1.2);
+      if (!post) continue;
+      this.propGroup.add(createStopSign(post.base, post.outward));
+      this.props.push({
+        kind: 'stopSign',
+        position: post.base,
+        segment: approach.branch.segment,
+      });
     }
+  }
+
+  /**
+   * 交差点の枝の路側に、支柱を立てられる場所を探す。
+   *
+   * 交差点の手前は他の枝が横切っているので、素直に「トリム位置から
+   * 少し戻った路側」に置くと、交差する道路の真ん中に立ってしまう。
+   * 塞がっていれば交差点から遠ざかる向きに探し直す。
+   */
+  private roadsidePost(
+    approach: Approach,
+    setback: number,
+  ): { base: Vector3; outward: Vector3; right: Vector3 } | null {
+    const cls = approach.branch.cls;
+    const alignment = this.network.alignmentOf(approach.branch.segment);
+    const lateral = cls.halfWidth + 0.5;
+
+    for (const extra of [0, 1.5, 3, 5, 7.5, 10.5]) {
+      const distance = approach.trim + setback + extra;
+      const s = approach.branch.atStart ? distance : alignment.length - distance;
+      if (s < 0.2 || s > alignment.length - 0.2) continue;
+      const sample = alignment.sampleAt(s);
+      const sign = approach.branch.atStart ? 1 : -1;
+      const right = sample.right.clone().multiplyScalar(sign).setY(0).normalize();
+      const x = sample.pos.x + right.x * lateral;
+      const z = sample.pos.z + right.z * lateral;
+      if (
+        !this.occupancy.isFree(x, z, {
+          exceptSegments: [approach.branch.segment],
+          margin: PROP_CLEARANCE,
+        })
+      ) {
+        continue;
+      }
+      const outward = sample.forward.clone().multiplyScalar(sign).setY(0).normalize();
+      const base = new Vector3(x, this.propGroundY(x, z, sample.pos.y + cls.curbHeight), z);
+      return { base, outward, right };
+    }
+    return null;
+  }
+
+  /** 小物の足元の高さ。整地後の地形と路肩の高い方に合わせ、少し埋める。 */
+  private propGroundY(x: number, z: number, surfaceY: number): number {
+    return Math.max(this.field.heightAt(x, z), surfaceY) - 0.05;
   }
 
   // ---------------------------------------------------------------- 踏切
@@ -540,22 +671,84 @@ export class WorldBuilder {
     if (crossing.kind !== 'level' || !crossing.road || !crossing.rail) return;
 
     stats.levelCrossings++;
-    const roadAlignment = this.network.alignmentOf(crossing.road.segment);
+    const road = crossing.road;
+    const roadAlignment = this.network.alignmentOf(road.segment);
     const build = buildLevelCrossing(
       overlay,
       crossing,
-      roadAlignment,
-      crossing.road.cls,
+      { sampleAt: (s) => this.roadSampleAt(road.segment, s) },
+      road.cls,
       crossing.rail.cls,
+      {
+        canPlace: (x, z) =>
+          this.occupancy.isFree(x, z, {
+            exceptSegments: [road.segment],
+            margin: PROP_CLEARANCE,
+          }),
+        groundY: (x, z, surfaceY) => this.propGroundY(x, z, surfaceY),
+      },
     );
 
     for (const stop of build.stopStations) {
-      buildCrossingStopLine(overlay, roadAlignment, stop.s, crossing.road.cls, stop.forward);
+      const alignment =
+        stop.segment === road.segment ? roadAlignment : this.network.alignmentOf(stop.segment);
+      buildCrossingStopLine(overlay, alignment, stop.s, road.cls, stop.forward);
     }
-    for (const spec of build.gates) this.placeGate(spec);
+    for (const spec of build.gates) this.placeGate(spec, road.segment);
   }
 
-  private placeGate(spec: GateSpec): void {
+  /**
+   * 道路上の 1 点を弧長で取る。範囲を外れたらノードを越えて隣の
+   * セグメントへ続ける。踏切がちょうどノードの上にあるとき、片側の
+   * 遮断機と停止線が丸ごと落ちてしまうのを防ぐ。
+   */
+  private roadSampleAt(segment: SegmentId, s: number, depth = 0): RoadSample | null {
+    const alignment = this.network.alignmentOf(segment);
+    if (s >= 0 && s <= alignment.length) {
+      const sample = alignment.sampleAt(s);
+      return {
+        pos: sample.pos.clone(),
+        right: sample.right.clone(),
+        forward: sample.forward.clone(),
+        segment,
+        s,
+      };
+    }
+    if (depth >= 2) return null;
+
+    const seg = this.network.segments.get(segment);
+    if (!seg) return null;
+    const kind = this.network.classOf(seg).kind;
+    const past = s > alignment.length;
+    const nodeId = past ? seg.b : seg.a;
+    const remaining = past ? s - alignment.length : -s;
+    const node = this.network.nodes.get(nodeId);
+    if (!node) return null;
+
+    for (const otherId of node.segments) {
+      if (otherId === segment) continue;
+      const other = this.network.segments.get(otherId);
+      if (!other || this.network.classOf(other).kind !== kind) continue;
+      const startsHere = other.a === nodeId;
+      const otherLength = this.network.alignmentOf(otherId).length;
+      const found = this.roadSampleAt(
+        otherId,
+        startsHere ? remaining : otherLength - remaining,
+        depth + 1,
+      );
+      if (!found) continue;
+      // 隣のセグメントの弧長が逆向きに繋がっていれば、進行方向を反転する。
+      if (past === startsHere) return found;
+      return {
+        ...found,
+        right: found.right.negate(),
+        forward: found.forward.negate(),
+      };
+    }
+    return null;
+  }
+
+  private placeGate(spec: GateSpec, segment: SegmentId): void {
     const gate = createCrossingGate({
       base: spec.base,
       across: spec.across,
@@ -564,6 +757,7 @@ export class WorldBuilder {
     });
     this.gates.push(gate);
     this.propGroup.add(gate.object);
+    this.props.push({ kind: 'crossingGate', position: spec.base.clone(), segment });
   }
 
   // ------------------------------------------------------------ ユーティリティ
@@ -579,6 +773,7 @@ export class WorldBuilder {
     this.propGroup.clear();
     this.signals = [];
     this.gates = [];
+    this.props = [];
   }
 
   /** 信号・遮断機のアニメーションを進める。 */
@@ -601,6 +796,63 @@ export class WorldBuilder {
     const blink = Math.floor(time * 1.6) % 2 === 0;
     for (const gate of this.gates) setGateState(gate, closed, blink);
   }
+}
+
+/** 踏切のまわりで、整地目標を道路側に寄せる範囲。 */
+interface CrossingZone {
+  /** 踏切の弧長 (線路側)。 */
+  s: number;
+  /** 舗装の下。ここまでは道路側に完全に譲る [m]。 */
+  inner: number;
+  /** ここまでで道床天端の高さまで下げる [m]。 */
+  shoulder: number;
+  /** ここまでで断面 (法尻) に戻す [m]。 */
+  outer: number;
+  /** 舗装の路端の高さ (線形 Y からのオフセット)。 */
+  roadOffset: number;
+  /** 道床天端のすぐ下の高さ (線形 Y からのオフセット)。 */
+  shoulderOffset: number;
+}
+
+/** 舗装の端から道床天端の高さまで下げるのにかける距離 [m]。 */
+const CROSSING_SHOULDER_RAMP = 3;
+/** さらに法尻まで戻すのにかける距離 [m]。 */
+const CROSSING_SLOPE_RAMP = 6;
+
+/**
+ * 踏切を考慮した整地目標。`null` なら道路側に任せて何も焼き込まない。
+ *
+ * 舗装の下だけを譲って外側を放置すると、道路と同じ高さの地形がそのまま
+ * 残ってレールまで埋まる。逆に舗装のすぐ脇で線路の断面 (法尻) まで
+ * 落とすと、路端の下が 1 m 近く掘られて道路が浮く。そこで
+ *   舗装の端 → 道床天端 → 法尻
+ * と 2 段階で戻し、路端では道路と同じ高さ、数メートル先ではレールが
+ * 顔を出している状態にする。
+ */
+function crossingDrop(zones: CrossingZone[], s: number, naturalDrop: number): number | null {
+  if (zones.length === 0) return naturalDrop;
+  const naturalOffset = -naturalDrop;
+  let offset = naturalOffset;
+  for (const zone of zones) {
+    const distance = Math.abs(s - zone.s);
+    if (distance <= zone.inner) return null;
+    if (distance >= zone.outer) continue;
+    const zoneOffset =
+      distance < zone.shoulder
+        ? lerp(
+            zone.roadOffset,
+            zone.shoulderOffset,
+            smoothstep((distance - zone.inner) / (zone.shoulder - zone.inner)),
+          )
+        : lerp(
+            zone.shoulderOffset,
+            naturalOffset,
+            smoothstep((distance - zone.shoulder) / (zone.outer - zone.shoulder)),
+          );
+    // 重なった場合は高い方を採る。低い方に合わせると路端の下が掘られる。
+    offset = Math.max(offset, zoneOffset);
+  }
+  return -offset;
 }
 
 /** リングを重心から外向きに広げる。整地の footprint を路面より広く取るため。 */
