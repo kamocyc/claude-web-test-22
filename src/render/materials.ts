@@ -40,7 +40,10 @@ export function createSurfaceMaterial(options?: {
     opacity: options?.opacity ?? 1,
     depthWrite: options?.depthWrite ?? true,
     polygonOffset: true,
-    polygonOffsetFactor: -1,
+    // 傾き係数は 0 にする。視線に対して浅い角度で見た面では傾き係数の項が
+    // 巨大になり、路面が数十 cm 手前に寄ってしまう。踏切のレールのように
+    // 路面のすぐ上にあるものが、その分だけ舗装に飲まれて消えてしまう。
+    polygonOffsetFactor: 0,
     polygonOffsetUnits: options?.polygonOffsetUnits ?? -2,
     ...(options?.side ? { side: options.side } : {}),
   });
@@ -190,7 +193,7 @@ export function createOverlayMaterial(): MeshStandardMaterial {
     roughness: 0.8,
     metalness: 0.0,
     polygonOffset: true,
-    polygonOffsetFactor: -4,
+    polygonOffsetFactor: 0,
     polygonOffsetUnits: -8,
   });
   return material;

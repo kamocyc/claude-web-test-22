@@ -6,6 +6,7 @@ import { VerticalProfile } from '../src/core/profile';
 import { checkPlacement } from '../src/network/rules';
 import { buildDemoNetwork } from '../src/app/demo';
 import { profileFor } from '../src/build/surface';
+import { surfaceBlendAt, surfaceHeightScale } from '../src/build/crossing';
 import { getClass } from '../src/network/classes';
 import { anchorFromNode, computePlacement, placeSegment, type Anchor } from '../src/network/editing';
 import { Network } from '../src/network/network';
@@ -129,8 +130,14 @@ describe('サンプルネットワーク', () => {
           if (zones.some((zone) => s >= zone.s0 && s <= zone.s1)) continue;
           const sample = alignment.sampleAt(s);
           const terrain = field.heightAt(sample.pos.x, sample.pos.z);
+          // 踏切のまわりでは、道路が線路に合わせて上下し断面も平らになる。
+          // 描画に使ったのと同じ高さを期待値にする。
+          const blends = result.blends.get(seg.id) ?? [];
+          const { dy } = surfaceBlendAt(blends, s);
+          const scale = surfaceHeightScale(blends, s);
+          const expected = sample.pos.y + dy + edgeHeight * scale;
           // 埋まる (地形が上に出る) ことも、浮く (地形が下に離れる) こともない。
-          expect(Math.abs(terrain - (sample.pos.y + edgeHeight))).toBeLessThan(0.5);
+          expect(Math.abs(terrain - expected)).toBeLessThan(0.5);
           checked++;
         }
       }
@@ -139,11 +146,15 @@ describe('サンプルネットワーク', () => {
   });
 
   it('橋・トンネル区間では地形が自然のまま残る', () => {
-    const { field, network, result } = buildWorld();
+    const { field, network, result, world } = buildWorld();
 
     // 他の線形の地表区間は、橋の下・トンネルの上でも当然整地される。
-    // 判定対象から外すため、地表区間の位置を集めておく。
+    // 判定対象から外すため、地表区間の位置を集めておく。交差点面は
+    // どのセグメントの区間にも属さないので、リングの点も足す。
     const groundPoints: { x: number; z: number }[] = [];
+    for (const junction of world.junctions.values()) {
+      for (const p of junction.ring) groundPoints.push({ x: p.x, z: p.z });
+    }
     for (const seg of network.segments.values()) {
       const alignment = network.alignmentOf(seg.id);
       for (const run of result.structures.get(seg.id) ?? []) {

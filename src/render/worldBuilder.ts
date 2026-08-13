@@ -4,13 +4,15 @@ import { MeshBuilder, signedAreaXZ } from '../core/meshbuilder';
 import { perp } from '../core/curve';
 import { TERRAIN_CELL, lerp, smoothstep } from '../core/units';
 import {
-  applyRailBlend,
+  applySurfaceBlend,
+  buildFlangeways,
   buildLevelCrossing,
-  computeRailBlend,
-  railBlendDelta,
+  computeCrossingBlend,
+  surfaceBlendAt,
+  surfaceHeightScale,
   type GateSpec,
-  type RailBlend,
   type RoadSample,
+  type SurfaceBlend,
 } from '../build/crossing';
 import {
   buildCrossingStopLine,
@@ -18,6 +20,7 @@ import {
   buildLaneMarkings,
   buildStopLine,
   type ApproachFrame,
+  type SurfacePath,
 } from '../build/markings';
 import { buildCatenary, buildTrack, buildTrackConnection } from '../build/rail';
 import {
@@ -44,6 +47,7 @@ import {
   gradingSectionPoints,
   junctionGradingDrop,
   profileFor,
+  surfaceHeightAt,
   type RGB,
 } from '../build/surface';
 import type { NetworkClass } from '../network/classes';
@@ -123,6 +127,11 @@ export interface BuildResult {
   connectivity: Connectivity;
   /** 配電線の接続関係。 */
   power: { poles: PolePlan[]; spans: PowerSpan[] };
+  /**
+   * 踏切に合わせた高さ補正。描画に使った実際の高さを知りたいとき
+   * (検証や当たり判定) はこれを線形の高さに足す。
+   */
+  blends: Map<SegmentId, SurfaceBlend[]>;
 }
 
 /** 配電線の系統数 (地中区間も繋がっているものとして数える)。 */
@@ -181,6 +190,8 @@ export class WorldBuilder {
   private props: PropPlacement[] = [];
   /** 直近の rebuild で作った占有索引。小物の位置決めに使う。 */
   private occupancy!: Occupancy;
+  /** 直近の rebuild で使った、踏切に合わせた高さ補正。 */
+  private blends = new Map<SegmentId, SurfaceBlend[]>();
 
   /**
    * 面の塗り方。`connectivity` にすると、行き来できる系統ごとに色を変える。
@@ -221,13 +232,14 @@ export class WorldBuilder {
     const crossings = findCrossings(network);
     this.crossings = crossings;
 
-    // 踏切に合わせた線路側の高さ補正をセグメントごとにまとめる。
+    // 踏切に合わせた道路側の高さ補正をセグメントごとにまとめる。
     // 交差点の断面もこの高さで作る必要があるので、交差点を解く前に用意する。
-    const railBlends = this.collectRailBlends(crossings);
-    const blendAt = (segment: SegmentId, s: number): number => {
-      const list = railBlends.get(segment);
-      return list ? railBlendDelta(list, s) : 0;
-    };
+    const blends = this.collectCrossingBlends(crossings);
+    this.blends = blends;
+    const blendAt = (segment: SegmentId, s: number) => ({
+      ...surfaceBlendAt(blends.get(segment) ?? [], s),
+      heightScale: surfaceHeightScale(blends.get(segment) ?? [], s),
+    });
 
     const { junctions, trims } = solveJunctions(network, blendAt);
     this.junctions = junctions;
@@ -292,7 +304,7 @@ export class WorldBuilder {
       crossingZones.set(rail.segment, list);
     }
 
-    this.applyGrading(junctions, structures, crossingZones, railBlends);
+    this.applyGrading(junctions, structures, crossingZones, blends);
     this.terrainMesh.update();
 
     // 小物を置く前に、どこが道路・線路・交差点に覆われているかを索引にする。
@@ -324,7 +336,6 @@ export class WorldBuilder {
       const alignment = network.alignmentOf(seg.id);
       const range = ranges.get(seg.id)!;
       const runs = structures.get(seg.id)!;
-      const blends = railBlends.get(seg.id) ?? [];
 
       const diag = evaluateAlignment(alignment, cls);
       diagnostics.set(seg.id, diag);
@@ -345,12 +356,12 @@ export class WorldBuilder {
         alignment,
         cls,
         runs,
-        blends,
+        blends.get(seg.id) ?? [],
         stats,
         this.tintFor(connectivity, seg.id),
       );
       if (cls.kind === 'road') {
-        buildLaneMarkings(overlay, alignment, range, cls);
+        buildLaneMarkings(overlay, this.surfacePath(seg.id), range, cls);
       }
     }
 
@@ -391,6 +402,7 @@ export class WorldBuilder {
       props: this.props,
       connectivity,
       power,
+      blends,
     };
   }
 
@@ -444,6 +456,9 @@ export class WorldBuilder {
       all.push(...poles);
     }
 
+    // 橋・トンネルの footprint。架空線はこの上を跨げない。
+    const obstacles = this.structureFootprints(structures);
+
     const spans: PowerSpan[] = [];
     // 既に繋がっている柱どうしを二重に繋がないよう、union-find で追う。
     const parent = new Map<PolePlan, PolePlan>();
@@ -459,7 +474,7 @@ export class WorldBuilder {
       const rb = find(b);
       if (ra === rb) return;
       parent.set(ra, rb);
-      const underground = !continuous || this.spanBlocked(a.base, b.base);
+      const underground = !continuous || this.spanBlocked(a.base, b.base, obstacles);
       spans.push({ a, b, underground });
     };
 
@@ -525,10 +540,41 @@ export class WorldBuilder {
   }
 
   /**
+   * 橋・トンネル区間の footprint を、点と半径の列として集める。
+   *
+   * 柱を建てられない区間なので、その上を架空線で跨いではいけない。区間が
+   * 電柱の間隔より短いと柱の候補地が 1 つも落ちず、番号の連続だけでは
+   * 「跨いでしまった」ことに気づけないため、形として持っておく。
+   */
+  private structureFootprints(
+    structures: Map<SegmentId, StructureRun[]>,
+  ): { x: number; z: number; radius: number }[] {
+    const out: { x: number; z: number; radius: number }[] = [];
+    for (const [id, runs] of structures) {
+      const seg = this.network.segments.get(id);
+      if (!seg) continue;
+      const cls = this.network.classOf(seg);
+      const alignment = this.network.alignmentOf(id);
+      for (const run of runs) {
+        if (run.mode === 'ground') continue;
+        const radius = structureFootprintHalfWidth(cls, run.mode);
+        for (const sample of alignmentSamplesInRange(alignment, run.s0, run.s1, 4)) {
+          out.push({ x: sample.pos.x, z: sample.pos.z, radius });
+        }
+      }
+    }
+    return out;
+  }
+
+  /**
    * 2 本の柱の間に架空線を張れるか。
    * 線路 (架線) の上や、橋・トンネルの構造物の上は跨げない。
    */
-  private spanBlocked(a: Vector3, b: Vector3): boolean {
+  private spanBlocked(
+    a: Vector3,
+    b: Vector3,
+    obstacles: { x: number; z: number; radius: number }[],
+  ): boolean {
     const steps = Math.max(2, Math.ceil(a.distanceTo(b) / 4));
     for (let i = 0; i <= steps; i++) {
       const t = i / steps;
@@ -538,29 +584,38 @@ export class WorldBuilder {
       const hit = this.occupancy.at(x, z, { kinds: ['rail'], margin: 2 });
       // 高さが大きく違えば (掘割の上、高架の下) 支障しない。
       if (hit && Math.abs(y - hit.y) < 8) return true;
+      for (const o of obstacles) {
+        const dx = x - o.x;
+        const dz = z - o.z;
+        if (dx * dx + dz * dz <= o.radius * o.radius) return true;
+      }
     }
     return false;
   }
 
   /**
-   * 踏切に合わせた線路側の高さ補正を集める。
+   * 踏切に合わせた道路側の高さ補正を集める。
    *
    * 踏切がセグメントの端の近くにあるときは、ノードを越えて隣のセグメントへも
    * 同じ補正を伝える。そうしないと継ぎ目で帯どうしに段差ができる。
    */
-  private collectRailBlends(crossings: Crossing[]): Map<SegmentId, RailBlend[]> {
+  private collectCrossingBlends(crossings: Crossing[]): Map<SegmentId, SurfaceBlend[]> {
     const network = this.network;
-    const blends = new Map<SegmentId, RailBlend[]>();
-    const add = (segment: SegmentId, blend: RailBlend): void => {
+    const blends = new Map<SegmentId, SurfaceBlend[]>();
+    const add = (segment: SegmentId, blend: SurfaceBlend): void => {
       const list = blends.get(segment) ?? [];
       list.push(blend);
       blends.set(segment, list);
     };
 
-    const spills: { segment: SegmentId; blend: RailBlend }[] = [];
+    const spills: { segment: SegmentId; blend: SurfaceBlend }[] = [];
     for (const crossing of crossings) {
       if (crossing.kind !== 'level' || !crossing.rail || !crossing.road) continue;
-      const blend = computeRailBlend(crossing, network.alignmentOf(crossing.road.segment));
+      const blend = computeCrossingBlend(
+        crossing,
+        network.alignmentOf(crossing.rail.segment),
+        network.alignmentOf(crossing.road.segment),
+      );
       add(blend.segment, blend);
 
       const seg = network.segments.get(blend.segment);
@@ -573,15 +628,22 @@ export class WorldBuilder {
         for (const otherId of node.segments) {
           if (otherId === blend.segment) continue;
           const other = network.segments.get(otherId);
-          if (!other || network.classOf(other).kind !== 'rail') continue;
+          if (!other || network.classOf(other).kind !== 'road') continue;
           // 隣のセグメントから見た踏切の弧長 (範囲外の値になる)。
-          const s =
-            other.a === nodeId
-              ? -distance
-              : network.alignmentOf(otherId).length + distance;
+          const startsHere = other.a === nodeId;
+          const s = startsHere ? -distance : network.alignmentOf(otherId).length + distance;
+          // 2 本が同じノードから同じ向きに出ていれば、弧長の向きは逆。
+          // 傾きの符号もそのぶん反転させないと、隣で逆向きに傾く。
+          const reversed = (seg.a === nodeId) === startsHere;
+          const sign = reversed ? -1 : 1;
           spills.push({
             segment: otherId,
-            blend: { s, deltaY: blend.deltaY, halfLength: blend.halfLength },
+            blend: {
+              ...blend,
+              s,
+              slope: blend.slope * sign,
+              roll: blend.roll * sign,
+            },
           });
         }
       };
@@ -590,6 +652,17 @@ export class WorldBuilder {
     }
     for (const { segment, blend } of spills) add(segment, blend);
     return blends;
+  }
+
+  /** 描画に使った高さ (踏切の補正込み) で線形をたどる経路。標示用。 */
+  private surfacePath(segment: SegmentId): SurfacePath {
+    const alignment = this.network.alignmentOf(segment);
+    const blends = this.blends.get(segment);
+    if (!blends || blends.length === 0) return alignment;
+    return {
+      length: alignment.length,
+      sampleAt: (s) => applySurfaceBlend([alignment.sampleAt(s)], blends)[0],
+    };
   }
 
   /**
@@ -645,7 +718,7 @@ export class WorldBuilder {
     structures: Map<SegmentId, StructureRun[]>,
     /** 踏切のまわりで整地目標を道路側に寄せる範囲。 */
     crossingZones: Map<SegmentId, CrossingZone[]>,
-    railBlends: Map<SegmentId, RailBlend[]>,
+    blends: Map<SegmentId, SurfaceBlend[]>,
   ): void {
     const grading = this.grading;
     grading.reset();
@@ -683,22 +756,23 @@ export class WorldBuilder {
       const section = gradingSection(cls);
       const naturalDrop = gradingDrop(cls);
       const zones = crossingZones.get(seg.id) ?? [];
-      const blends = railBlends.get(seg.id) ?? [];
+      const segmentBlends = blends.get(seg.id) ?? [];
       for (const run of structures.get(seg.id) ?? []) {
         if (run.mode !== 'ground') continue;
         // 描画と同じ高さを整地の目標にする。踏切に寄せた分を無視すると、
         // 道床が地形からわずかに浮いたり沈んだりする。
-        const samples = applyRailBlend(
+        const samples = applySurfaceBlend(
           alignmentSamplesInRange(alignment, run.s0, run.s1, 3),
-          blends,
+          segmentBlends,
         );
         for (let i = 0; i + 1 < samples.length; i++) {
           // 勾配のある所では、格子の量子化で地形が路端より高く出ることが
           // ある。1 マス分の高低差だけ余計に下げて逃げる。
           const grade = Math.abs(samples[i].grade + samples[i + 1].grade) / 2;
           const shift = grade * TERRAIN_CELL;
-          const a = gradingSectionPoints(samples[i], section, shift);
-          const b = gradingSectionPoints(samples[i + 1], section, shift);
+          const scale = surfaceHeightScale(segmentBlends, samples[i].s);
+          const a = gradingSectionPoints(samples[i], section, shift, scale);
+          const b = gradingSectionPoints(samples[i + 1], section, shift, scale);
           // 踏切のまわりでは、点ごとに道路からの垂距で目標を持ち上げる。
           if (zones.length > 0) {
             liftForCrossings(a, samples[i].pos.y, zones, naturalDrop);
@@ -810,7 +884,7 @@ export class WorldBuilder {
     alignment: Alignment,
     cls: NetworkClass,
     runs: StructureRun[],
-    blends: RailBlend[],
+    blends: SurfaceBlend[],
     stats: WorldStats,
     tint?: RGB,
   ): void {
@@ -823,13 +897,16 @@ export class WorldBuilder {
     for (const run of runs) {
       const raw = alignmentSamplesInRange(alignment, run.s0, run.s1, 2.5);
       if (raw.length < 2) continue;
-      const samples = cls.kind === 'rail' ? applyRailBlend(raw, blends) : raw;
+      const samples = applySurfaceBlend(raw, blends);
 
       buildRibbon(surface, samples, profile, {
         skirt: run.mode === 'ground',
         cls,
         groundY: ground,
         tint,
+        // 踏切の上では縁石・歩道の段差を潰す。レールが歩道の帯に潜って
+        // 途切れて見えるのを防ぐ (実物の踏切でも縁石は切り下げられている)。
+        heightScale: (s) => surfaceHeightScale(blends, s),
       });
 
       if (run.mode === 'bridge') {
@@ -852,8 +929,7 @@ export class WorldBuilder {
       const first = runs[0];
       const last = runs[runs.length - 1];
       if (first && last) {
-        const raw = alignmentSamplesInRange(alignment, first.s0, last.s1, 1.5);
-        const samples = applyRailBlend(raw, blends);
+        const samples = alignmentSamplesInRange(alignment, first.s0, last.s1, 1.5);
         buildTrack(structure, samples, cls.tracks.length ? cls.tracks : [0]);
       }
     }
@@ -898,10 +974,16 @@ export class WorldBuilder {
     }
 
     if (cls.kind === 'rail') {
+      // 交差点面 (道床天端) は、いちばん内側のリングを塗ったもの。
+      const ballast = junction.rings[junction.rings.length - 1];
+      const ballastY =
+        ballast && ballast.length >= 3
+          ? (x: number, z: number): number | null => surfaceHeightAt(ballast, x, z)
+          : undefined;
       for (const connection of junction.connections) {
         const from = junction.approaches.find((a) => a.branch.segment === connection.from);
         const to = junction.approaches.find((a) => a.branch.segment === connection.to);
-        if (from && to) buildTrackConnection(structure, from, to, connection.through);
+        if (from && to) buildTrackConnection(structure, from, to, connection.through, { ballastY });
       }
       return;
     }
@@ -925,7 +1007,7 @@ export class WorldBuilder {
   private approachFrame(approach: Approach): ApproachFrame {
     const alignment = this.network.alignmentOf(approach.branch.segment);
     return {
-      alignment,
+      alignment: this.surfacePath(approach.branch.segment),
       atStart: approach.branch.atStart,
       length: alignment.length,
       trim: approach.trim,
@@ -1054,7 +1136,6 @@ export class WorldBuilder {
 
     stats.levelCrossings++;
     const road = crossing.road;
-    const roadAlignment = this.network.alignmentOf(road.segment);
     const build = buildLevelCrossing(
       overlay,
       crossing,
@@ -1073,10 +1154,34 @@ export class WorldBuilder {
       },
     );
 
+    // 踏切の中だけ、レールの内側にフランジ溝を敷く。線路が舗装から
+    // わずかしか出ていないので、これが無いとどこが線路か分かりにくい。
+    const railAlignment = this.network.alignmentOf(crossing.rail.segment);
+    // 舗装の中だけ。外まで伸ばすと、道床の上に溝が浮いてしまう。
+    const sin = Math.max(
+      0.26,
+      Math.abs(road.dir.x * crossing.rail.dir.y - road.dir.y * crossing.rail.dir.x),
+    );
+    const reach = Math.max(1, road.cls.halfWidth / sin - 0.5);
+    buildFlangeways(
+      overlay,
+      alignmentSamplesInRange(
+        railAlignment,
+        Math.max(0, crossing.rail.s - reach),
+        Math.min(railAlignment.length, crossing.rail.s + reach),
+        2,
+      ),
+      crossing.rail.cls,
+    );
+
     for (const stop of build.stopStations) {
-      const alignment =
-        stop.segment === road.segment ? roadAlignment : this.network.alignmentOf(stop.segment);
-      buildCrossingStopLine(overlay, alignment, stop.s, road.cls, stop.forward);
+      buildCrossingStopLine(
+        overlay,
+        this.surfacePath(stop.segment),
+        stop.s,
+        road.cls,
+        stop.forward,
+      );
     }
     for (const spec of build.gates) this.placeGate(spec, road.segment);
   }
@@ -1089,13 +1194,17 @@ export class WorldBuilder {
   private roadSampleAt(segment: SegmentId, s: number, depth = 0): RoadSample | null {
     const alignment = this.network.alignmentOf(segment);
     if (s >= 0 && s <= alignment.length) {
-      const sample = alignment.sampleAt(s);
+      const sample = applySurfaceBlend(
+        [alignment.sampleAt(s)],
+        this.blends.get(segment) ?? [],
+      )[0];
       return {
         pos: sample.pos.clone(),
         right: sample.right.clone(),
         forward: sample.forward.clone(),
         segment,
         s,
+        roll: sample.roll ?? 0,
       };
     }
     if (depth >= 2) return null;
@@ -1127,6 +1236,8 @@ export class WorldBuilder {
         ...found,
         right: found.right.negate(),
         forward: found.forward.negate(),
+        // 弧長が逆向きなら、右手側も反転するので横断勾配の符号も変わる。
+        roll: -found.roll,
       };
     }
     return null;

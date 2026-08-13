@@ -19,6 +19,13 @@ export interface AlignmentSample {
   curvature: number;
   /** 縦断勾配 dy/ds。 */
   grade: number;
+  /**
+   * 横断勾配 (中心線から右へ 1 m につき上がる量)。
+   *
+   * 線形そのものは持たない。踏切で線路の勾配に舗装を合わせるときだけ、
+   * 描画用のサンプル列に後から加える (`applySurfaceBlend`)。
+   */
+  roll?: number;
 }
 
 /**

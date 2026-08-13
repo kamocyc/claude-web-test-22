@@ -2,7 +2,12 @@ import { describe, expect, it } from 'vitest';
 import { MeshBasicMaterial, Vector3 } from 'three';
 import { buildDemoNetwork } from '../src/app/demo';
 import { buildCatenary } from '../src/build/rail';
-import { buildPowerLine, planUtilityPoles } from '../src/build/streetside';
+import {
+  buildPowerLine,
+  planUtilityPoles,
+  type PolePlan,
+  type PowerSpan,
+} from '../src/build/streetside';
 import { profileFor } from '../src/build/surface';
 import { MeshBuilder } from '../src/core/meshbuilder';
 import { SURFACE_LIFT } from '../src/core/units';
@@ -139,7 +144,17 @@ function samplePoly(
 }
 
 /** 実際に描画された弧長範囲 (交差点でトリムしたあと) の中心線。 */
+const drawnCache = new Map<Scene, Poly[]>();
+
 function drawnCenterlines(s: Scene): Poly[] {
+  const cached = drawnCache.get(s);
+  if (cached) return cached;
+  const built = computeDrawnCenterlines(s);
+  drawnCache.set(s, built);
+  return built;
+}
+
+function computeDrawnCenterlines(s: Scene): Poly[] {
   const out: Poly[] = [];
   for (const seg of s.network.segments.values()) {
     const al = s.network.alignmentOf(seg.id);
@@ -310,6 +325,176 @@ function shareNode(network: Network, a: SegmentId, b: SegmentId): boolean {
   const sa = network.getSegment(a);
   const sb = network.getSegment(b);
   return sa.a === sb.a || sa.a === sb.b || sa.b === sb.a || sa.b === sb.b;
+}
+
+
+// ------------------------------------------------- 配電線 (実メッシュで見る)
+
+/** `buildPowerLine` が作った形状の頂点をそのまま取り出す。 */
+function powerVertices(poles: PolePlan[], spans: PowerSpan[]): Vector3[] {
+  const mb = new MeshBuilder();
+  buildPowerLine(mb, poles, spans);
+  const pos = mb.build().getAttribute('position');
+  const out: Vector3[] = [];
+  for (let i = 0; i < pos.count; i++) {
+    out.push(new Vector3(pos.getX(i), pos.getY(i), pos.getZ(i)));
+  }
+  return out;
+}
+
+function horizontalDistance(a: Vector3, b: Vector3): number {
+  return Math.hypot(a.x - b.x, a.z - b.z);
+}
+
+function nearestPoleDistance(v: Vector3, poles: PolePlan[]): number {
+  let best = Infinity;
+  for (const p of poles) best = Math.min(best, horizontalDistance(v, p.base));
+  return best;
+}
+
+/**
+ * 柱まわりの金物 (腕金・碍子・変圧器・引き下げ管・ハンドホール) が収まる
+ * 水平半径 [m]。定数を決め打ちせず、「線を 1 本も張らない形状」と
+ * 「全径間を地中にした形状」を実際に作って測る。これより遠い頂点は
+ * 架空線のものだと言い切れる。
+ */
+function poleHardwareRadius(poles: PolePlan[], spans: PowerSpan[]): number {
+  let r = 0;
+  const bare = powerVertices(poles, []);
+  const risers = powerVertices(poles, spans.map((sp) => ({ ...sp, underground: true })));
+  for (const v of bare) r = Math.max(r, nearestPoleDistance(v, poles));
+  for (const v of risers) r = Math.max(r, nearestPoleDistance(v, poles));
+  return r;
+}
+
+interface PowerMesh {
+  poles: PolePlan[];
+  spans: PowerSpan[];
+  /** 柱の金物から離れた頂点 = 架空線の途中。 */
+  wireVertices: Vector3[];
+  radius: number;
+  /** 足元にハンドホール (引き下げ管) が見える柱。 */
+  risers: Set<PolePlan>;
+}
+
+/**
+ * 足元の点検口の有無で「引き下げ管が付いているか」を見分ける。
+ *
+ * 柱の幹は半径 0.3 m に収まり、腕金・電線は遥か上にあるので、
+ * 「足元の高さで、幹から 0.3〜2.0 m 離れた頂点」があるのは点検口だけ。
+ * 判別できていることは、線を張らない形状 (0 本) と全径間地中の形状
+ * (全端点) で毎回確かめる。
+ */
+function hasHandhole(vertices: Vector3[], pole: PolePlan): boolean {
+  for (const v of vertices) {
+    if (Math.abs(v.y - pole.base.y) > 0.5) continue;
+    const d = horizontalDistance(v, pole.base);
+    if (d > 0.3 && d < 2.0) return true;
+  }
+  return false;
+}
+
+const meshCache = new Map<Scene, PowerMesh>();
+
+function powerMesh(s: Scene): PowerMesh {
+  const cached = meshCache.get(s);
+  if (cached) return cached;
+  const built = computePowerMesh(s);
+  meshCache.set(s, built);
+  return built;
+}
+
+function computePowerMesh(s: Scene): PowerMesh {
+  const { poles, spans } = s.result.power;
+  const radius = poles.length ? poleHardwareRadius(poles, spans) : 0;
+  const vertices = powerVertices(poles, spans);
+  const risers = new Set<PolePlan>();
+  for (const pole of poles) {
+    if (hasHandhole(vertices, pole)) risers.add(pole);
+  }
+  return {
+    poles,
+    spans,
+    radius,
+    wireVertices: vertices.filter((v) => nearestPoleDistance(v, poles) > radius + 1e-6),
+    risers,
+  };
+}
+
+/**
+ * その径間だけを組み立てて、増えた頂点を取り出す。
+ *
+ * 全体のメッシュから位置で切り出そうとすると、隣の径間の線を拾ってしまう。
+ * 同じ 2 本の柱で「径間あり」と「径間なし」を作り、その差を取れば、その
+ * 径間が作った形状 (架空線 or 引き下げ管) だけが確実に得られる。
+ */
+function spanGeometry(span: PowerSpan): Vector3[] {
+  const two = [span.a, span.b];
+  const withSpan = powerVertices(two, [span]);
+  const without = powerVertices(two, []);
+  const bag = new Map<string, number>();
+  const key = (v: Vector3): string => `${v.x.toFixed(4)},${v.y.toFixed(4)},${v.z.toFixed(4)}`;
+  for (const v of without) bag.set(key(v), (bag.get(key(v)) ?? 0) + 1);
+  const out: Vector3[] = [];
+  for (const v of withSpan) {
+    const k = key(v);
+    const n = bag.get(k) ?? 0;
+    if (n > 0) bag.set(k, n - 1);
+    else out.push(v);
+  }
+  return out;
+}
+
+/** その径間に架空線が張られているか (柱の金物から離れた頂点があるか)。 */
+const wireCache = new Map<PowerSpan, Vector3[]>();
+
+function spanWireVertices(span: PowerSpan, radius: number): Vector3[] {
+  const cached = wireCache.get(span);
+  if (cached) return cached;
+  const two = [span.a, span.b];
+  const result = spanGeometry(span).filter((v) => nearestPoleDistance(v, two) > radius + 1e-6);
+  wireCache.set(span, result);
+  return result;
+}
+
+/** 電柱が属するセグメント。 */
+function poleSegmentOf(s: Scene, pole: PolePlan): SegmentId | undefined {
+  for (const prop of s.result.props) {
+    if (prop.kind !== 'utilityPole') continue;
+    if (prop.position.distanceToSquared(pole.base) < 1e-8) return prop.segment;
+  }
+  return undefined;
+}
+
+/** 径間を 1 m 刻みで辿る。 */
+function sampleSpan(span: PowerSpan): { x: number; z: number; y: number }[] {
+  const a = span.a.base;
+  const b = span.b.base;
+  const steps = Math.max(2, Math.ceil(a.distanceTo(b)));
+  const out = [];
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps;
+    out.push({
+      x: a.x + (b.x - a.x) * t,
+      z: a.z + (b.z - a.z) * t,
+      y: a.y + (b.y - a.y) * t,
+    });
+  }
+  return out;
+}
+
+/** その地点を覆う線形と、そこでの構造形式。 */
+function coverAt(s: Scene, x: number, z: number): { poly: Poly; near: Nearest; mode: string }[] {
+  const out: { poly: Poly; near: Nearest; mode: string }[] = [];
+  for (const poly of drawnCenterlines(s)) {
+    const near = nearestOnPoly(x, z, poly);
+    if (near.dist > poly.cls.halfWidth) continue;
+    const mode =
+      s.result.structures.get(poly.segment)?.find((r) => near.s >= r.s0 && near.s <= r.s1)?.mode ??
+      'ground';
+    out.push({ poly, near, mode });
+  }
+  return out;
 }
 
 // -------------------------------------------------------------------- 違反
@@ -682,9 +867,33 @@ interface WireSpan {
 
 function wireSpans(s: Scene): WireSpan[] {
   const out: WireSpan[] = [];
+
+  // 電柱の径間は `result.power.spans` にそのまま入っている (実データ)。
+  // 架空線が張られているものだけを見る。
+  const mesh = powerMesh(s);
+  for (const span of mesh.spans) {
+    if (span.underground) continue;
+    if (spanWireVertices(span, mesh.radius).length === 0) continue;
+    const segment = poleSegmentOf(s, span.a);
+    if (segment === undefined) continue;
+    const poly = fullCenterline(s, segment);
+    let minLateral = Infinity;
+    for (const p of sampleSpan(span)) {
+      minLateral = Math.min(minLateral, nearestOnPoly(p.x, p.z, poly).dist);
+    }
+    out.push({
+      segment,
+      kind: 'utilityPole',
+      minLateral,
+      poleLateral: nearestOnPoly(span.a.base.x, span.a.base.z, poly).dist,
+      mid: new Vector3().addVectors(span.a.base, span.b.base).multiplyScalar(0.5),
+    });
+  }
+
+  // 架線は従来どおり「ピッチ 1 つ分だけ離れた隣り合う柱」で見る。
   const bySegment = new Map<SegmentId, { prop: PropPlacement; s: number }[]>();
   for (const prop of s.result.props) {
-    if (prop.kind !== 'utilityPole' && prop.kind !== 'catenaryPole') continue;
+    if (prop.kind !== 'catenaryPole') continue;
     if (prop.segment === undefined) continue;
     const poly = fullCenterline(s, prop.segment);
     const list = bySegment.get(prop.segment) ?? [];
@@ -695,7 +904,7 @@ function wireSpans(s: Scene): WireSpan[] {
     list.sort((a, b) => a.s - b.s);
     const poly = fullCenterline(s, segment);
     for (let i = 0; i + 1 < list.length; i++) {
-      const pitch = list[i].prop.kind === 'utilityPole' ? 38 : 45;
+      const pitch = 45;
       if (Math.abs(list[i + 1].s - list[i].s - pitch) > 1.0) continue;
       const a = list[i].prop.position;
       const b = list[i + 1].prop.position;
@@ -1375,6 +1584,219 @@ describe('小物の配置 (敵対的検証)', () => {
     const v = collect(checkFootNearOwnSurface);
     expect(v.map(fmt), report(v)).toEqual([]);
   });
+
+
+  it('1 つの道路網の電柱が 1 つの電力系統に繋がる', () => {
+    // 地中区間も辺として数える。橋・トンネルや交差点を跨いでも、行き来
+    // できる道路の上の電柱は 1 系統でなければならない。
+    const bad: string[] = [];
+    let checked = 0;
+    for (const s of built().scenes) {
+      const { poles, spans } = s.result.power;
+      if (poles.length === 0) continue;
+      const parent = new Map<PolePlan, PolePlan>();
+      const find = (p: PolePlan): PolePlan => {
+        let root = p;
+        while (parent.get(root) !== root) root = parent.get(root)!;
+        return root;
+      };
+      for (const p of poles) parent.set(p, p);
+      for (const span of spans) {
+        const ra = find(span.a);
+        const rb = find(span.b);
+        if (ra !== rb) parent.set(ra, rb);
+      }
+
+      // 電柱を、その柱が立つ道路の連結成分ごとにまとめる。
+      const byComponent = new Map<number, PolePlan[]>();
+      const segmentOfPole = new Map<PolePlan, SegmentId>();
+      for (const prop of s.result.props) {
+        if (prop.kind !== 'utilityPole' || prop.segment === undefined) continue;
+        const pole = poles.find(
+          (p) => p.base.distanceToSquared(prop.position) < 1e-8,
+        );
+        if (pole) segmentOfPole.set(pole, prop.segment);
+      }
+      for (const pole of poles) {
+        const segment = segmentOfPole.get(pole);
+        if (segment === undefined) continue;
+        const component = s.result.connectivity.componentOf.get(segment);
+        if (component === undefined) continue;
+        const list = byComponent.get(component) ?? [];
+        list.push(pole);
+        byComponent.set(component, list);
+      }
+
+      for (const [component, list] of byComponent) {
+        const roots = new Set(list.map((p) => find(p)));
+        checked++;
+        if (roots.size <= 1) continue;
+        // どこで切れているか分かるよう、系統ごとの代表位置を出す。
+        const groups = new Map<PolePlan, PolePlan[]>();
+        for (const p of list) {
+          const r = find(p);
+          groups.set(r, [...(groups.get(r) ?? []), p]);
+        }
+        const detail = [...groups.values()]
+          .map((g) => `${g.length} 本 (例 ${g[0].base.x.toFixed(0)}, ${g[0].base.z.toFixed(0)})`)
+          .join(' / ');
+        bad.push(
+          `[${s.name}] 道路網 #${component} の電柱 ${list.length} 本が ${roots.size} 系統に分断: ${detail}`,
+        );
+      }
+    }
+    expect(bad, `\n${bad.slice(0, 12).join('\n')}\n`).toEqual([]);
+    expect(checked, '電柱のある道路網が 1 つもない (検査が空振り)').toBeGreaterThan(10);
+  }, 60000);
+
+  it('架空線は地中区間には張られず、地中区間だけに引き下げ管が付く', () => {
+    // 判定は実メッシュ。径間の中ほどに線の頂点があるかどうかで見る。
+    const bad: string[] = [];
+    let overhead = 0;
+    let underground = 0;
+    for (const s of built().scenes) {
+      const mesh = powerMesh(s);
+      if (mesh.poles.length === 0) continue;
+
+      // 見分け方が効いていることの確認 (線なし = 0 本、全地中 = 全端点)。
+      const bare = powerVertices(mesh.poles, []);
+      const allUnder = powerVertices(
+        mesh.poles,
+        mesh.spans.map((sp) => ({ ...sp, underground: true })),
+      );
+      const endpoints = new Set<PolePlan>();
+      for (const sp of mesh.spans) {
+        endpoints.add(sp.a);
+        endpoints.add(sp.b);
+      }
+      for (const pole of mesh.poles) {
+        if (hasHandhole(bare, pole)) {
+          bad.push(`[${s.name}] 判別失敗: 線を張らない形状にも点検口が見える`);
+          break;
+        }
+        if (endpoints.has(pole) && !hasHandhole(allUnder, pole)) {
+          bad.push(`[${s.name}] 判別失敗: 全地中の形状で点検口が見えない`);
+          break;
+        }
+      }
+
+      for (const span of mesh.spans) {
+        const wires = spanWireVertices(span, mesh.radius).length;
+        const where = `(${span.a.base.x.toFixed(0)}, ${span.a.base.z.toFixed(0)})〜(${span.b.base.x.toFixed(0)}, ${span.b.base.z.toFixed(0)})`;
+        if (span.underground) {
+          underground++;
+          if (wires > 0) {
+            bad.push(`[${s.name}] 地中区間 ${where} に架空線の頂点が ${wires} 個ある`);
+          }
+        } else {
+          overhead++;
+          if (wires === 0) {
+            bad.push(`[${s.name}] 架空区間 ${where} に架空線がない`);
+          }
+        }
+      }
+
+      for (const pole of mesh.poles) {
+        const shouldHave = mesh.spans.some(
+          (sp) => sp.underground && (sp.a === pole || sp.b === pole),
+        );
+        const has = mesh.risers.has(pole);
+        if (shouldHave === has) continue;
+        bad.push(
+          `[${s.name}] 引き下げ管が${has ? '余計に付いている' : '足りない'}: ` +
+            `柱 (${pole.base.x.toFixed(1)}, ${pole.base.z.toFixed(1)})`,
+        );
+      }
+    }
+    expect(bad, `\n${bad.slice(0, 12).join('\n')}\n`).toEqual([]);
+    expect(overhead, '架空区間が 1 つもない (検査が空振り)').toBeGreaterThan(20);
+    expect(underground, '地中区間が 1 つもない (検査が空振り)').toBeGreaterThan(0);
+  }, 60000);
+
+  it('架空線が線路の架線と干渉しない', () => {
+    // 架空配電線が軌道の上を通ってよいのは、架線 (トロリ線) より高い所だけ。
+    // 判定に使う高さは、線路側の断面ではなく架線柱の実際の頭の高さから測る。
+    const bad: string[] = [];
+    let sampled = 0;
+    for (const s of built().scenes) {
+      const mesh = powerMesh(s);
+      // その線路に架線柱が建っているか (建っていなければ架線もない)。
+      const catenaryTop = new Map<SegmentId, number>();
+      for (const prop of s.result.props) {
+        if (prop.kind !== 'catenaryPole' || prop.segment === undefined) continue;
+        catenaryTop.set(
+          prop.segment,
+          Math.max(catenaryTop.get(prop.segment) ?? -Infinity, prop.position.y),
+        );
+      }
+      for (const span of mesh.spans) {
+        if (span.underground) continue;
+        const wires = spanWireVertices(span, mesh.radius);
+        if (wires.length === 0) continue;
+        const lowest = Math.min(...wires.map((v) => v.y));
+        for (const p of sampleSpan(span)) {
+          sampled++;
+          for (const cover of coverAt(s, p.x, p.z)) {
+            if (cover.poly.cls.kind !== 'rail') continue;
+            const top = catenaryTop.get(cover.poly.segment);
+            if (top === undefined) continue; // 架線のない側線
+            // 架線柱の足元 (道床天端) からの高さ 5 m 前後にトロリ線が来る。
+            const contactWire = top + 5;
+            if (lowest > contactWire) continue;
+            bad.push(
+              `[${s.name}] 架空配電線が軌道 seg#${cover.poly.segment} の上を ` +
+                `架線より低く通る @ (${p.x.toFixed(1)}, ${p.z.toFixed(1)}) ` +
+                `中心線から ${cover.near.dist.toFixed(2)} m / 電線 ${lowest.toFixed(2)} m ` +
+                `vs 架線 ${contactWire.toFixed(2)} m`,
+            );
+          }
+        }
+      }
+    }
+    const unique = [...new Set(bad)];
+    expect(unique, `\n${unique.slice(0, 12).join('\n')}\n`).toEqual([]);
+    expect(sampled, '架空線が 1 本もない (検査が空振り)').toBeGreaterThan(500);
+  }, 120000);
+
+  it('架空線が橋・トンネルの区間を跨がない', () => {
+    // 橋・トンネルには柱が建たないので、その区間は地中で繋ぐのが仕様。
+    // 「径間のうち何 m が構造物の上か」も測って出す。
+    const bad: string[] = [];
+    let checked = 0;
+    for (const s of built().scenes) {
+      const mesh = powerMesh(s);
+      for (const span of mesh.spans) {
+        if (span.underground) continue;
+        if (spanWireVertices(span, mesh.radius).length === 0) continue;
+        checked++;
+        const points = sampleSpan(span);
+        let over = 0;
+        const modes = new Set<string>();
+        const segments = new Set<SegmentId>();
+        for (const p of points) {
+          let hit = false;
+          for (const cover of coverAt(s, p.x, p.z)) {
+            if (cover.poly.cls.kind === 'rail' || cover.mode === 'ground') continue;
+            hit = true;
+            modes.add(cover.mode);
+            segments.add(cover.poly.segment);
+          }
+          if (hit) over++;
+        }
+        if (over === 0) continue;
+        const length = span.a.base.distanceTo(span.b.base);
+        bad.push(
+          `[${s.name}] 架空線が ${[...modes].join('/')} 区間 ` +
+            `seg#${[...segments].join(',')} の上を通る: 径間 ${length.toFixed(1)} m のうち ` +
+            `${((over / points.length) * length).toFixed(1)} m ` +
+            `(${((over / points.length) * 100).toFixed(0)}%) が構造物の上`,
+        );
+      }
+    }
+    const unique = [...new Set(bad)];
+    expect(unique, `\n${unique.slice(0, 12).join('\n')}\n`).toEqual([]);
+    expect(checked, '架空区間が 1 つもない (検査が空振り)').toBeGreaterThan(20);
+  }, 120000);
 
   it('柱が飛ばされた区間には電線を張らない', () => {
     // 途中を塞いだ状態で直接組み立て、塞いだ帯の中に一切の形状 (= 電線) が

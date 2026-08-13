@@ -3,7 +3,7 @@ import { Alignment, type AlignmentSample } from '../core/alignment';
 import { curveFromTangents } from '../core/curve';
 import { VerticalProfile } from '../core/profile';
 import type { MeshBuilder } from '../core/meshbuilder';
-import { RAIL_GAUGE, SURFACE_LIFT } from '../core/units';
+import { RAIL_GAUGE, SURFACE_LIFT, smoothstep } from '../core/units';
 import type { NetworkClass } from '../network/classes';
 import type { Approach } from '../network/junction';
 import { addBox, addWire } from './primitives';
@@ -15,7 +15,9 @@ const RAIL_HEAD: RGB = [0.68, 0.66, 0.66];
 const SLEEPER_COLOR: RGB = [0.31, 0.26, 0.22];
 const BLADE_COLOR: RGB = [0.55, 0.52, 0.5];
 
-const RAIL_HALF_WIDTH = 0.035;
+/** レール頭部の半幅 [m]。踏切のフランジ溝の位置決めにも使う。 */
+export const RAIL_HEAD_HALF_WIDTH = 0.035;
+const RAIL_HALF_WIDTH = RAIL_HEAD_HALF_WIDTH;
 const RAIL_HEIGHT = 0.15;
 const SLEEPER_PITCH = 0.62;
 const SLEEPER_HALF_LENGTH = 1.25;
@@ -149,30 +151,57 @@ export function interpolateSample(
 }
 
 /**
- * 交差点 (分岐器・クロッシング) を通過する軌道を作る。
+ * 交差点 (分岐器・クロッシング) を通過する軌道の線形。
  *
- * 2 本の接続枝のトリム位置を、両端の接線を保った 3 次曲線で結び、
- * その上に軌道を敷く。直進側でも分岐側でも同じ処理で扱える。
+ * 平面は両端の接線を保った 3 次曲線。縦断は**両端の勾配を引き継ぐ**
+ * エルミート曲線にする。単純に両端を直線で結ぶと、高低差のある分岐で
+ * 枝との継ぎ目に折れ点ができ、勾配がそこだけ跳ね上がる。
+ */
+export function trackConnectionAlignment(from: Approach, to: Approach): Alignment | null {
+  const a = new Vector2(from.center.x, from.center.z);
+  const b = new Vector2(to.center.x, to.center.z);
+  if (a.distanceTo(b) < 0.2) return null;
+
+  // ノードへ向かう方向 = 外向きの逆。
+  const ta = from.dir.clone().negate();
+  const tb = to.dir.clone();
+  const horizontal = curveFromTangents(a, ta, b, tb);
+  // 曲線は from の外向きと逆に進むので、始点の勾配は符号が反転する。
+  return new Alignment(
+    horizontal,
+    new VerticalProfile(
+      from.center.y,
+      to.center.y,
+      -from.outwardGrade,
+      to.outwardGrade,
+      horizontal.length,
+    ),
+  );
+}
+
+export interface TrackConnectionOptions {
+  /**
+   * その地点の交差点面 (道床天端) の高さ。軌道がこれより下に潜らないよう
+   * 持ち上げる。高低差のある分岐では、縦断曲線が弦より下に垂れて道床に
+   * 埋まることがある。
+   */
+  ballastY?: (x: number, z: number) => number | null;
+}
+
+/**
+ * 交差点 (分岐器・クロッシング) を通過する軌道を作る。
+ * 直進側でも分岐側でも同じ処理で扱える。
  */
 export function buildTrackConnection(
   mb: MeshBuilder,
   from: Approach,
   to: Approach,
   through: boolean,
+  options: TrackConnectionOptions = {},
 ): void {
-  const a = new Vector2(from.center.x, from.center.z);
-  const b = new Vector2(to.center.x, to.center.z);
-  if (a.distanceTo(b) < 0.2) return;
-
-  // ノードへ向かう方向 = 外向きの逆。
-  const ta = from.dir.clone().negate();
-  const tb = to.dir.clone();
-  const horizontal = curveFromTangents(a, ta, b, tb);
-  const alignment = new Alignment(
-    horizontal,
-    VerticalProfile.linear(from.center.y, to.center.y, horizontal.length),
-  );
-  const samples = alignment.sample(1.2);
+  const alignment = trackConnectionAlignment(from, to);
+  if (!alignment) return;
+  const samples = liftAboveBallast(alignment.sample(1.2), options.ballastY);
 
   const fromOffsets = outwardTrackOffsets(from);
   const toOffsets = outwardTrackOffsets(to);
@@ -191,8 +220,10 @@ export function buildTrackConnection(
     }
     const ob = toOffsets[best];
     // 接続曲線に沿って、始点で oa・終点で -ob になるようレールを寄せる。
+    // 直線で寄せると両端で横方向に折れるので、両端の傾きが 0 になる
+    // なめらかな関数を使う。
     const shifted = samples.map((sample) => {
-      const t = sample.s / Math.max(1e-6, alignment.length);
+      const t = smoothstep(sample.s / Math.max(1e-6, alignment.length));
       const offset = oa * (1 - t) + -ob * t;
       return { sample, offset };
     });
@@ -245,6 +276,29 @@ function buildShiftedRailPair(
       SLEEPER_COLOR,
     );
   }
+}
+
+/**
+ * 交差点の道床より下に潜った所を持ち上げる。
+ *
+ * 両端は断面がそのまま道床天端なので持ち上げ量が 0 になり、継ぎ目は
+ * 開かない。中だるみした所だけが道床の上に出てくる。
+ */
+function liftAboveBallast(
+  samples: AlignmentSample[],
+  ballastY?: (x: number, z: number) => number | null,
+): AlignmentSample[] {
+  if (!ballastY) return samples;
+  return samples.map((sample) => {
+    const ground = ballastY(sample.pos.x, sample.pos.z);
+    if (ground === null) return sample;
+    const min = ground + RAIL_TOP_TO_BALLAST;
+    if (sample.pos.y >= min) return sample;
+    return {
+      ...sample,
+      pos: new Vector3(sample.pos.x, min, sample.pos.z),
+    };
+  });
 }
 
 function offsetSample(sample: AlignmentSample, offset: number): AlignmentSample {

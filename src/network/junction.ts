@@ -23,6 +23,8 @@ export interface Approach {
   center: Vector3;
   /** 外向き方向 (水平、単位)。 */
   dir: Vector2;
+  /** 外向き方向に見た縦断勾配 dy/ds。分岐器の縦断を枝と繋げるのに使う。 */
+  outwardGrade: number;
   /** 方位角が小さい隣の枝を向く側の断面端点。 */
   edgePrev: Vector3;
   /** 方位角が大きい隣の枝を向く側の断面端点。 */
@@ -97,7 +99,7 @@ const CORNER_MARGIN = 0.6;
 export function solveJunctions(
   network: Network,
   /**
-   * 描画高さの補正 (踏切に合わせた線路の持ち上げ)。交差点の断面にも
+   * 描画高さの補正 (踏切に合わせた道路の上下・傾斜)。交差点の断面にも
    * 同じ補正を掛けないと、トリム位置が踏切の近くのとき帯と面がずれる。
    */
   heightOffset?: HeightOffset,
@@ -156,8 +158,16 @@ export function solveJunctions(
   return { junctions, trims };
 }
 
-/** セグメント上の弧長に対する、描画高さの補正量 [m]。 */
-export type HeightOffset = (segment: SegmentId, s: number) => number;
+/** セグメント上の弧長に対する、描画高さの補正 (中心線の上下と横断勾配)。 */
+export type HeightOffset = (
+  segment: SegmentId,
+  s: number,
+) => {
+  dy: number;
+  roll: number;
+  /** 断面の段差 (縁石・歩道) に掛ける係数。踏切では 0 に近づく。 */
+  heightScale: number;
+};
 
 /** リングが自分自身と交差しているか (XZ 平面で見て)。 */
 export function selfIntersects(ring: Vector3[]): boolean {
@@ -215,6 +225,7 @@ function solveNode(
     trim: 0,
     center: new Vector3(),
     dir: branch.dir.clone(),
+    outwardGrade: 0,
     edgePrev: new Vector3(),
     edgeNext: new Vector3(),
     carriagewayPrev: new Vector3(),
@@ -235,6 +246,25 @@ function solveNode(
     }
   }
 
+  const connections = kind === 'railSwitch' || kind === 'railCrossing' || kind === 'seam'
+    ? solveTrackConnections(branches, warnings)
+    : [];
+
+  // 分岐器は、規格の最小半径で振り分けられるだけの長さを交差点に取り込む。
+  // 短いまま繋ぐと、線路とは思えない急な折れ線になってしまう。
+  // (継ぎ目は交差点面を作らないので、トリムするとそこが穴になる。)
+  for (const conn of kind === 'railSwitch' || kind === 'railCrossing' ? connections : []) {
+    if (conn.deflection < 1e-3) continue;
+    const pair = approaches.filter(
+      (ap) => ap.branch.segment === conn.from || ap.branch.segment === conn.to,
+    );
+    // 分岐側の規格で決める。本線の最小半径を使うと、側線が浅い角度で
+    // 分かれるだけで交差点が何十 m にも膨らんでしまう。
+    const radius = Math.min(...pair.map((ap) => ap.branch.cls.minRadius));
+    const tangent = turnoutTangentLength(radius, conn.deflection);
+    for (const ap of pair) ap.trim = Math.max(ap.trim, tangent);
+  }
+
   const needsMargin = kind === 'intersection' || kind === 'railSwitch' || kind === 'railCrossing';
   for (const ap of approaches) {
     const L = network.alignmentOf(ap.branch.segment).length;
@@ -252,10 +282,6 @@ function solveNode(
     kind === 'intersection' &&
     branches.length >= 3 &&
     branches.some((b) => b.cls.signalCapable);
-
-  const connections = kind === 'railSwitch' || kind === 'railCrossing' || kind === 'seam'
-    ? solveTrackConnections(branches, warnings)
-    : [];
 
   return {
     node: nodeId,
@@ -324,12 +350,17 @@ function updateApproachGeometry(
   const s = clamp(ap.branch.atStart ? ap.trim : L - ap.trim, 0, L);
   const raw = al.sampleAt(s);
   const cls = ap.branch.cls;
-  // 描画側と同じ高さで断面を作る。
-  const dy = heightOffset?.(ap.branch.segment, s) ?? 0;
+  // 描画側と同じ高さ・同じ傾きで断面を作る。
+  const offset = heightOffset?.(ap.branch.segment, s) ?? ZERO_OFFSET;
   const sample =
-    dy === 0
+    offset.dy === 0 && offset.roll === 0
       ? raw
-      : { ...raw, pos: new Vector3(raw.pos.x, raw.pos.y + dy, raw.pos.z) };
+      : {
+          ...raw,
+          pos: new Vector3(raw.pos.x, raw.pos.y + offset.dy, raw.pos.z),
+          roll: (raw.roll ?? 0) + offset.roll,
+        };
+  const roll = sample.roll ?? 0;
 
   // 外向き方向はトリム位置の接線で取り直す (曲線ではノードでの接線とずれるため)。
   const outward = ap.branch.atStart ? sample.forwardXZ.clone() : sample.forwardXZ.clone().negate();
@@ -337,39 +368,62 @@ function updateApproachGeometry(
 
   const normal = perp(outward);
   ap.center.copy(sample.pos);
+  ap.outwardGrade = ap.branch.atStart ? sample.grade : -sample.grade;
 
   // 断面をそのまま展開する。セグメント側の帯も同じ点を通るので、
   // 高低差があっても交差点面との継ぎ目が開かない。
   const profile = profileFor(cls);
-  ap.section = profile.map((p) => sectionPoint(sample.pos, normal, p));
+  // 断面の横オフセットは「外向き方向から見た右」で測る。線形の弧長が
+  // 逆向きの枝では横断勾配の符号も反転する。
+  const rollOutward = ap.branch.atStart ? roll : -roll;
+  ap.section = profile.map((p) =>
+    sectionPoint(sample.pos, normal, p, rollOutward, offset.heightScale),
+  );
 
+  const hw = cls.halfWidth;
   ap.edgePrev.set(
-    sample.pos.x - normal.x * cls.halfWidth,
-    sample.pos.y,
-    sample.pos.z - normal.y * cls.halfWidth,
+    sample.pos.x - normal.x * hw,
+    sample.pos.y - rollOutward * hw,
+    sample.pos.z - normal.y * hw,
   );
   ap.edgeNext.set(
-    sample.pos.x + normal.x * cls.halfWidth,
-    sample.pos.y,
-    sample.pos.z + normal.y * cls.halfWidth,
+    sample.pos.x + normal.x * hw,
+    sample.pos.y + rollOutward * hw,
+    sample.pos.z + normal.y * hw,
   );
   const cw = cls.carriagewayHalfWidth;
   ap.carriagewayNext.set(
     sample.pos.x + normal.x * cw,
-    sample.pos.y,
+    sample.pos.y + rollOutward * cw,
     sample.pos.z + normal.y * cw,
   );
   ap.carriagewayPrev.set(
     sample.pos.x - normal.x * cw,
-    sample.pos.y,
+    sample.pos.y - rollOutward * cw,
     sample.pos.z - normal.y * cw,
   );
 }
 
-function sectionPoint(pos: Vector3, normal: Vector2, p: ProfilePoint): Vector3 {
+const ZERO_OFFSET = { dy: 0, roll: 0, heightScale: 1 };
+
+/**
+ * 分岐角 `deflection` を最小半径 `radius` の円曲線で振り分けるのに必要な
+ * 接線長。ノードから左右にこれだけ取れば、交差点の中の曲線がその半径に収まる。
+ */
+export function turnoutTangentLength(radius: number, deflection: number): number {
+  return Math.min(40, radius * Math.tan(Math.min(deflection, Math.PI / 3) / 2));
+}
+
+function sectionPoint(
+  pos: Vector3,
+  normal: Vector2,
+  p: ProfilePoint,
+  roll = 0,
+  heightScale = 1,
+): Vector3 {
   return new Vector3(
     pos.x + normal.x * p.offset,
-    pos.y + p.height,
+    pos.y + p.height * heightScale + p.offset * roll,
     pos.z + normal.y * p.offset,
   );
 }

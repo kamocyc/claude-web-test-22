@@ -1,6 +1,12 @@
 import { Vector3 } from 'three';
 import type { AlignmentSample } from '../core/alignment';
-import { MeshBuilder, extrudeSkirt, extrudeSkirtTo, fillPolygon } from '../core/meshbuilder';
+import {
+  MeshBuilder,
+  earcutXZ,
+  extrudeSkirt,
+  extrudeSkirtTo,
+  fillPolygon,
+} from '../core/meshbuilder';
 import { GRADING_MARGIN, SURFACE_LIFT, SURFACE_SKIRT, TERRAIN_CELL } from '../core/units';
 import type { NetworkClass } from '../network/classes';
 
@@ -67,7 +73,10 @@ export function profileFor(cls: NetworkClass): ProfilePoint[] {
   return cls.kind === 'rail' ? railProfile(cls) : roadProfile(cls);
 }
 
-/** 横断面上の 1 点をワールド座標に展開する。 */
+/**
+ * 横断面上の 1 点をワールド座標に展開する。
+ * サンプルが横断勾配を持っていれば (踏切) 断面ごと傾ける。
+ */
 export function profilePointAt(
   sample: AlignmentSample,
   offset: number,
@@ -76,7 +85,7 @@ export function profilePointAt(
 ): Vector3 {
   return out.set(
     sample.pos.x + sample.right.x * offset,
-    sample.pos.y + height + SURFACE_LIFT,
+    sample.pos.y + height + SURFACE_LIFT + offset * (sample.roll ?? 0),
     sample.pos.z + sample.right.z * offset,
   );
 }
@@ -84,6 +93,11 @@ export function profilePointAt(
 export interface RibbonOptions {
   /** 外周に垂れ壁を付けるか (地表区間では地形との隙間を隠すために必要)。 */
   skirt: boolean;
+  /**
+   * 断面の高さ (縁石・歩道の段差) に掛ける係数。踏切のまわりで 0 に近づけ、
+   * 路面を平らにするのに使う。
+   */
+  heightScale?: (s: number) => number;
   /** 診断色に使う規格値。 */
   cls: NetworkClass;
   /** 整地後の地形の高さ。垂れ壁を地面まで届かせるのに使う。 */
@@ -147,17 +161,18 @@ export function buildRibbon(
     const gradeRisk = Math.abs(sample.grade) / cls.maxGrade;
     const radius = Math.abs(sample.curvature) > 1e-6 ? 1 / Math.abs(sample.curvature) : Infinity;
     const curveRisk = radius > 1e6 ? 0 : cls.minRadius / radius;
+    const scale = options.heightScale?.(sample.s) ?? 1;
     const row: number[] = [];
     for (let k = 0; k < profile.length; k++) {
       const p = profile[k];
-      profilePointAt(sample, p.offset, p.height, pos);
+      profilePointAt(sample, p.offset, p.height * scale, pos);
       // 法線は隣の断面点との向きから求める。端では片側だけを見る。
       const prev = profile[Math.max(0, k - 1)];
       const next = profile[Math.min(profile.length - 1, k + 1)];
       across
         .set(
           sample.right.x * (next.offset - prev.offset),
-          next.height - prev.height,
+          (next.height - prev.height) * scale,
           sample.right.z * (next.offset - prev.offset),
         )
         .normalize();
@@ -184,8 +199,15 @@ export function buildRibbon(
   }
 
   if (options.skirt) {
-    buildEdgeSkirt(mb, samples, profile[0], -1, options.groundY);
-    buildEdgeSkirt(mb, samples, profile[profile.length - 1], 1, options.groundY);
+    buildEdgeSkirt(mb, samples, profile[0], -1, options.groundY, options.heightScale);
+    buildEdgeSkirt(
+      mb,
+      samples,
+      profile[profile.length - 1],
+      1,
+      options.groundY,
+      options.heightScale,
+    );
   }
 }
 
@@ -196,6 +218,7 @@ function buildEdgeSkirt(
   edge: ProfilePoint,
   side: number,
   ground?: GroundQuery,
+  heightScale?: (s: number) => number,
 ): void {
   const top = new Vector3();
   const normal = new Vector3();
@@ -203,7 +226,7 @@ function buildEdgeSkirt(
   let prevTop = -1;
   let prevBottom = -1;
   for (const sample of samples) {
-    profilePointAt(sample, edge.offset, edge.height, top);
+    profilePointAt(sample, edge.offset, edge.height * (heightScale?.(sample.s) ?? 1), top);
     normal.set(sample.right.x * side, 0, sample.right.z * side).normalize();
     const t = mb.vertex(top, normal, 0, sample.s * 0.1, color);
     const b = mb.vertex(
@@ -248,7 +271,8 @@ function dropForHeight(h: number): number {
 /** 整地用の断面上の 1 点。 */
 export interface GradingPoint {
   offset: number;
-  drop: number;
+  /** 合わせる断面の高さ (路面基準)。踏切では段差を潰した高さになる。 */
+  height: number;
 }
 
 /**
@@ -268,11 +292,10 @@ export function gradingSection(cls: NetworkClass): GradingPoint[] {
   const half = gradingHalfWidth(cls);
   const outer = profile[0].height;
   const low = Math.min(...profile.map((p) => p.height));
-  const outerDrop = dropForHeight(outer);
   if (low >= outer - 1e-6) {
     return [
-      { offset: -half, drop: outerDrop },
-      { offset: half, drop: outerDrop },
+      { offset: -half, height: outer },
+      { offset: half, height: outer },
     ];
   }
 
@@ -280,14 +303,13 @@ export function gradingSection(cls: NetworkClass): GradingPoint[] {
     ...profile.filter((p) => p.height <= low + 1e-6).map((p) => Math.abs(p.offset)),
   );
   const edge = Math.min(lowHalf + TERRAIN_CELL, cls.halfWidth - 0.2);
-  const lowDrop = dropForHeight(low);
   return [
-    { offset: -half, drop: outerDrop },
-    { offset: -edge, drop: outerDrop },
-    { offset: -edge + 0.6, drop: lowDrop },
-    { offset: edge - 0.6, drop: lowDrop },
-    { offset: edge, drop: outerDrop },
-    { offset: half, drop: outerDrop },
+    { offset: -half, height: outer },
+    { offset: -edge, height: outer },
+    { offset: -edge + 0.6, height: low },
+    { offset: edge - 0.6, height: low },
+    { offset: edge, height: outer },
+    { offset: half, height: outer },
   ];
 }
 
@@ -296,12 +318,14 @@ export function gradingSectionPoints(
   sample: AlignmentSample,
   section: GradingPoint[],
   extraDrop = 0,
+  heightScale = 1,
 ): Vector3[] {
+  const roll = sample.roll ?? 0;
   return section.map(
     (p) =>
       new Vector3(
         sample.pos.x + sample.right.x * p.offset,
-        sample.pos.y - p.drop - extraDrop,
+        sample.pos.y - dropForHeight(p.height * heightScale) - extraDrop + p.offset * roll,
         sample.pos.z + sample.right.z * p.offset,
       ),
   );
@@ -346,6 +370,45 @@ export function buildJunctionSurface(
 }
 
 const SKIRT_COLOR: RGB = [0.3, 0.28, 0.26];
+
+/**
+ * 交差点面 (リングを塗り潰した多角形) の、ある一点での高さ。
+ *
+ * 描画とまったく同じ三角形分割を使うので、「面より上か下か」を確実に
+ * 判定できる。分岐器の軌道を道床に埋めないために使う。範囲外なら null。
+ */
+export function surfaceHeightAt(ring: Vector3[], x: number, z: number): number | null {
+  if (ring.length < 3) return null;
+  const flat: number[] = [];
+  for (const p of ring) flat.push(p.x, p.z);
+  const tris = earcutXZ(flat);
+  for (let i = 0; i < tris.length; i += 3) {
+    const a = ring[tris[i]];
+    const b = ring[tris[i + 1]];
+    const c = ring[tris[i + 2]];
+    const y = heightInTriangle(a, b, c, x, z);
+    if (y !== null) return y;
+  }
+  return null;
+}
+
+/** 三角形の内側なら重心座標で高さを返す。外側なら null。 */
+function heightInTriangle(
+  a: Vector3,
+  b: Vector3,
+  c: Vector3,
+  x: number,
+  z: number,
+): number | null {
+  const d = (b.z - c.z) * (a.x - c.x) + (c.x - b.x) * (a.z - c.z);
+  if (Math.abs(d) < 1e-12) return null;
+  const u = ((b.z - c.z) * (x - c.x) + (c.x - b.x) * (z - c.z)) / d;
+  const v = ((c.z - a.z) * (x - c.x) + (a.x - c.x) * (z - c.z)) / d;
+  const w = 1 - u - v;
+  const eps = -1e-6;
+  if (u < eps || v < eps || w < eps) return null;
+  return u * a.y + v * b.y + w * c.y;
+}
 
 /** 同じ頂点数の 2 本のリングの間を帯で埋める。 */
 function buildRingBand(

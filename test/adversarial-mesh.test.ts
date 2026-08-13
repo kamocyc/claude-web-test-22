@@ -1,7 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import { MeshBasicMaterial, Vector3 } from 'three';
 import { buildDemoNetwork } from '../src/app/demo';
-import { applyRailBlend, computeRailBlend, type RailBlend } from '../src/build/crossing';
+import {
+  applySurfaceBlend,
+  surfaceHeightScale,
+  type SurfaceBlend,
+} from '../src/build/crossing';
 import { RAIL_TOP_TO_BALLAST, profileFor, profilePointAt } from '../src/build/surface';
 import { earcutXZ } from '../src/core/meshbuilder';
 import { SURFACE_LIFT, clamp } from '../src/core/units';
@@ -114,59 +118,20 @@ const cliffX = (y0: number, drop: number, run: number) => (x: number) =>
 // =====================================================================
 
 /**
- * 線路セグメントごとの踏切ブレンド。`WorldBuilder.collectRailBlends` と
- * 同じ組み立て (ノードを越えて隣のセグメントへ伝える分も含む)。
+ * セグメントごとの踏切ブレンド。
  *
- * ここが実装とずれると帯の高さを取り違えるので、`ribbonMatchesMesh` で
- * 実メッシュと突き合わせて裏を取っている。
+ * 踏切では**線路ではなく道路**が線路の高さ・勾配に合わせて動く。組み立て済み
+ * のものが `BuildResult.blends` に入っている (ノードを越えて隣のセグメントへ
+ * 伝わる分も含む) ので、そのまま使う。
  */
-function railBlendsOf(scene: Scene): Map<SegmentId, RailBlend[]> {
-  const network = scene.network;
-  const map = new Map<SegmentId, RailBlend[]>();
-  const add = (segment: SegmentId, blend: RailBlend): void => {
-    const list = map.get(segment) ?? [];
-    list.push(blend);
-    map.set(segment, list);
-  };
-  const spills: { segment: SegmentId; blend: RailBlend }[] = [];
-
-  for (const crossing of scene.world.crossings) {
-    if (crossing.kind !== 'level' || !crossing.rail || !crossing.road) continue;
-    const blend = computeRailBlend(crossing, network.alignmentOf(crossing.road.segment));
-    add(blend.segment, blend);
-
-    const seg = network.segments.get(blend.segment);
-    if (!seg) continue;
-    const length = network.alignmentOf(blend.segment).length;
-    const spill = (nodeId: number, distance: number): void => {
-      if (distance >= blend.halfLength) return;
-      const node = network.nodes.get(nodeId);
-      if (!node) return;
-      for (const otherId of node.segments) {
-        if (otherId === blend.segment) continue;
-        const other = network.segments.get(otherId);
-        if (!other || network.classOf(other).kind !== 'rail') continue;
-        const s =
-          other.a === nodeId ? -distance : network.alignmentOf(otherId).length + distance;
-        spills.push({
-          segment: otherId,
-          blend: { s, deltaY: blend.deltaY, halfLength: blend.halfLength },
-        });
-      }
-    };
-    spill(seg.a, blend.s);
-    spill(seg.b, length - blend.s);
-  }
-  for (const { segment, blend } of spills) add(segment, blend);
-  return map;
+function blendsOf(scene: Scene): Map<SegmentId, SurfaceBlend[]> {
+  return scene.result.blends;
 }
 
-/** 描画に使われるサンプル (線路なら踏切ブレンド込み)。 */
-function drawnSampleAt(scene: Scene, segment: SegmentId, s: number, blends = railBlendsOf(scene)) {
-  const cls = scene.network.classOf(scene.network.getSegment(segment));
+/** 描画に使われるサンプル (踏切のまわりでは道路が上下・傾斜する)。 */
+function drawnSampleAt(scene: Scene, segment: SegmentId, s: number, blends = blendsOf(scene)) {
   const raw = scene.network.alignmentOf(segment).sampleAt(s);
-  if (cls.kind !== 'rail') return raw;
-  return applyRailBlend([raw], blends.get(segment) ?? [])[0];
+  return applySurfaceBlend([raw], blends.get(segment) ?? [])[0];
 }
 
 /** セグメント帯の端 (トリム位置) の横断面をワールド展開する。 */
@@ -413,7 +378,7 @@ function seamViolations(scene: Scene, tolerance = 0.01): Violation[] {
 function railBuriedViolations(scene: Scene, tolerance = 0.05): Violation[] {
   const out: Violation[] = [];
   const roads = roadPolylines(scene);
-  const blends = railBlendsOf(scene);
+  const blends = blendsOf(scene);
   for (const seg of scene.network.segments.values()) {
     const cls = scene.network.classOf(seg);
     if (cls.kind !== 'rail') continue;
@@ -452,7 +417,7 @@ function railBuriedViolations(scene: Scene, tolerance = 0.05): Violation[] {
 function ballastBuriedViolations(scene: Scene, tolerance = 0.05): Violation[] {
   const out: Violation[] = [];
   const roads = roadPolylines(scene);
-  const blends = railBlendsOf(scene);
+  const blends = blendsOf(scene);
   for (const seg of scene.network.segments.values()) {
     const cls = scene.network.classOf(seg);
     if (cls.kind !== 'rail') continue;
@@ -486,10 +451,12 @@ function roadBuriedViolations(scene: Scene, tolerance = 0.05): Violation[] {
     const cls = scene.network.classOf(seg);
     if (cls.kind !== 'road') continue;
     const cw = cls.carriagewayHalfWidth;
+    const blends = blendsOf(scene);
     for (const s of groundStations(scene, seg.id, 2)) {
-      const sample = scene.network.alignmentOf(seg.id).sampleAt(s);
-      const surfaceY = sample.pos.y + SURFACE_LIFT;
+      // 踏切のまわりでは路面が線路に合わせて上下・傾斜する。
+      const sample = drawnSampleAt(scene, seg.id, s, blends);
       for (const offset of [-cw + 0.2, 0, cw - 0.2]) {
+        const surfaceY = sample.pos.y + SURFACE_LIFT + offset * (sample.roll ?? 0);
         const x = sample.pos.x + sample.right.x * offset;
         const z = sample.pos.z + sample.right.z * offset;
         const terrain = scene.field.heightAt(x, z);
@@ -675,7 +642,7 @@ class SurfaceFloor {
 function skirtGapViolations(scene: Scene, tolerance = 0.05): Violation[] {
   const out: Violation[] = [];
   const floor = new SurfaceFloor(scene);
-  const blends = railBlendsOf(scene);
+  const blends = blendsOf(scene);
   for (const seg of scene.network.segments.values()) {
     const cls = scene.network.classOf(seg);
     const edge = profileFor(cls)[0];
@@ -683,8 +650,15 @@ function skirtGapViolations(scene: Scene, tolerance = 0.05): Violation[] {
     // 細かく歩いて「メッシュの頂点がある所」だけを評価する。
     for (const s of groundStations(scene, seg.id, 0.5)) {
       const sample = drawnSampleAt(scene, seg.id, s, blends);
+      // 踏切の上では縁石・歩道の段差が潰れる。描画と同じ係数を掛ける。
+      const scale = surfaceHeightScale(blends.get(seg.id) ?? [], s);
       for (const side of [-1, 1]) {
-        const p = profilePointAt(sample, side * Math.abs(edge.offset), edge.height, new Vector3());
+        const p = profilePointAt(
+          sample,
+          side * Math.abs(edge.offset),
+          edge.height * scale,
+          new Vector3(),
+        );
         const vertex = floor.nearestVertexXZ(p.x, p.z, 0.15, p.y);
         if (!vertex) continue;
         const bottom = floor.lowestAt(vertex.x, vertex.z, 0.05, p.y + 0.05);
@@ -746,15 +720,22 @@ function junctionSkirtGapViolations(scene: Scene, tolerance = 0.05): Violation[]
 function harnessDriftViolations(scene: Scene, tolerance = 0.03): Violation[] {
   const out: Violation[] = [];
   const floor = new SurfaceFloor(scene);
-  const blends = railBlendsOf(scene);
+  const blends = blendsOf(scene);
   let compared = 0;
   for (const seg of scene.network.segments.values()) {
     const cls = scene.network.classOf(seg);
     const edge = profileFor(cls)[0];
     for (const s of groundStations(scene, seg.id, 1)) {
       const sample = drawnSampleAt(scene, seg.id, s, blends);
+      // 踏切の上では縁石・歩道の段差が潰れる。描画と同じ係数を掛ける。
+      const scale = surfaceHeightScale(blends.get(seg.id) ?? [], s);
       for (const side of [-1, 1]) {
-        const p = profilePointAt(sample, side * Math.abs(edge.offset), edge.height, new Vector3());
+        const p = profilePointAt(
+          sample,
+          side * Math.abs(edge.offset),
+          edge.height * scale,
+          new Vector3(),
+        );
         const vertex = floor.nearestVertexXZ(p.x, p.z, 0.06, p.y, 0.5);
         if (!vertex) continue;
         const top = floor.highestAt(vertex.x, vertex.z, 0.05, p.y + 0.5);
@@ -849,6 +830,173 @@ function structureJointViolations(scene: Scene): { violations: Violation[]; join
     }
   }
   return { violations: out, joints };
+}
+
+/** `surfaces` メッシュの三角形 (位置は実頂点そのまま)。 */
+function surfaceTriangles(scene: Scene): { a: Vector3; b: Vector3; c: Vector3 }[] {
+  const mesh = scene.world.group.getObjectByName('surfaces') as
+    | {
+        geometry: {
+          index: { count: number; getX(i: number): number } | null;
+          attributes: {
+            position: { count: number; getX(i: number): number; getY(i: number): number; getZ(i: number): number };
+          };
+        };
+      }
+    | undefined;
+  const geometry = mesh?.geometry;
+  const pos = geometry?.attributes.position;
+  if (!geometry || !pos) throw new Error('surfaces メッシュが見つからない');
+  const at = (i: number): Vector3 => new Vector3(pos.getX(i), pos.getY(i), pos.getZ(i));
+  const out: { a: Vector3; b: Vector3; c: Vector3 }[] = [];
+  const index = geometry.index;
+  const count = index ? index.count : pos.count;
+  for (let i = 0; i + 2 < count; i += 3) {
+    const i0 = index ? index.getX(i) : i;
+    const i1 = index ? index.getX(i + 1) : i + 1;
+    const i2 = index ? index.getX(i + 2) : i + 2;
+    out.push({ a: at(i0), b: at(i1), c: at(i2) });
+  }
+  return out;
+}
+
+/** 断面の高さを、指定した横オフセットで線形補間して返す。 */
+function profileHeightAt(profile: { offset: number; height: number }[], offset: number): number {
+  if (offset <= profile[0].offset) return profile[0].height;
+  for (let i = 0; i + 1 < profile.length; i++) {
+    const a = profile[i];
+    const b = profile[i + 1];
+    if (offset <= b.offset) {
+      if (b.offset - a.offset < 1e-9) return b.height;
+      const t = (offset - a.offset) / (b.offset - a.offset);
+      return a.height + (b.height - a.height) * t;
+    }
+  }
+  return profile[profile.length - 1].height;
+}
+
+/** 交差点の「枝の口」(トリム位置の断面) の情報。 */
+interface Mouth {
+  origin: Vector3;
+  forward: Vector3;
+  right: Vector3;
+  cls: ReturnType<Network['classOf']>;
+  innerRing: Vector3[];
+  label: string;
+}
+
+function junctionMouths(scene: Scene): Mouth[] {
+  const out: Mouth[] = [];
+  const blends = blendsOf(scene);
+  for (const [id, junction] of scene.world.junctions) {
+    if (junction.rings.length === 0) continue;
+    const inner = junction.rings[junction.rings.length - 1];
+    if (inner.length < 3) continue;
+    for (const ap of junction.approaches) {
+      const range = scene.result.ranges.get(ap.branch.segment)!;
+      const s = ap.branch.atStart ? range.s0 : range.s1;
+      const sample = drawnSampleAt(scene, ap.branch.segment, s, blends);
+      out.push({
+        origin: sample.pos.clone(),
+        // 交差点から外を向く水平方向。
+        forward: new Vector3(ap.dir.x, 0, ap.dir.y).normalize(),
+        right: sample.right.clone(),
+        cls: ap.branch.cls,
+        innerRing: inner.map((p) => new Vector3(p.x, p.y + SURFACE_LIFT, p.z)),
+        label: `node=${id} kind=${junction.kind} seg=${ap.branch.segment}`,
+      });
+    }
+  }
+  return out;
+}
+
+/**
+ * (9) 枝の口を横切る立ち上がり面が残っていないか。
+ *
+ * 交差点面の歩道・縁石の帯や外周の垂れ壁が枝の口にも作られると、道路を
+ * 横切る 15 cm の段差 (縁石) や垂れ壁ができてしまう。実メッシュの三角形を
+ * 走査し、「口の断面上 (前後 0.35 m) にあり、車道の内側 (±0.85 × 車道半幅)
+ * を通り、ほぼ垂直 (法線の Y 成分 < 0.35 = 傾き 70° 超)」な面を探す。
+ *
+ * 判定域を車道半幅の 0.85 倍までにしているのは、口の端 (±車道半幅) には
+ * 隅丸めの帯や垂れ壁が正当に接するため。実測でも、口の断面上の垂直面は
+ * すべて 0.85 倍より外側にある (デモ配置で 75 面、うち車道の内側は 0 面)。
+ */
+function mouthVerticalFaceViolations(scene: Scene): Violation[] {
+  const out: Violation[] = [];
+  const mouths = junctionMouths(scene);
+  if (mouths.length === 0) return out;
+  const tris = surfaceTriangles(scene);
+  const ab = new Vector3();
+  const ac = new Vector3();
+  const normal = new Vector3();
+  const centroid = new Vector3();
+
+  for (const tri of tris) {
+    centroid.copy(tri.a).add(tri.b).add(tri.c).divideScalar(3);
+    ab.copy(tri.b).sub(tri.a);
+    ac.copy(tri.c).sub(tri.a);
+    normal.crossVectors(ab, ac);
+    if (normal.lengthSq() < 1e-16) continue;
+    normal.normalize();
+    if (Math.abs(normal.y) >= 0.35) continue;
+
+    for (const mouth of mouths) {
+      const dx = centroid.x - mouth.origin.x;
+      const dz = centroid.z - mouth.origin.z;
+      const along = dx * mouth.forward.x + dz * mouth.forward.z;
+      if (Math.abs(along) > 0.35) continue;
+      const lat = dx * mouth.right.x + dz * mouth.right.z;
+      if (Math.abs(lat) > mouth.cls.carriagewayHalfWidth * 0.85) continue;
+      const expected =
+        mouth.origin.y + profileHeightAt(profileFor(mouth.cls), lat) + SURFACE_LIFT;
+      // 立体交差など、別の高さにある面は無関係。
+      if (Math.abs(centroid.y - expected) > 3) continue;
+      const span = Math.max(tri.a.y, tri.b.y, tri.c.y) - Math.min(tri.a.y, tri.b.y, tri.c.y);
+      out.push({
+        amount: span,
+        where: centroid.clone(),
+        what: `枝の口に立ち上がり面が残っている: ${mouth.label} 高さ${span.toFixed(2)}m 法線Y=${normal.y.toFixed(2)}`,
+      });
+      break;
+    }
+  }
+  return out;
+}
+
+/**
+ * (10) 交差点の車道面が、枝の車道面と同じ高さで繋がっているか。
+ *
+ * 口から 5 cm だけ内側に入った点で、交差点面 (いちばん内側のリングを描画と
+ * 同じ earcut で分割したもの) の高さを引き、枝のトリム位置の断面の高さと
+ * 比べる。許容 0.03 m は、5 cm 内側に入る分の勾配 (12% で 0.006 m) と
+ * Float32 の丸めを見込んだ値。
+ */
+function mouthContinuityViolations(scene: Scene, tolerance = 0.03): Violation[] {
+  const out: Violation[] = [];
+  for (const mouth of junctionMouths(scene)) {
+    const profile = profileFor(mouth.cls);
+    // いちばん内側のリングに対応する断面の高さ (道路なら車道面、線路なら道床天端)。
+    const levels = Math.max(1, profile.length >> 1);
+    const innerHeight = profile[Math.min(levels - 1, profile.length - 1)].height;
+    const half = mouth.cls.carriagewayHalfWidth;
+    for (let i = -4; i <= 4; i++) {
+      const lat = (half * 0.85 * i) / 4;
+      const x = mouth.origin.x - mouth.forward.x * 0.05 + mouth.right.x * lat;
+      const z = mouth.origin.z - mouth.forward.z * 0.05 + mouth.right.z * lat;
+      const surfaceY = polygonSurfaceY(mouth.innerRing, x, z);
+      if (surfaceY === null) continue;
+      const expected = mouth.origin.y + innerHeight + SURFACE_LIFT;
+      if (Math.abs(surfaceY - expected) > tolerance) {
+        out.push({
+          amount: Math.abs(surfaceY - expected),
+          where: new Vector3(x, surfaceY, z),
+          what: `枝の口で車道面に段差: ${mouth.label} 交差点面=${surfaceY.toFixed(3)} 枝=${expected.toFixed(3)}`,
+        });
+      }
+    }
+  }
+  return out;
 }
 
 // =====================================================================
@@ -1350,6 +1498,41 @@ describe('整地した地形が路面・線路より上に来ない', () => {
       ['交差点面', junctionBuriedViolations(scene)],
     ]);
   });
+});
+
+describe('交差点の枝の口', () => {
+  it('枝の口に縁石・歩道・垂れ壁の立ち上がりが残っていない', () => {
+    const entries: [string, Violation[]][] = [];
+    for (const [name, scene] of [
+      ['T 字 (12%)', teeScene(0.12)],
+      ['十字 large×small 45° (12%)', fourWayScene({ main: 'road_large', cross: 'road_small', deg: 45, crossGrade: 0.12 })],
+      ['十字 highway×medium', fourWayScene({ main: 'road_highway', cross: 'road_medium', deg: 90 })],
+      ['分岐器', turnoutScene({ mainGrade: 0.03, yardGrade: 0.02 })],
+      ['曲線', curvedScene(0.06)],
+      ['デモ配置', demoScene()],
+    ] as const) {
+      // 判定が空振りしていないこと。
+      expect(junctionMouths(scene).length).toBeGreaterThan(0);
+      entries.push([`枝の口 (${name})`, mouthVerticalFaceViolations(scene)]);
+    }
+    expectAllClean(entries);
+  }, 30000);
+
+  it('交差点の車道面が枝の車道面と段差なく繋がっている', () => {
+    const entries: [string, Violation[]][] = [];
+    for (const [name, scene] of [
+      ['T 字 (12%)', teeScene(0.12)],
+      ['十字 large×small 45° (12%)', fourWayScene({ main: 'road_large', cross: 'road_small', deg: 45, crossGrade: 0.12 })],
+      ['十字 30° 鋭角', fourWayScene({ main: 'road_large', cross: 'road_small', deg: 30 })],
+      ['分岐器', turnoutScene({ mainGrade: 0.03, yardGrade: 0.02 })],
+      ['曲線', curvedScene(0.06)],
+      ['起伏地形', roughTerrainScene()],
+      ['デモ配置', demoScene()],
+    ] as const) {
+      entries.push([`車道面の連続 (${name})`, mouthContinuityViolations(scene)]);
+    }
+    expectAllClean(entries);
+  }, 30000);
 });
 
 describe('橋・トンネルの取り付き部', () => {

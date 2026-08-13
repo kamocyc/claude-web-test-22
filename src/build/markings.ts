@@ -1,5 +1,5 @@
 import { Vector3 } from 'three';
-import type { Alignment } from '../core/alignment';
+import type { AlignmentSample } from '../core/alignment';
 import { MeshBuilder, UP } from '../core/meshbuilder';
 import { DRIVE_ON_LEFT, MARKING_LIFT, SURFACE_LIFT } from '../core/units';
 import type { NetworkClass } from '../network/classes';
@@ -22,12 +22,21 @@ const STOP_LINE_WIDTH = 0.45;
 /** 標示を描くのに必要な取り付け長 [m]。 */
 export const MARKING_CLEARANCE = STOP_LINE_OFFSET + STOP_LINE_WIDTH + 0.5;
 
+/**
+ * 標示を引く路面。踏切のまわりでは路面が線路に合わせて上下・傾斜するので、
+ * 線形そのものではなく「描画に使った高さ」を返せる経路を受け取る。
+ */
+export interface SurfacePath {
+  readonly length: number;
+  sampleAt(s: number): AlignmentSample;
+}
+
 /** 路面上の 1 点。標示は路面よりわずかに浮かせる。 */
-function surfacePoint(alignment: Alignment, s: number, offset: number, out = new Vector3()): Vector3 {
-  const sample = alignment.sampleAt(s);
+function surfacePoint(path: SurfacePath, s: number, offset: number, out = new Vector3()): Vector3 {
+  const sample = path.sampleAt(s);
   return out.set(
     sample.pos.x + sample.right.x * offset,
-    sample.pos.y + SURFACE_LIFT + MARKING_LIFT,
+    sample.pos.y + SURFACE_LIFT + MARKING_LIFT + offset * (sample.roll ?? 0),
     sample.pos.z + sample.right.z * offset,
   );
 }
@@ -35,7 +44,7 @@ function surfacePoint(alignment: Alignment, s: number, offset: number, out = new
 /** 弧長 [s0, s1]、横断方向 [o0, o1] の矩形を路面上に描く。 */
 export function paintRect(
   mb: MeshBuilder,
-  alignment: Alignment,
+  alignment: SurfacePath,
   s0: number,
   s1: number,
   o0: number,
@@ -59,7 +68,7 @@ export function paintRect(
 /** 破線・実線を線形に沿って描く。 */
 function paintStripe(
   mb: MeshBuilder,
-  alignment: Alignment,
+  alignment: SurfacePath,
   range: { s0: number; s1: number },
   offset: number,
   width: number,
@@ -98,7 +107,7 @@ function paintStripe(
  */
 export function buildLaneMarkings(
   mb: MeshBuilder,
-  alignment: Alignment,
+  alignment: SurfacePath,
   range: { s0: number; s1: number },
   cls: NetworkClass,
 ): void {
@@ -129,7 +138,7 @@ export function buildLaneMarkings(
 
 /** 交差点の 1 枝に対する、外向き方向を基準とした座標系。 */
 export interface ApproachFrame {
-  alignment: Alignment;
+  alignment: SurfacePath;
   atStart: boolean;
   length: number;
   trim: number;
@@ -196,7 +205,7 @@ export function buildStopLine(mb: MeshBuilder, frame: ApproachFrame): void {
 /** 踏切の前後に引く停止線と、線路までの離隔を示す縞。 */
 export function buildCrossingStopLine(
   mb: MeshBuilder,
-  alignment: Alignment,
+  alignment: SurfacePath,
   sStop: number,
   cls: NetworkClass,
   forward: boolean,

@@ -1,11 +1,12 @@
-import { Vector3 } from 'three';
+import { Vector2, Vector3 } from 'three';
 import type { Alignment, AlignmentSample } from '../core/alignment';
 import type { MeshBuilder } from '../core/meshbuilder';
 import { UP } from '../core/meshbuilder';
-import { MARKING_LIFT, SURFACE_LIFT, clamp, smoothstep } from '../core/units';
+import { MARKING_LIFT, RAIL_GAUGE, SURFACE_LIFT, clamp, smoothstep } from '../core/units';
 import type { NetworkClass } from '../network/classes';
 import type { Crossing } from '../network/crossings';
 import type { SegmentId } from '../network/network';
+import { RAIL_HEAD_HALF_WIDTH } from './rail';
 import type { RGB } from './surface';
 
 const PANEL: RGB = [0.44, 0.44, 0.45];
@@ -14,20 +15,37 @@ const PANEL: RGB = [0.44, 0.44, 0.45];
 const PANEL_MARGIN = 1.6;
 /** 遮断機を線路から離す距離 [m]。 */
 const GATE_STANDOFF = 1.6;
-/** レール高さを道路面に馴染ませる区間の長さ [m]。 */
-export const RAIL_BLEND_HALF_LENGTH = 9;
 /**
- * 舗装面からレール頭頂面を出す量 [m]。
- * 踏切パネルとの差が小さすぎると Z ファイティングでレールが点線になる。
+ * 舗装面をレール頭頂面より下げる量 [m]。
+ * 差が小さすぎると Z ファイティングでレールが点線になる。
  */
-const RAILHEAD_PROUD = 0.05;
+export const PAVEMENT_BELOW_RAILHEAD = 0.06;
+/** 舗装を線路に合わせた分を、道路の本来の高さへ戻すのにかける距離 [m]。 */
+const BLEND_RAMP = 14;
 
-/** 線路側の描画高さを局所的にずらす指定。 */
-export interface RailBlend {
-  /** 線路の弧長 [m]。 */
+/**
+ * 描画高さを局所的にずらす指定。
+ *
+ * 踏切では**線路を動かさず、道路の方を線路に合わせる**。列車は舗装より上に
+ * 出ていないと走れないし、線路は道路よりはるかに勾配・線形の自由度が低い。
+ * 道路側は多少きつい勾配を飲んでもよい、という優先順位にしている。
+ *
+ * 高さの補正は中心線の上下 (`deltaY`, `slope`) だけでは足りない。線路が
+ * 勾配を持って斜めに横切ると、舗装の幅の中でレール頭頂面が上下するので、
+ * 断面を横に傾ける (`roll`) 必要がある。
+ */
+export interface SurfaceBlend {
+  /** 基準となる弧長 [m]。 */
   s: number;
-  /** この地点で加える高さ [m]。 */
+  /** 基準点で加える高さ [m]。 */
   deltaY: number;
+  /** 弧長方向の補正の変化率 (dΔ/ds)。踏切の面を線路の勾配に合わせる。 */
+  slope: number;
+  /** 横断勾配。中心線から右へ 1 m につき上がる量。 */
+  roll: number;
+  /** 補正を全量かける範囲 (片側) [m]。舗装が線路に接している範囲。 */
+  core: number;
+  /** ここまでで補正を 0 に戻す [m]。 */
   halfLength: number;
 }
 
@@ -48,6 +66,8 @@ export interface RoadSample {
   forward: Vector3;
   segment: SegmentId;
   s: number;
+  /** 横断勾配 (踏切で線路に合わせて傾けた分)。 */
+  roll: number;
 }
 
 /** 弧長で道路をたどる手段。範囲外はノードを越えて隣のセグメントを返す。 */
@@ -67,8 +87,9 @@ export interface LevelCrossingBuild {
 /**
  * 踏切 1 箇所分の形状を組み立てる。
  *
- * 舗装は道路側が優先で、線路側は道床が舗装の下に隠れる。レールだけは
- * 舗装からわずかに頭を出すよう、線路の描画高さを道路面に寄せる。
+ * 高さは線路が優先で、道路の方が線路に合わせて上下・傾斜する
+ * (`computeCrossingBlend`)。舗装はレール頭頂面より少し低い所に来るので、
+ * 道床と枕木は舗装の下に隠れ、レールだけが頭を出す。
  */
 export interface LevelCrossingOptions {
   /** 遮断機を置いてよい場所か (線路や他の道路と重ならないか)。 */
@@ -91,14 +112,10 @@ export function buildLevelCrossing(
   options: LevelCrossingOptions = {},
 ): LevelCrossingBuild {
   const road = crossing.road!;
-  const rail = crossing.rail!;
   const canPlace = options.canPlace ?? (() => true);
   const groundY = options.groundY ?? ((_x, _z, surfaceY) => surfaceY);
 
-  // 道路と線路のなす角。斜め踏切ではパネルが道路方向に長くなる。
-  const sinTheta = Math.abs(road.dir.x * rail.dir.y - road.dir.y * rail.dir.x);
-  const skew = 1 / Math.max(0.26, sinTheta);
-  const halfLength = clamp(railClass.halfWidth * skew + PANEL_MARGIN, 2.5, 40);
+  const halfLength = panelHalfLength(crossing, railClass);
 
   const sRoad0 = road.s - halfLength;
   const sRoad1 = road.s + halfLength;
@@ -160,22 +177,114 @@ export function buildLevelCrossing(
 }
 
 /**
- * 踏切に合わせた線路側の高さ補正を求める。
- * メッシュを作らずに済むよう、整地より前の段階で単独に呼べるようにしている。
+ * 踏切パネル (舗装が線路に接している範囲) の、道路の弧長で見た半長。
+ * 斜め踏切では道路方向に長くなる。
  */
-export function computeRailBlend(
-  crossing: Crossing,
-  roadAlignment: Alignment,
-): RailBlend & { segment: SegmentId } {
+export function panelHalfLength(crossing: Crossing, railClass: NetworkClass): number {
   const road = crossing.road!;
   const rail = crossing.rail!;
-  const roadY = roadAlignment.sampleAt(road.s).pos.y;
+  const sinTheta = Math.abs(road.dir.x * rail.dir.y - road.dir.y * rail.dir.x);
+  const skew = 1 / Math.max(0.26, sinTheta);
+  return clamp(railClass.halfWidth * skew + PANEL_MARGIN, 2.5, 40);
+}
+
+/**
+ * 踏切に合わせた**道路側**の高さ補正を求める。
+ * メッシュを作らずに済むよう、整地より前の段階で単独に呼べるようにしている。
+ *
+ * 目標は「舗装面がレール頭頂面の `PAVEMENT_BELOW_RAILHEAD` [m] 下を通る」
+ * こと。線路が勾配を持っていれば、その面は傾いた平面になるので、道路の
+ * 弧長方向の傾き (`slope`) と横断方向の傾き (`roll`) の両方を返す。中心線の
+ * 高さだけを合わせると、舗装の幅の中でレールが潜ってしまう。
+ */
+export function computeCrossingBlend(
+  crossing: Crossing,
+  railAlignment: Alignment,
+  roadAlignment: Alignment,
+): SurfaceBlend & { segment: SegmentId } {
+  const road = crossing.road!;
+  const rail = crossing.rail!;
+  const railSample = railAlignment.sampleAt(rail.s);
+  const roadSample = roadAlignment.sampleAt(road.s);
+
+  // 線路の面の勾配ベクトル (水平 1 m あたりの上がり)。
+  const gradient = new Vector2(railSample.forwardXZ.x, railSample.forwardXZ.y).multiplyScalar(
+    railSample.grade,
+  );
+  const forward = roadSample.forwardXZ;
+  const right = new Vector2(roadSample.right.x, roadSample.right.z);
+
+  // 補正を全量かける範囲。舗装が線路に接するのは踏切パネルの範囲だが、
+  // 斜め踏切では道路の幅の中で線路が道路方向にも進むので、その分も含める。
+  // ここを狭くすると、路端に近い所だけ補正が効かずレールが潜る。
+  const sin = Math.max(0.26, Math.abs(road.dir.x * rail.dir.y - road.dir.y * rail.dir.x));
+  const cos = Math.min(1, Math.abs(road.dir.dot(rail.dir)));
+  const reach = road.cls.halfWidth * (cos / sin);
+  const core = Math.min(40, panelHalfLength(crossing, rail.cls) + reach + 1);
   return {
-    segment: rail.segment,
-    s: rail.s,
-    deltaY: roadY + RAILHEAD_PROUD - crossing.point.y,
-    halfLength: RAIL_BLEND_HALF_LENGTH,
+    segment: road.segment,
+    s: road.s,
+    deltaY: railSample.pos.y - PAVEMENT_BELOW_RAILHEAD - roadSample.pos.y,
+    slope: gradient.dot(forward) - roadSample.grade,
+    roll: gradient.dot(right),
+    core,
+    halfLength: core + BLEND_RAMP,
   };
+}
+
+const FLANGEWAY: RGB = [0.1, 0.1, 0.11];
+/** フランジ溝の幅と、レール頭頂面からの下げ量 [m]。 */
+const FLANGEWAY_WIDTH = 0.09;
+const FLANGEWAY_DEPTH = 0.045;
+
+/**
+ * 踏切のフランジ溝 (レールの内側に開ける車輪のつば用の溝) を描く。
+ *
+ * レールは舗装から 6 cm ほどしか頭を出さないので、真上から見ると
+ * 舗装に紛れてどこが線路か分かりにくい。実物と同じように溝を入れると、
+ * 線路が通っていることが一目で分かる。
+ */
+export function buildFlangeways(
+  mb: MeshBuilder,
+  samples: AlignmentSample[],
+  cls: NetworkClass,
+): void {
+  if (samples.length < 2) return;
+  const half = RAIL_GAUGE / 2;
+  const tracks = cls.tracks.length > 0 ? cls.tracks : [0];
+  for (const track of tracks) {
+    for (const side of [-1, 1]) {
+      const inner = track + side * (half - RAIL_HEAD_HALF_WIDTH);
+      const outer = inner - side * FLANGEWAY_WIDTH;
+      paintStrip(mb, samples, Math.min(inner, outer), Math.max(inner, outer));
+    }
+  }
+}
+
+/** 軌道に沿った細い帯 (溝) を、レール頭頂面のわずかに下に敷く。 */
+function paintStrip(mb: MeshBuilder, samples: AlignmentSample[], o0: number, o1: number): void {
+  let prevL = -1;
+  let prevR = -1;
+  for (const sample of samples) {
+    const y = sample.pos.y + SURFACE_LIFT - FLANGEWAY_DEPTH;
+    const l = mb.vertex(
+      new Vector3(sample.pos.x + sample.right.x * o0, y, sample.pos.z + sample.right.z * o0),
+      UP,
+      0,
+      sample.s,
+      FLANGEWAY,
+    );
+    const r = mb.vertex(
+      new Vector3(sample.pos.x + sample.right.x * o1, y, sample.pos.z + sample.right.z * o1),
+      UP,
+      1,
+      sample.s,
+      FLANGEWAY,
+    );
+    if (prevL >= 0) mb.quad(prevL, prevR, r, l);
+    prevL = l;
+    prevR = r;
+  }
 }
 
 /** 踏切パネル (舗装の色違い) を路面に重ねる。 */
@@ -199,15 +308,17 @@ function paintPanel(
       continue;
     }
     const y = sample.pos.y + SURFACE_LIFT + MARKING_LIFT * 0.5;
+    // 路面が傾いていれば (勾配のある線路を渡る踏切) パネルも同じだけ傾ける。
+    const tilt = sample.roll * hw;
     const l = mb.vertex(
-      new Vector3(sample.pos.x - sample.right.x * hw, y, sample.pos.z - sample.right.z * hw),
+      new Vector3(sample.pos.x - sample.right.x * hw, y - tilt, sample.pos.z - sample.right.z * hw),
       UP,
       0,
       i,
       PANEL,
     );
     const r = mb.vertex(
-      new Vector3(sample.pos.x + sample.right.x * hw, y, sample.pos.z + sample.right.z * hw),
+      new Vector3(sample.pos.x + sample.right.x * hw, y + tilt, sample.pos.z + sample.right.z * hw),
       UP,
       1,
       i,
@@ -220,27 +331,68 @@ function paintPanel(
 }
 
 /**
- * 踏切に合わせて線路の描画高さを局所的にずらす。
+ * 踏切に合わせて描画高さを局所的にずらす。
  *
- * 線形データ自体は変えず、描画用のサンプル列だけを補正する。踏切の
- * 許容高低差は 0.25 m なので、緩衝区間 9 m で 3% 未満の勾配にしかならない。
+ * 線形データ自体は変えず、描画用のサンプル列だけを補正する。踏切の許容
+ * 高低差は 0.25 m なので、緩衝区間 10 m で 3% ほどの勾配が加わるだけで済む。
  */
-export function applyRailBlend(samples: AlignmentSample[], blends: RailBlend[]): AlignmentSample[] {
+export function applySurfaceBlend(
+  samples: AlignmentSample[],
+  blends: SurfaceBlend[],
+): AlignmentSample[] {
   if (blends.length === 0) return samples;
   return samples.map((sample) => {
-    const delta = railBlendDelta(blends, sample.s);
-    if (delta === 0) return sample;
-    return { ...sample, pos: new Vector3(sample.pos.x, sample.pos.y + delta, sample.pos.z) };
+    const { dy, roll } = surfaceBlendAt(blends, sample.s);
+    if (dy === 0 && roll === 0) return sample;
+    return {
+      ...sample,
+      pos: new Vector3(sample.pos.x, sample.pos.y + dy, sample.pos.z),
+      roll: (sample.roll ?? 0) + roll,
+    };
   });
 }
 
-/** ある弧長での補正量。交差点の断面など、サンプル列を持たない所で使う。 */
-export function railBlendDelta(blends: RailBlend[], s: number): number {
-  let delta = 0;
+/**
+ * ある弧長での補正量。交差点の断面など、サンプル列を持たない所で使う。
+ *
+ * 複数の踏切が重なった場合 (複線を斜めに渡るなど) は重みで平均する。
+ * 単純に足すと、どちらの線路にも合わない高さになってしまう。
+ */
+export function surfaceBlendAt(
+  blends: SurfaceBlend[],
+  s: number,
+): { dy: number; roll: number } {
+  let dy = 0;
+  let roll = 0;
+  let total = 0;
   for (const blend of blends) {
-    const t = Math.abs(s - blend.s) / blend.halfLength;
-    if (t >= 1) continue;
-    delta += blend.deltaY * (1 - smoothstep(t));
+    const w = blendWeight(blend, s);
+    if (w <= 0) continue;
+    dy += w * (blend.deltaY + blend.slope * (s - blend.s));
+    roll += w * blend.roll;
+    total += w;
   }
-  return delta;
+  if (total <= 1) return { dy, roll };
+  return { dy: dy / total, roll: roll / total };
+}
+
+/**
+ * 断面の段差 (縁石・歩道) を潰す割合。1 = そのまま、0 = 完全に平ら。
+ *
+ * 踏切では舗装がレール頭頂面のすぐ下を通る。歩道が縁石の分だけ高いままだと、
+ * レールが歩道の帯の下に潜って途切れて見えるので、踏切のまわりだけ断面を
+ * 平らにする (実際の踏切でも縁石は切り下げられている)。
+ */
+export function surfaceHeightScale(blends: SurfaceBlend[], s: number): number {
+  let w = 0;
+  for (const blend of blends) w = Math.max(w, blendWeight(blend, s));
+  return 1 - w;
+}
+
+/** 補正をどれだけ効かせるか。舗装の下では全量、そこから滑らかに 0 へ戻す。 */
+function blendWeight(blend: SurfaceBlend, s: number): number {
+  const d = Math.abs(s - blend.s);
+  if (d <= blend.core) return 1;
+  if (d >= blend.halfLength) return 0;
+  return 1 - smoothstep((d - blend.core) / Math.max(1e-6, blend.halfLength - blend.core));
 }
