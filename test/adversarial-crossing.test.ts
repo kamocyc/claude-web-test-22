@@ -1035,11 +1035,8 @@ describe('踏切でレールが舗装の上に出ている', () => {
     }
     cases.push(['複数踏切 40m', twinCrossingScene({ gap: 40, roadGrade: 0 })]);
     cases.push(['複数踏切 16m', twinCrossingScene({ gap: 16, roadGrade: 0 })]);
-    // 「踏切がノード上」(道路が踏切の真上で 14 度折れる) は外してある。
-    // 折れ点の外側に舗装の空きができるためだが、これは踏切とは無関係の
-    // 既存の欠陥で、線路を置かずに同じ道路だけを引いても同じ所が空く。
-    // (交差点リングの隅丸めが、路端線の交点まで届かないことによる。)
-    cases.push(['踏切がノードの 12m 脇', nodeCrossingScene(12)]);
+    cases.push(['踏切がノード上', nodeCrossingScene(0)]);
+    cases.push(['踏切がノードの 3m 脇', nodeCrossingScene(3)]);
     cases.push(['線路ノードが踏切上', railNodeCrossingScene(0)]);
     cases.push(['交差点の 20m 先に踏切', junctionCrossingScene(20)]);
     cases.push(['曲線の踏切', curvedCrossingScene(0)]);

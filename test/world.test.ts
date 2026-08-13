@@ -51,6 +51,31 @@ function draw(network: Network, classId: string, points: Vector3[]): void {
   }
 }
 
+
+/** その XZ を覆う面のうち、いちばん高いものの高さ。覆われていなければ null。 */
+function surfaceTopAt(mesh: Mesh, x: number, z: number): number | null {
+  const position = mesh.geometry.attributes.position;
+  const index = mesh.geometry.getIndex();
+  if (!index) return null;
+  let top: number | null = null;
+  const a = new Vector3();
+  const b = new Vector3();
+  const c = new Vector3();
+  for (let i = 0; i < index.count; i += 3) {
+    a.fromBufferAttribute(position, index.getX(i));
+    b.fromBufferAttribute(position, index.getX(i + 1));
+    c.fromBufferAttribute(position, index.getX(i + 2));
+    const d = (b.z - c.z) * (a.x - c.x) + (c.x - b.x) * (a.z - c.z);
+    if (Math.abs(d) < 1e-12) continue;
+    const u = ((b.z - c.z) * (x - c.x) + (c.x - b.x) * (z - c.z)) / d;
+    const v = ((c.z - a.z) * (x - c.x) + (a.x - c.x) * (z - c.z)) / d;
+    if (u < -1e-9 || v < -1e-9 || 1 - u - v < -1e-9) continue;
+    const y = u * a.y + v * b.y + (1 - u - v) * c.y;
+    if (top === null || y > top) top = y;
+  }
+  return top;
+}
+
 describe('立体交差の上の交差点', () => {
   it('床版と橋脚が付き、路面だけが宙に浮かない', () => {
     const field = new Heightfield();
@@ -230,6 +255,53 @@ describe('サンプルネットワーク', () => {
     }
     expect(changed).toBeGreaterThan(100);
   });
+});
+
+describe('折れ点 (2 枝のノード)', () => {
+  /**
+   * 道路が折れる所では、2 本の帯と交差点面を合わせて隙間なく覆われて
+   * いなければならない。断面の外側 (路端) だけを見て頂点をまとめると、
+   * 車道の縁ではずれている点まで落ちてしまい、隅が切れて舗装に穴が開く。
+   */
+  it('折れ点のまわりに舗装の空きができない', () => {
+    const problems: string[] = [];
+    let probes = 0;
+    for (const classId of ['road_small', 'road_medium', 'road_large']) {
+      for (const bendDeg of [8, 14, 25, 40, 60]) {
+        const field = new Heightfield();
+        field.base.fill(40);
+        field.resetWork();
+        const network = new Network();
+        const rad = (bendDeg * Math.PI) / 180;
+        draw(network, classId, [
+          new Vector3(0, 40, -200),
+          new Vector3(0, 40, 0),
+          new Vector3(Math.sin(rad) * 200, 40, Math.cos(rad) * 200),
+        ]);
+        const world = new WorldBuilder(network, field, new TerrainMesh(field, new MeshBasicMaterial()));
+        world.rebuild();
+        const surfaces = world.group.children.find((o) => o.name === 'surfaces') as Mesh;
+        const cls = getClass(classId);
+        // 路端そのものは帯の境界なので、少しだけ内側を見る。
+        const reach = cls.halfWidth - 0.2;
+        for (let x = -reach; x <= reach; x += 0.25) {
+          for (let z = -6; z <= 6; z += 0.25) {
+            const onA = z <= 0 && Math.abs(x) <= reach;
+            const along = x * Math.sin(rad) + z * Math.cos(rad);
+            const across = -x * Math.cos(rad) + z * Math.sin(rad);
+            const onB = along >= 0 && Math.abs(across) <= reach;
+            if (!onA && !onB) continue;
+            probes++;
+            if (surfaceTopAt(surfaces, x, z) === null) {
+              problems.push(`${classId} ${bendDeg}°: (${x.toFixed(2)}, ${z.toFixed(2)}) に舗装がない`);
+            }
+          }
+        }
+      }
+    }
+    expect(probes).toBeGreaterThan(5000);
+    expect(problems.slice(0, 5)).toEqual([]);
+  }, 60000);
 });
 
 describe('敷設の制限', () => {

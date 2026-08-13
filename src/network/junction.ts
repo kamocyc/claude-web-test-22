@@ -447,6 +447,14 @@ function buildRings(junction: Junction): { rings: Vector3[][]; openEdge: boolean
   const levels = Math.max(...aps.map((a) => Math.max(1, a.section.length >> 1)));
   const rings: Vector3[][] = Array.from({ length: levels }, () => []);
   const openEdge: boolean[] = [];
+  /**
+   * 折れ点 (同じ道が曲がっているだけの 2 枝) では隅を丸めない。
+   *
+   * 交差点の隅は道路と道路の間の余地なので丸めてよいが、折れ点の外側は
+   * 道路自身の路端がそのまま続く所で、丸めるとその分だけ舗装が欠ける。
+   * 路端線の交点をそのまま角に使えば、両側の帯と隙間なく繋がる。
+   */
+  const sharpCorner = junction.kind === 'joint' || junction.kind === 'railSwitch';
 
   for (let i = 0; i < n; i++) {
     const cur = aps[i];
@@ -467,12 +475,17 @@ function buildRings(junction: Junction): { rings: Vector3[][]; openEdge: boolean
         const b = sideOf(next, k, 'prev');
         // 内側のリードでは路端線が交わらないことがある。その場合は
         // 中点を制御点にして、点数だけ揃える。
-        const corner = cornerControl(a, cur.dir, b, next.dir) ?? a.clone().lerp(b, 0.5);
-        for (let t = 1; t <= 3; t++) {
-          rings[k].push(quadratic(a, corner, b, t / 4));
+        const corner =
+          cornerControl(a, cur.dir, b, next.dir, sharpCorner) ?? a.clone().lerp(b, 0.5);
+        if (sharpCorner) {
+          rings[k].push(corner);
+        } else {
+          for (let t = 1; t <= 3; t++) {
+            rings[k].push(quadratic(a, corner, b, t / 4));
+          }
         }
       }
-      openEdge.push(false, false, false);
+      openEdge.push(...(sharpCorner ? [false] : [false, false, false]));
     }
   }
 
@@ -495,15 +508,28 @@ function sideOf(ap: Approach, k: number, side: 'prev' | 'next'): Vector3 {
  * 隅丸めが交差点の外へ大きく膨らみ、リングがねじれたり、面の下に地形の
  * ない所ができたりする。2 点の間隔を目安に打ち切る。
  */
-function cornerControl(p: Vector3, dp: Vector2, q: Vector3, dq: Vector2): Vector3 | null {
+function cornerControl(
+  p: Vector3,
+  dp: Vector2,
+  q: Vector3,
+  dq: Vector2,
+  /**
+   * 交点が断面より手前 (ノード側) にあっても使うか。
+   *
+   * 折れ点の外側では、路端線どうしの交点は断面とノードの間に来る。
+   * 交差点では手前の交点は隅の形として意味を持たないので使わないが、
+   * 折れ点では**そこが路端そのもの**なので、使わないと舗装が欠ける。
+   */
+  allowBehind = false,
+): Vector3 | null {
   const det = dp.x * dq.y - dp.y * dq.x;
   if (Math.abs(det) < 1e-6) return null;
   const rx = q.x - p.x;
   const rz = q.z - p.z;
   const t = (rx * dq.y - rz * dq.x) / det;
-  if (t < 0) return null;
+  if (t < 0 && !allowBehind) return null;
   const limit = Math.max(2, p.distanceTo(q) * 1.2);
-  if (t > limit) return null;
+  if (Math.abs(t) > limit) return null;
   return new Vector3(p.x + dp.x * t, (p.y + q.y) / 2, p.z + dp.y * t);
 }
 
@@ -518,7 +544,11 @@ function quadratic(a: Vector3, c: Vector3, b: Vector3, t: number): Vector3 {
 
 /**
  * 重なった点を落とす。どのリングも同じ頂点数でなければ帯が作れないので、
- * いちばん外側のリングで残す点を決め、全リングに同じ取捨を適用する。
+ * 全リングに同じ取捨を適用する。
+ *
+ * 判定は**全てのリング**で見る。外側のリングだけで決めると、路端では
+ * 重なっているのに車道の縁ではずれている点 (浅い折れ点の内側の隅) を
+ * 落としてしまい、車道のリングが隅を切って舗装に穴が開く。
  */
 function dedupeRings(
   rings: Vector3[][],
@@ -526,15 +556,16 @@ function dedupeRings(
 ): { rings: Vector3[][]; openEdge: boolean[] } {
   const outer = rings[0];
   if (!outer) return { rings: [], openEdge: [] };
+  const full = rings.filter((ring) => ring.length === outer.length);
+  const same = (a: number, b: number): boolean =>
+    full.every((ring) => ring[a].distanceToSquared(ring[b]) <= 1e-4);
+
   const keep: number[] = [];
   for (let i = 0; i < outer.length; i++) {
-    const last = keep.length > 0 ? outer[keep[keep.length - 1]] : null;
-    if (!last || last.distanceToSquared(outer[i]) > 1e-4) keep.push(i);
+    const last = keep.length > 0 ? keep[keep.length - 1] : -1;
+    if (last < 0 || !same(last, i)) keep.push(i);
   }
-  while (
-    keep.length > 1 &&
-    outer[keep[0]].distanceToSquared(outer[keep[keep.length - 1]]) < 1e-4
-  ) {
+  while (keep.length > 1 && same(keep[0], keep[keep.length - 1])) {
     keep.pop();
   }
   return {
