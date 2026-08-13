@@ -1,7 +1,7 @@
 import { Group, Mesh, Vector3 } from 'three';
 import type { Alignment } from '../core/alignment';
-import { MeshBuilder } from '../core/meshbuilder';
-import { lerp, smoothstep } from '../core/units';
+import { MeshBuilder, signedAreaXZ } from '../core/meshbuilder';
+import { TERRAIN_CELL, lerp, smoothstep } from '../core/units';
 import {
   applyRailBlend,
   buildLevelCrossing,
@@ -386,7 +386,10 @@ export class WorldBuilder {
           const drop = crossingDrop(zones, mid, naturalDrop);
           if (drop === null) continue;
           // 踏切に寄せる分は断面全体を平行移動する。
-          const shift = drop - naturalDrop;
+          // 勾配のある所では、格子の量子化で地形が路端より高く出ることが
+          // ある。1 マス分の高低差だけ余計に下げて逃げる。
+          const grade = Math.abs(samples[i].grade + samples[i + 1].grade) / 2;
+          const shift = drop - naturalDrop + grade * TERRAIN_CELL;
           const a = gradingSectionPoints(samples[i], section, shift);
           const b = gradingSectionPoints(samples[i + 1], section, shift);
           for (let k = 0; k + 1 < section.length; k++) {
@@ -425,7 +428,14 @@ export class WorldBuilder {
    * 外周より高い所 (線路の道床など) は外周の高さで止める。
    */
   private stampJunction(grading: TerrainGrading, junction: Junction, cls: NetworkClass): void {
-    const drop = junctionGradingDrop();
+    // 取り付く枝の勾配の分だけ余計に下げる (セグメント側と同じ理由)。
+    let grade = 0;
+    for (const approach of junction.approaches) {
+      const alignment = this.network.alignmentOf(approach.branch.segment);
+      const s = approach.branch.atStart ? approach.trim : alignment.length - approach.trim;
+      grade = Math.max(grade, Math.abs(alignment.sampleAt(s).grade));
+    }
+    const drop = junctionGradingDrop() + grade * TERRAIN_CELL;
     const outer = junction.rings[0];
     if (!outer || outer.length < 3) return;
     const rings = junction.rings.map((ring) =>
@@ -862,17 +872,36 @@ function crossingDrop(zones: CrossingZone[], s: number, naturalDrop: number): nu
   return -offset;
 }
 
-/** リングを重心から外向きに広げる。整地の footprint を路面より広く取るため。 */
+/**
+ * リングを外向きに `margin` [m] 広げる。整地の footprint を路面より広く
+ * 取るため。
+ *
+ * 重心から放射状に広げると、細長いリングでは辺に対して垂直な余裕が
+ * margin より狭くなり、路端のすぐ外の格子点が整地されずに残る。そこで
+ * 辺の法線を使ったオフセット (マイター) にする。
+ */
 function expandRing(ring: Vector3[], margin: number): Vector3[] {
-  if (ring.length === 0 || margin <= 0) return ring.map((p) => p.clone());
-  const centroid = new Vector3();
-  for (const p of ring) centroid.add(p);
-  centroid.divideScalar(ring.length);
-  return ring.map((p) => {
-    const dir = new Vector3(p.x - centroid.x, 0, p.z - centroid.z);
-    const len = dir.length();
-    if (len < 1e-4) return p.clone();
-    dir.divideScalar(len);
-    return new Vector3(p.x + dir.x * margin, p.y, p.z + dir.z * margin);
+  const n = ring.length;
+  if (n < 3 || margin <= 0) return ring.map((p) => p.clone());
+  const sign = signedAreaXZ(ring) > 0 ? 1 : -1;
+  return ring.map((p, i) => {
+    const normal = edgeNormal(ring[(i - 1 + n) % n], p, sign).add(
+      edgeNormal(p, ring[(i + 1) % n], sign),
+    );
+    const len = normal.length();
+    if (len < 1e-6) return p.clone();
+    normal.divideScalar(len);
+    // 鋭角の頂点で伸びすぎないよう、マイター長に上限を設ける。
+    const miter = margin / Math.max(0.4, normal.dot(edgeNormal(p, ring[(i + 1) % n], sign)));
+    return new Vector3(p.x + normal.x * miter, p.y, p.z + normal.z * miter);
   });
+}
+
+/** XZ 平面での辺の外向き法線 (リングが反時計回りなら sign = 1)。 */
+function edgeNormal(a: Vector3, b: Vector3, sign: number): Vector3 {
+  const dx = b.x - a.x;
+  const dz = b.z - a.z;
+  const len = Math.hypot(dx, dz);
+  if (len < 1e-9) return new Vector3();
+  return new Vector3((dz / len) * sign, 0, (-dx / len) * sign);
 }
