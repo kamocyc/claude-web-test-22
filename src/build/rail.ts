@@ -2,7 +2,7 @@ import { Vector2, Vector3 } from 'three';
 import { Alignment, type AlignmentSample } from '../core/alignment';
 import { curveFromTangents } from '../core/curve';
 import { VerticalProfile } from '../core/profile';
-import type { MeshBuilder } from '../core/meshbuilder';
+import { UP, type MeshBuilder } from '../core/meshbuilder';
 import { RAIL_GAUGE, SURFACE_LIFT, smoothstep } from '../core/units';
 import type { NetworkClass } from '../network/classes';
 import type { Approach } from '../network/junction';
@@ -350,7 +350,18 @@ export interface CatenaryOptions {
    * 道路の真ん中になることがあるので、置く前に必ず確かめる。
    */
   canPlace?: (x: number, z: number, y: number) => boolean;
+  /**
+   * その弧長で、隣に並んでいる軌道の横距 [m] (自分自身は 0)。
+   *
+   * 複線・三線では線路 1 本ごとに柱を建てると、線路の間に柱が林立して
+   * しまう。並んでいる軌道をまとめて 1 基の門型 (ビーム) で受けると、
+   * 実物の複線と同じ見え方になる。
+   */
+  offsetsAt?: (s: number) => number[];
 }
+
+/** 架線柱の高さ [m] と、軌道からの離れ [m]。 */
+const CATENARY_HEIGHT = 5.6;
 
 /** 架線柱と架線を作る。建てた柱の足元位置を返す。 */
 export function buildCatenary(
@@ -360,76 +371,143 @@ export function buildCatenary(
   options: CatenaryOptions = {},
 ): Vector3[] {
   if (cls.kind !== 'rail' || cls.id === 'rail_yard') return [];
-  const up = new Vector3(0, 1, 0);
   const poleColor: RGB = [0.42, 0.44, 0.46];
   const wireColor: RGB = [0.2, 0.2, 0.22];
   const total = samples[samples.length - 1].s - samples[0].s;
   const count = Math.floor(total / CATENARY_PITCH);
-  const armLength = cls.halfWidth - 0.6;
-  const height = 5.6;
+  const reach = cls.halfWidth - 0.6;
   const canPlace = options.canPlace ?? (() => true);
 
   const bases: Vector3[] = [];
   // 架線は「連続して建った柱の間」だけに張る。間が飛んだ所で張ると、
   // 踏切や交差点の上を斜めに横切ってしまう。
   const spans: { a: Vector3; b: Vector3 }[] = [];
-  let previous: { head: Vector3; index: number } | null = null;
+  let previous: { heads: Map<number, Vector3>; index: number } | null = null;
 
   for (let i = 0; i <= count; i++) {
     const s = samples[0].s + i * CATENARY_PITCH;
     const sample = interpolateSample(samples, s);
     if (!sample) continue;
 
-    // 線路の左右どちらでも構わないので、空いている側に建てる。
-    const side = pickSide(sample, armLength, canPlace);
-    if (side === 0) {
+    const tracks = [...(options.offsetsAt?.(s) ?? [0])].sort((a, b) => a - b);
+    const built =
+      tracks.length > 1
+        ? buildGantry(mb, sample, tracks, reach, poleColor, canPlace)
+        : buildMast(mb, sample, reach, poleColor, canPlace);
+    if (!built) {
       previous = null;
       continue;
     }
-    const offset = armLength * side;
-    const base = new Vector3(
-      sample.pos.x + sample.right.x * offset,
-      sample.pos.y - RAIL_TOP_TO_BALLAST,
-      sample.pos.z + sample.right.z * offset,
-    );
-    addBox(
-      mb,
-      base.clone().add(new Vector3(0, height / 2, 0)),
-      sample.right,
-      up,
-      sample.forward,
-      { x: 0.11, y: height / 2, z: 0.11 },
-      poleColor,
-    );
-    // 腕木は軌道の上へ張り出す。
-    const armCenter = base
-      .clone()
-      .add(new Vector3(0, height - 0.4, 0))
-      .addScaledVector(sample.right, -offset / 2);
-    addBox(
-      mb,
-      armCenter,
-      sample.right,
-      up,
-      sample.forward,
-      { x: armLength / 2, y: 0.08, z: 0.08 },
-      poleColor,
-    );
 
-    const head = new Vector3(
-      sample.pos.x,
-      sample.pos.y + height - 0.5 - RAIL_TOP_TO_BALLAST,
-      sample.pos.z,
-    );
-    if (previous && i - previous.index === 1) spans.push({ a: previous.head, b: head });
-    previous = { head, index: i };
-    bases.push(base);
+    const heads = new Map<number, Vector3>();
+    for (const offset of tracks) {
+      heads.set(
+        Math.round(offset * 4) / 4,
+        new Vector3(
+          sample.pos.x + sample.right.x * offset,
+          sample.pos.y + CATENARY_HEIGHT - 0.5 - RAIL_TOP_TO_BALLAST,
+          sample.pos.z + sample.right.z * offset,
+        ),
+      );
+    }
+    if (previous && i - previous.index === 1) {
+      for (const [key, head] of heads) {
+        const before = previous.heads.get(key);
+        if (before) spans.push({ a: before, b: head });
+      }
+    }
+    previous = { heads, index: i };
+    bases.push(...built);
   }
 
   for (const span of spans) {
     addWire(mb, span.a, span.b, 0.25, 0.03, wireColor);
   }
   return bases;
+}
+
+/** 1 本の軌道を受ける柱 (片持ちの腕木)。空いている側に建てる。 */
+function buildMast(
+  mb: MeshBuilder,
+  sample: AlignmentSample,
+  reach: number,
+  color: RGB,
+  canPlace: (x: number, z: number, y: number) => boolean,
+): Vector3[] | null {
+  // 線路の左右どちらでも構わないので、空いている側に建てる。
+  const side = pickSide(sample, reach, canPlace);
+  if (side === 0) return null;
+  const offset = reach * side;
+  const base = post(mb, sample, offset, color);
+  // 腕木は軌道の上へ張り出す。
+  beam(mb, sample, offset, 0, color);
+  return [base];
+}
+
+/**
+ * 並んだ軌道をまとめて受ける門型の架線柱。
+ *
+ * いちばん外の軌道の**外側の路肩**に柱を建て、その間に梁を渡して軌道ごとに
+ * 架線を吊る。線路 1 本ごとに建てると、複線の間に柱が林立してしまう。柱の
+ * 位置は 1 本のときとまったく同じ (路肩の上) なので、足元の高さの扱いも
+ * 変わらない。
+ */
+function buildGantry(
+  mb: MeshBuilder,
+  sample: AlignmentSample,
+  tracks: number[],
+  reach: number,
+  color: RGB,
+  canPlace: (x: number, z: number, y: number) => boolean,
+): Vector3[] | null {
+  const left = tracks[0] - reach;
+  const right = tracks[tracks.length - 1] + reach;
+  for (const offset of [left, right]) {
+    const x = sample.pos.x + sample.right.x * offset;
+    const z = sample.pos.z + sample.right.z * offset;
+    if (!canPlace(x, z, sample.pos.y - RAIL_TOP_TO_BALLAST)) return null;
+  }
+  const bases = [left, right].map((offset) => post(mb, sample, offset, color));
+  beam(mb, sample, left, right, color);
+  return bases;
+}
+
+/** 柱を 1 本建てる。足元の位置を返す。 */
+function post(mb: MeshBuilder, sample: AlignmentSample, offset: number, color: RGB): Vector3 {
+  const base = new Vector3(
+    sample.pos.x + sample.right.x * offset,
+    sample.pos.y - RAIL_TOP_TO_BALLAST,
+    sample.pos.z + sample.right.z * offset,
+  );
+  addBox(
+    mb,
+    base.clone().add(new Vector3(0, CATENARY_HEIGHT / 2, 0)),
+    sample.right,
+    UP,
+    sample.forward,
+    { x: 0.11, y: CATENARY_HEIGHT / 2, z: 0.11 },
+    color,
+  );
+  return base;
+}
+
+/** 横距 `a` から `b` まで梁 (腕木) を渡す。 */
+function beam(
+  mb: MeshBuilder,
+  sample: AlignmentSample,
+  a: number,
+  b: number,
+  color: RGB,
+): void {
+  const centre = (a + b) / 2;
+  const half = Math.abs(b - a) / 2;
+  if (half < 0.05) return;
+  const at = new Vector3(
+    sample.pos.x + sample.right.x * centre,
+    sample.pos.y + CATENARY_HEIGHT - 0.4 - RAIL_TOP_TO_BALLAST,
+    sample.pos.z + sample.right.z * centre,
+  );
+  addBox(mb, at, sample.right, UP, sample.forward, { x: half, y: 0.08, z: 0.08 }, color);
 }
 
 /** 空いている方の路肩を選ぶ。両方塞がっていれば 0 (建てない)。 */

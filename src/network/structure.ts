@@ -48,6 +48,101 @@ export function computeStructureProfile(
   return runs;
 }
 
+/** 平行に並んだ線形 1 本ぶんの、区間を揃えるための情報。 */
+export interface ParallelRuns {
+  alignment: Alignment;
+  runs: StructureRun[];
+  range: { s0: number; s1: number };
+}
+
+/** 強い構造形式が勝つ (並んだ線のどれかが橋なら、みんな橋にする)。 */
+const MODE_RANK: Record<StructureMode, number> = { ground: 0, bridge: 1, tunnel: 2 };
+
+/**
+ * 平行に並んだ線形の構造形式を揃える。
+ *
+ * 並んだ線はそれぞれ独立に地形と比べて区間を決めるので、同じ谷を渡って
+ * いても橋の始まりが数 m ずれる。実物の複線ではありえない見え方なので、
+ * **同じ断面の所は同じ構造形式**になるよう、いちばん強い形式に揃える。
+ * 揃えた結果、桁・坑門が横に並んで 1 つの構造物に見える。
+ */
+export function unifyParallelRuns(
+  members: ParallelRuns[],
+  step = 2,
+): StructureRun[][] {
+  if (members.length < 2) return members.map((m) => m.runs);
+
+  // 相手の弧長を引くための折れ線。曲線でも数 cm の精度で足りる。
+  const traces = members.map((member) => {
+    const points: { s: number; x: number; z: number }[] = [];
+    const n = Math.max(1, Math.ceil((member.range.s1 - member.range.s0) / step));
+    for (let i = 0; i <= n; i++) {
+      const s = member.range.s0 + ((member.range.s1 - member.range.s0) * i) / n;
+      const p = member.alignment.sampleAt(s).pos;
+      points.push({ s, x: p.x, z: p.z });
+    }
+    return points;
+  });
+
+  return members.map((member, index) => {
+    const stations: number[] = [];
+    const modes: StructureMode[] = [];
+    for (const point of traces[index]) {
+      let mode = modeAt(member.runs, point.s);
+      for (let other = 0; other < members.length; other++) {
+        if (other === index) continue;
+        const near = nearest(traces[other], point.x, point.z);
+        // 相手が並んでいない所 (端の外) までは揃えない。
+        if (!near) continue;
+        const theirs = modeAt(members[other].runs, near);
+        if (MODE_RANK[theirs] > MODE_RANK[mode]) mode = theirs;
+      }
+      stations.push(point.s);
+      modes.push(mode);
+    }
+    if (stations.length < 2) return member.runs;
+    return mergeShortRuns(encodeRuns(stations, modes));
+  });
+}
+
+/** 折れ線上でいちばん近い点の弧長。端で折り返していれば null。 */
+function nearest(
+  points: { s: number; x: number; z: number }[],
+  x: number,
+  z: number,
+): number | null {
+  let best = -1;
+  let bestDistance = Infinity;
+  for (let i = 0; i < points.length; i++) {
+    const d = (points[i].x - x) ** 2 + (points[i].z - z) ** 2;
+    if (d < bestDistance) {
+      bestDistance = d;
+      best = i;
+    }
+  }
+  if (best < 0) return null;
+  if (best === 0 || best === points.length - 1) {
+    // 端の点がいちばん近いのは、そこから先は並んでいないという意味。
+    // 真横にある (並んでいる) ときだけ採る。
+    const neighbour = points[best === 0 ? 1 : points.length - 2];
+    const dx = points[best].x - x;
+    const dz = points[best].z - z;
+    const ux = neighbour.x - points[best].x;
+    const uz = neighbour.z - points[best].z;
+    const len = Math.hypot(ux, uz);
+    if (len > 1e-6 && Math.abs((dx * ux + dz * uz) / len) > 2) return null;
+  }
+  return points[best].s;
+}
+
+/** その弧長がどの構造形式の区間に入るか。区間の外は地表とみなす。 */
+export function modeAt(runs: StructureRun[], s: number): StructureMode {
+  for (const run of runs) {
+    if (s >= run.s0 && s <= run.s1) return run.mode;
+  }
+  return 'ground';
+}
+
 export function classify(roadY: number, terrainY: number): StructureMode {
   if (roadY - DECK_THICKNESS - terrainY > BRIDGE_THRESHOLD) return 'bridge';
   if (terrainY - roadY > TUNNEL_THRESHOLD) return 'tunnel';

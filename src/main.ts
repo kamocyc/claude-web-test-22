@@ -40,7 +40,7 @@ const ui = new Ui(uiRoot, {
     ui.setClass(classId);
   },
   onElevation: (steps) => tool.adjustElevation(steps),
-  onParallel: (count) => tool.setParallel(count),
+  onParallelSnap: (on) => tool.setParallelSnap(on),
   onConnectivityColors: (on) => {
     world.colorMode = on ? 'connectivity' : 'normal';
     dirty = true;
@@ -77,7 +77,7 @@ function setMode(mode: ToolMode): void {
 
 setMode('build');
 ui.setClass(tool.classId);
-ui.setParallel(tool.parallelCount);
+ui.setParallelSnap(tool.parallelSnap);
 buildDemoNetwork(network, field);
 
 // 動作確認・デバッグ用に主要オブジェクトを公開する。

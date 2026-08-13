@@ -266,6 +266,37 @@ describe('既存の線形への取り付き', () => {
     expect(far).toBeDefined();
   });
 
+  /**
+   * 始点と終点をどちらも同じ線形の途中に取り付けると、始点を分割した時点で
+   * 終点の相手が消える。分かれた片方に取り付き直して、例外にしない。
+   */
+  it('同じ線形の 2 か所に取り付いても例外にならない', () => {
+    const network = new Network();
+    // 大きく曲がった道路。その内側を突っ切る近道を引く。
+    const a = network.addNode(new Vector3(-150, 0, 0));
+    const b = network.addNode(new Vector3(150, 0, 0));
+    network.addSegment({
+      classId: 'road_medium',
+      a: a.id,
+      b: b.id,
+      ctrlA: new Vector2(-90, 180),
+      ctrlB: new Vector2(90, 180),
+      gradeA: 0,
+      gradeB: 0,
+    });
+    const [existing] = [...network.segments.keys()];
+    const alignment = network.alignmentOf(existing);
+    const start = anchorFromSegment(network, existing, alignment.length * 0.25);
+    const end = anchorFromSegment(network, existing, alignment.length * 0.75);
+    const preview = computePlacement(start, end.pos.clone(), {
+      straight: true,
+      cls: getClass('road_medium'),
+    });
+    expect(() => placeSegment(network, 'road_medium', start, { ...end }, preview)).not.toThrow();
+    // 元の線形は 2 か所で分割され、近道が 1 本増える。
+    expect(network.segments.size).toBeGreaterThanOrEqual(4);
+  });
+
   it('急な折れは「角」の意図とみなしてそのまま残す', () => {
     const joined = joinAt(75);
     expect(joined.result.smoothed).toEqual([]);

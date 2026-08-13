@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { Mesh, MeshBasicMaterial, Vector2, Vector3 } from 'three';
 import { Alignment } from '../src/core/alignment';
+import { heightInTriangleXZ } from '../src/core/meshbuilder';
 import { curveFromTangents } from '../src/core/curve';
 import { VerticalProfile } from '../src/core/profile';
 import { checkPlacement } from '../src/network/rules';
@@ -99,6 +100,51 @@ function surfaceTopAt(mesh: Mesh, x: number, z: number): number | null {
   return top;
 }
 
+/**
+ * 面を格子に入れて、その XZ を覆う面の高さを引く索引。
+ * メッシュ全体を毎回なめると遅いので、三角形を格子に振っておく。
+ */
+class SurfaceIndex {
+  private readonly cells = new Map<string, number[]>();
+  private readonly tris: Vector3[][] = [];
+  constructor(mesh: Mesh, private readonly cell = 8) {
+    const position = mesh.geometry.attributes.position;
+    const index = mesh.geometry.getIndex();
+    if (!index) return;
+    for (let i = 0; i < index.count; i += 3) {
+      const tri = [0, 1, 2].map((k) => {
+        const j = index.getX(i + k);
+        return new Vector3(position.getX(j), position.getY(j), position.getZ(j));
+      });
+      const id = this.tris.push(tri) - 1;
+      const xs = tri.map((p) => p.x);
+      const zs = tri.map((p) => p.z);
+      for (let x = Math.floor(Math.min(...xs) / cell); x <= Math.floor(Math.max(...xs) / cell); x++) {
+        for (let z = Math.floor(Math.min(...zs) / cell); z <= Math.floor(Math.max(...zs) / cell); z++) {
+          const key = `${x},${z}`;
+          const list = this.cells.get(key) ?? [];
+          list.push(id);
+          this.cells.set(key, list);
+        }
+      }
+    }
+  }
+
+  /** `y` から `window` [m] 以内にある面のうち、いちばん高いもの。 */
+  topNear(x: number, z: number, y: number, window: number): number | null {
+    const list = this.cells.get(`${Math.floor(x / this.cell)},${Math.floor(z / this.cell)}`);
+    if (!list) return null;
+    let top: number | null = null;
+    for (const id of list) {
+      const [a, b, c] = this.tris[id];
+      const height = heightInTriangleXZ(a, b, c, x, z);
+      if (height === null || Math.abs(height - y) > window) continue;
+      if (top === null || height > top) top = height;
+    }
+    return top;
+  }
+}
+
 describe('立体交差の上の交差点', () => {
   it('床版と橋脚が付き、路面だけが宙に浮かない', () => {
     const field = new Heightfield();
@@ -130,6 +176,77 @@ describe('立体交差の上の交差点', () => {
   });
 });
 
+describe('橋の下', () => {
+  /** 桁より下にある構造物 (橋脚・フーチング) の頂点。 */
+  function pierPoints(world: WorldBuilder, deckY: number): Vector3[] {
+    const structures = world.group.children.find((o) => o.name === 'structures') as Mesh;
+    const position = structures.geometry.attributes.position;
+    const out: Vector3[] = [];
+    for (let i = 0; i < position.count; i++) {
+      const y = position.getY(i);
+      if (y > deckY - 4) continue;
+      out.push(new Vector3(position.getX(i), y, position.getZ(i)));
+    }
+    return out;
+  }
+
+  it('橋脚が下を通る道路の車道の上に建たない', () => {
+    const field = new Heightfield();
+    const network = new Network();
+    // 桁下 13 m の高架。橋脚が何本も入る長さにする。
+    draw(network, 'road_medium', [new Vector3(-200, 14, 0), new Vector3(200, 14, 0)]);
+    const world = new WorldBuilder(network, field, new TerrainMesh(field, new MeshBasicMaterial()));
+    world.rebuild();
+
+    // 橋脚が建つ位置をまず調べ、そのど真ん中を通る道路を足す。
+    const before = pierPoints(world, 14);
+    expect(before.length).toBeGreaterThan(0);
+    const target = before.reduce((best, p) => (Math.abs(p.x) < Math.abs(best.x) ? p : best)).x;
+    draw(network, 'road_small', [new Vector3(target, 0, -160), new Vector3(target, 0, 160)]);
+    world.rebuild();
+
+    const cls = getClass('road_small');
+    let piers = 0;
+    for (const p of pierPoints(world, 14)) {
+      piers++;
+      // 下の道路の車道の中に、橋脚の頂点が 1 つも無いこと。
+      expect(Math.abs(p.x - target)).toBeGreaterThan(cls.carriagewayHalfWidth);
+    }
+    // 橋脚そのものは建っている (全部あきらめて逃げていない)。
+    expect(piers).toBeGreaterThan(0);
+  });
+
+  it('地形が桁の上に被さらない (掘割の中で橋にした所)', () => {
+    const field = new Heightfield();
+    const network = new Network();
+    // 平らな地形 (高さ 0) を 1 m 掘った所を通る道路。下をくぐる道路の
+    // ために強制的に橋になるので、整地が遮断されて地形が残る。
+    draw(network, 'road_medium', [new Vector3(-200, -1, 0), new Vector3(200, -1, 0)]);
+    draw(network, 'road_small', [new Vector3(0, -7, -160), new Vector3(0, -7, 160)]);
+    const world = new WorldBuilder(network, field, new TerrainMesh(field, new MeshBasicMaterial()));
+    const result = world.rebuild();
+
+    const upper = [...network.segments.values()].find(
+      (s) => Math.abs(network.alignmentOf(s.id).sampleAt(0).pos.y + 1) < 0.5,
+    )!;
+    const alignment = network.alignmentOf(upper.id);
+    const runs = result.structures.get(upper.id) ?? [];
+    expect(runs.some((r) => r.mode === 'bridge')).toBe(true);
+
+    let checked = 0;
+    for (const run of runs) {
+      if (run.mode !== 'bridge') continue;
+      for (let s = run.s0; s <= run.s1; s += 2) {
+        const p = alignment.sampleAt(s).pos;
+        // 路面より上に地形が出ていたら、道路が地形に埋まって見える。
+        expect(field.heightAt(p.x, p.z)).toBeLessThan(p.y);
+        checked++;
+      }
+    }
+    expect(checked).toBeGreaterThan(10);
+  });
+});
+
 describe('サンプルネットワーク', () => {
   it('交差点・分岐器・踏切・立体交差・橋・トンネルが一通りできる', () => {
     const { result, network } = buildWorld();
@@ -137,8 +254,9 @@ describe('サンプルネットワーク', () => {
     expect(result.stats.segments).toBeGreaterThan(10);
     expect(result.stats.intersections).toBeGreaterThanOrEqual(1);
     expect(result.stats.turnouts).toBeGreaterThanOrEqual(1);
-    // 複線 (並列 2 本) なので、1 本の道路に対して踏切は 2 か所できる。
-    expect(result.stats.levelCrossings).toBe(2);
+    // 複線を渡る所は、交点が 2 つあっても踏切としては 1 か所にまとめる。
+    expect(result.stats.levelCrossings).toBe(1);
+    expect(findCrossings(network).filter((c) => c.kind === 'level')).toHaveLength(2);
     expect(result.stats.bridgeLength).toBeGreaterThan(20);
     expect(result.stats.tunnelLength).toBeGreaterThan(20);
 
@@ -231,6 +349,28 @@ describe('サンプルネットワーク', () => {
       }
     }
     expect(structural).toBeGreaterThan(20);
+  });
+
+  it('車・列車が路面の下を通らない', () => {
+    const { world } = buildWorld();
+    const surfaces = world.group.children.find((o) => o.name === 'surfaces') as Mesh;
+    const index = new SurfaceIndex(surfaces);
+
+    let checked = 0;
+    for (const lane of world.laneGraph.lanes) {
+      const steps = Math.max(2, Math.ceil(lane.path.length / 2));
+      for (let i = 0; i <= steps; i++) {
+        const pose = lane.path.poseAt((i / steps) * lane.path.length);
+        // 立体交差では当然「上の道路」に覆われるので、自分と同じ高さに
+        // ある面 (自分が走っている舗装) だけを見る。
+        const top = index.topNear(pose.pos.x, pose.pos.z, pose.pos.y, 3);
+        if (top === null) continue;
+        checked++;
+        // 路面より下を通っていない (踏切の上下・交差点面の反りを含む)。
+        expect(top - pose.pos.y).toBeLessThan(0.05);
+      }
+    }
+    expect(checked).toBeGreaterThan(500);
   });
 
   it('踏切のまわりでレールが地形に埋まらない', () => {

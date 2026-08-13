@@ -2,11 +2,12 @@ import { Group, Mesh, Vector3, type Vector2 } from 'three';
 import type { Alignment } from '../core/alignment';
 import { MeshBuilder, signedAreaXZ } from '../core/meshbuilder';
 import { perp } from '../core/curve';
-import { PROP_MAX_RISE, TERRAIN_CELL, lerp, smoothstep } from '../core/units';
+import { DECK_THICKNESS, PROP_MAX_RISE, TERRAIN_CELL, lerp, smoothstep } from '../core/units';
 import {
   applySurfaceBlend,
   buildFlangeways,
   buildLevelCrossing,
+  panelHalfLength,
   computeCrossingBlend,
   surfaceBlendAt,
   surfaceHeightScale,
@@ -66,8 +67,16 @@ import {
   classify,
   computeStructureProfile,
   forceRunMode,
+  modeAt,
+  unifyParallelRuns,
   type StructureRun,
 } from '../network/structure';
+import {
+  findParallelGroups,
+  lateralOffsetAt,
+  stationOf,
+  type ParallelGroup,
+} from '../network/parallel';
 import { evaluateAlignment, type SegmentDiagnostics } from '../network/validation';
 import { TerrainGrading } from '../terrain/grading';
 import type { Heightfield } from '../terrain/heightfield';
@@ -138,6 +147,8 @@ export interface BuildResult {
    * (検証や当たり判定) はこれを線形の高さに足す。
    */
   blends: Map<SegmentId, SurfaceBlend[]>;
+  /** 平行に並んでいると判定した線形のまとまり。 */
+  parallelGroups: ParallelGroup[];
 }
 
 /** 配電線の系統数 (地中区間も繋がっているものとして数える)。 */
@@ -175,6 +186,12 @@ const COMPONENT_TINTS: RGB[] = [
 /** 小物を立てるときに、路面から確保する余裕 [m]。 */
 const PROP_CLEARANCE = 0.35;
 
+/**
+ * 橋の下で地形を抑える高さ (路面からの下げ量) [m]。
+ * 桁の下面 (床版厚) より少し下に取り、桁と地形の間を空ける。
+ */
+const DECK_CLEARANCE = DECK_THICKNESS + 0.3;
+
 /** 架空線で飛ばせる径間の上限 (電柱の間隔の何倍まで)。 */
 const MAX_AERIAL_SPANS = 1.6;
 
@@ -211,6 +228,8 @@ export class WorldBuilder {
   /** 最後に解いた交差点情報。ツール側のスナップやハイライトで使う。 */
   junctions = new Map<NodeId, Junction>();
   crossings: Crossing[] = [];
+  /** 最後に見つけた、平行に並んでいる線形のまとまり。 */
+  parallelGroups: ParallelGroup[] = [];
 
   /** 最後に組み立てた車線グラフ。 */
   laneGraph: LaneGraph = { lanes: [], spawnable: [] };
@@ -281,6 +300,20 @@ export class WorldBuilder {
       const range = { s0: trim.a, s1: Math.max(trim.a + 0.5, alignment.length - trim.b) };
       ranges.set(seg.id, range);
       structures.set(seg.id, computeStructureProfile(alignment, this.field, range));
+    }
+
+    // 平行に並んでいる線形どうしは、橋・トンネルの区間を揃える。並んだ
+    // 線が同じ谷を渡っているのに桁の始まりが数 m ずれる、といったことを
+    // 防ぐ (揃えれば桁も坑門も横に並んで 1 つの構造物に見える)。
+    const parallelGroups = findParallelGroups(network);
+    this.parallelGroups = parallelGroups;
+    for (const group of parallelGroups) {
+      const members = group.members.map((id) => ({
+        alignment: network.alignmentOf(id),
+        runs: structures.get(id)!,
+        range: ranges.get(id)!,
+      }));
+      unifyParallelRuns(members).forEach((runs, i) => structures.set(group.members[i], runs));
     }
 
     // 立体交差の上側は、盛土になる高さでも橋にする。そうしないと下をくぐる
@@ -409,8 +442,21 @@ export class WorldBuilder {
       );
     }
 
+    this.buildCatenaries(structure, structures, parallelGroups);
+
     for (const crossing of crossings) {
-      this.buildCrossing(overlay, crossing, structures, warnings, stats);
+      if (crossing.message) {
+        warnings.push({
+          message: crossing.message,
+          position: crossing.point.clone(),
+          severity: crossing.kind === 'conflict' ? 'error' : 'warning',
+        });
+      }
+    }
+    // 並んだ線路を渡る所は、1 か所の踏切としてまとめて作る。線路ごとに
+    // 作ると、線路と線路の間に遮断機と停止線が入り込んでしまう。
+    for (const group of groupLevelCrossings(crossings)) {
+      this.buildCrossing(overlay, group, structures, stats);
     }
 
     const power = this.buildPower(structure, structures, ranges);
@@ -425,7 +471,11 @@ export class WorldBuilder {
 
     // 車線グラフは形が変わるたびに作り直す。走っている車両は捨てる
     // (通れなくなった車線に取り残された車が残り続けるのを防ぐ)。
-    this.laneGraph = buildLaneGraph(network, junctions, ranges);
+    // 車が走る高さは、描画に使った路面と同じにする。踏切のまわりで
+    // 舗装が上下する分を無視すると、車が路面の下を通ることになる。
+    this.laneGraph = buildLaneGraph(network, junctions, ranges, {
+      surface: (segment, s, y) => surfaceBlendAt(blends.get(segment) ?? [], s, y),
+    });
     this.traffic.reset(this.laneGraph);
     this.vehicleView.clear();
 
@@ -439,6 +489,7 @@ export class WorldBuilder {
       connectivity,
       power,
       blends,
+      parallelGroups,
     };
   }
 
@@ -805,6 +856,13 @@ export class WorldBuilder {
           const a = gradingEdges(samples[i], half, 0);
           const b = gradingEdges(samples[i + 1], half, 0);
           grading.blockQuad(a.left, b.left, b.right, a.right);
+          if (run.mode !== 'bridge') continue;
+          // 桁の下に地形が残るのは正しいが、桁より上に出てはいけない。
+          // 立体交差やトンネル坑口の都合で地形より低い所を橋にしたとき、
+          // そのままでは地形が路面に被さる。
+          const c = gradingEdges(samples[i], cls.halfWidth + 1, DECK_CLEARANCE);
+          const d = gradingEdges(samples[i + 1], cls.halfWidth + 1, DECK_CLEARANCE);
+          grading.carveQuad(c.left, d.left, d.right, c.right);
         }
       }
     }
@@ -959,9 +1017,6 @@ export class WorldBuilder {
   ): void {
     const profile = profileFor(cls);
     const ground = (x: number, z: number): number => this.field.heightAt(x, z);
-    // 自分自身の上には当然乗るので、判定からは外す。
-    const canPlace = (x: number, z: number, y?: number): boolean =>
-      this.occupancy.isFree(x, z, { exceptSegments: [segment], margin: PROP_CLEARANCE, y });
 
     for (const run of runs) {
       const raw = alignmentSamplesInRange(alignment, run.s0, run.s1, 2.5);
@@ -980,18 +1035,14 @@ export class WorldBuilder {
 
       if (run.mode === 'bridge') {
         stats.bridgeLength += run.s1 - run.s0;
-        buildBridge(structure, samples, cls, this.field);
+        buildBridge(structure, samples, cls, this.field, {
+          // 橋脚を下を通る道路・線路の真ん中に建てない。
+          canPlace: (x, z, y) => this.canPlaceProp(x, z, y, [segment]),
+        });
       } else if (run.mode === 'tunnel') {
         stats.tunnelLength += run.s1 - run.s0;
         buildTunnel(structure, samples, cls, this.field);
       }
-
-      if (cls.kind === 'rail' && run.mode !== 'tunnel') {
-        for (const base of buildCatenary(structure, samples, cls, { canPlace })) {
-          this.props.push({ kind: 'catenaryPole', position: base, segment });
-        }
-      }
-
     }
 
     if (cls.kind === 'rail') {
@@ -1000,6 +1051,87 @@ export class WorldBuilder {
       if (first && last) {
         const samples = alignmentSamplesInRange(alignment, first.s0, last.s1, 1.5);
         buildTrack(structure, samples, cls.tracks.length ? cls.tracks : [0]);
+      }
+    }
+  }
+
+  /** 小物を立ててよい場所か (自分の線形は除く)。 */
+  private canPlaceProp(x: number, z: number, y: number | undefined, own: SegmentId[]): boolean {
+    return this.occupancy.isFree(x, z, {
+      exceptSegments: own,
+      margin: PROP_CLEARANCE,
+      y,
+    });
+  }
+
+  /**
+   * 架線柱を建てる。
+   *
+   * 平行に並んだ線路は 1 つのまとまりとして扱い、**まとめて 1 基の門型**で
+   * 受ける。線路ごとに建てると、複線の間に柱が林立してしまう。区間
+   * (地表・橋・トンネル) は既に揃えてあるので、まとまりの代表 1 本の
+   * 区間をたどれば、並んだ線のどこに柱が要るかが決まる。
+   */
+  private buildCatenaries(
+    structure: MeshBuilder,
+    structures: Map<SegmentId, StructureRun[]>,
+    groups: ParallelGroup[],
+  ): void {
+    const groupOf = new Map<SegmentId, SegmentId[]>();
+    for (const group of groups) {
+      if (group.kind !== 'rail') continue;
+      // 代表は ID がいちばん小さい線。その断面で並びを測る。
+      for (const id of group.members) groupOf.set(id, group.members);
+    }
+
+    for (const seg of this.network.segments.values()) {
+      const cls = this.network.classOf(seg);
+      if (cls.kind !== 'rail') continue;
+      const members = groupOf.get(seg.id);
+      // まとまりの代表以外は、代表が建てた門型に吊るので何もしない。
+      if (members && members[0] !== seg.id) continue;
+
+      const alignment = this.network.alignmentOf(seg.id);
+      const partners = (members ?? [])
+        .filter((id) => id !== seg.id)
+        .map((id) => this.network.alignmentOf(id));
+      const own = members ?? [seg.id];
+      /** その点にいちばん近い線形。門型の柱の持ち主を決めるのに使う。 */
+      const nearestOf = (at: Vector3, candidates: SegmentId[]): SegmentId => {
+        let best = candidates[0];
+        let bestDistance = Infinity;
+        for (const id of candidates) {
+          const other = this.network.alignmentOf(id);
+          const p = other.sampleAt(stationOf(other, at.x, at.z)).pos;
+          const d = (p.x - at.x) ** 2 + (p.z - at.z) ** 2;
+          if (d < bestDistance) {
+            bestDistance = d;
+            best = id;
+          }
+        }
+        return best;
+      };
+
+      for (const run of structures.get(seg.id) ?? []) {
+        if (run.mode === 'tunnel') continue;
+        const samples = alignmentSamplesInRange(alignment, run.s0, run.s1, 2.5);
+        if (samples.length < 2) continue;
+        const bases = buildCatenary(structure, samples, cls, {
+          canPlace: (x, z, y) => this.canPlaceProp(x, z, y, own),
+          offsetsAt: (s) => {
+            const offsets = [0];
+            for (const other of partners) {
+              const lateral = lateralOffsetAt(alignment, s, other);
+              if (lateral !== null) offsets.push(lateral);
+            }
+            return offsets;
+          },
+        });
+        // 門型の柱は外側の軌道の路肩に立つので、その軌道の持ち物として
+        // 記録する (どの線形の路側にあるかで検証されるため)。
+        for (const base of bases) {
+          this.props.push({ kind: 'catenaryPole', position: base, segment: nearestOf(base, own) });
+        }
       }
     }
   }
@@ -1039,7 +1171,15 @@ export class WorldBuilder {
     // 高い所にある交差点には床版と橋脚を付ける。付けないと路面だけが宙に浮く。
     const terrain = this.field.baseHeightAt(node.pos.x, node.pos.z);
     if (classify(node.pos.y, terrain) === 'bridge' && junction.rings.length > 0) {
-      buildJunctionDeck(structure, junction.rings[0], cls, this.field);
+      buildJunctionDeck(structure, junction.rings[0], cls, this.field, {
+        canPlace: (x, z, y) =>
+          this.canPlaceProp(
+            x,
+            z,
+            y,
+            junction.approaches.map((a) => a.branch.segment),
+          ),
+      });
     }
 
     if (cls.kind === 'rail') {
@@ -1214,31 +1354,29 @@ export class WorldBuilder {
 
   // ---------------------------------------------------------------- 踏切
 
+  /**
+   * 踏切 1 か所を作る。
+   *
+   * 複線を渡る所では線路の本数だけ交点があるが、施設としての踏切は
+   * 1 か所である。舗装・遮断機・停止線はまとめて作り、フランジ溝だけを
+   * 線路ごとに敷く。
+   */
   private buildCrossing(
     overlay: MeshBuilder,
-    crossing: Crossing,
+    group: LevelCrossingGroup,
     structures: Map<SegmentId, StructureRun[]>,
-    warnings: WorldWarning[],
     stats: WorldStats,
   ): void {
-    if (crossing.message) {
-      warnings.push({
-        message: crossing.message,
-        position: crossing.point.clone(),
-        severity: crossing.kind === 'conflict' ? 'error' : 'warning',
-      });
-    }
-    if (crossing.kind !== 'level' || !crossing.road || !crossing.rail) return;
-
     stats.levelCrossings++;
-    const road = crossing.road;
+    const road = group.main.road!;
     const build = buildLevelCrossing(
       overlay,
-      crossing,
+      group.main,
       { sampleAt: (s) => this.roadSampleAt(road.segment, s) },
       road.cls,
-      crossing.rail.cls,
+      group.main.rail!.cls,
       {
+        span: { s0: group.s0, s1: group.s1 },
         canPlace: (x, z, y) =>
           this.occupancy.isFree(x, z, {
             exceptSegments: [road.segment],
@@ -1250,15 +1388,6 @@ export class WorldBuilder {
       },
     );
 
-    // 踏切の中だけ、レールの内側にフランジ溝を敷く。線路が舗装から
-    // わずかしか出ていないので、これが無いとどこが線路か分かりにくい。
-    const railAlignment = this.network.alignmentOf(crossing.rail.segment);
-    // 舗装の中だけ。外まで伸ばすと、道床の上に溝が浮いてしまう。
-    const sin = Math.max(
-      0.26,
-      Math.abs(road.dir.x * crossing.rail.dir.y - road.dir.y * crossing.rail.dir.x),
-    );
-    const reach = Math.max(1, road.cls.halfWidth / sin - 0.5);
     // 溝の高さは舗装から取る。道路の枠 (弧長・横距) に直してから、
     // 描画に使ったのと同じ路面 (踏切の傾き込み) を引く。
     const atCrossing = this.roadSampleAt(road.segment, road.s);
@@ -1272,17 +1401,30 @@ export class WorldBuilder {
       const sample = this.roadSampleAt(road.segment, station);
       return sample ? sample.pos.y + lateral * sample.roll : null;
     };
-    buildFlangeways(
-      overlay,
-      alignmentSamplesInRange(
-        railAlignment,
-        Math.max(0, crossing.rail.s - reach),
-        Math.min(railAlignment.length, crossing.rail.s + reach),
-        1.5,
-      ),
-      crossing.rail.cls,
-      pavementY,
-    );
+
+    // 踏切の中だけ、レールの内側にフランジ溝を敷く。線路が舗装から
+    // わずかしか出ていないので、これが無いとどこが線路か分かりにくい。
+    for (const crossing of group.crossings) {
+      const rail = crossing.rail!;
+      const railAlignment = this.network.alignmentOf(rail.segment);
+      // 舗装の中だけ。外まで伸ばすと、道床の上に溝が浮いてしまう。
+      const sin = Math.max(
+        0.26,
+        Math.abs(crossing.road!.dir.x * rail.dir.y - crossing.road!.dir.y * rail.dir.x),
+      );
+      const reach = Math.max(1, crossing.road!.cls.halfWidth / sin - 0.5);
+      buildFlangeways(
+        overlay,
+        alignmentSamplesInRange(
+          railAlignment,
+          Math.max(0, rail.s - reach),
+          Math.min(railAlignment.length, rail.s + reach),
+          1.5,
+        ),
+        rail.cls,
+        pavementY,
+      );
+    }
 
     for (const stop of build.stopStations) {
       buildCrossingStopLine(
@@ -1431,12 +1573,86 @@ function liftForCrossings(
   }
 }
 
-/** その弧長がどの構造形式の区間に入るか。 */
-function modeAt(runs: StructureRun[], s: number): StructureRun['mode'] {
-  for (const run of runs) {
-    if (s >= run.s0 && s <= run.s1) return run.mode;
+/** 1 か所の踏切としてまとめた、平面交差のまとまり。 */
+interface LevelCrossingGroup {
+  /** 代表 (まとまりの中央にいちばん近い交差)。 */
+  main: Crossing;
+  crossings: Crossing[];
+  /** 舗装を敷く道路の弧長の範囲。 */
+  s0: number;
+  s1: number;
+}
+
+/** まとめる踏切パネルどうしの隙間の上限 [m]。 */
+const CROSSING_MERGE_GAP = 10;
+/** 同じ道路の上とみなす、中心線からのずれ [m]。 */
+const CROSSING_MERGE_LATERAL = 4;
+
+/**
+ * 平面交差を「施設としての踏切」ごとにまとめる。
+ *
+ * 複線を渡れば交点は線路の本数だけできるが、実物では舗装も遮断機も
+ * 1 組しかない。線路ごとに作ると、線路と線路の間 (数 m しかない) に
+ * 遮断機と停止線が入り込んでしまう。
+ *
+ * まとめる判定は道路の弧長ではなく**world 座標**で行う。線路の間に道路の
+ * ノードが来ると、隣り合う交差が別々のセグメントに乗ってしまい、弧長では
+ * 比べられないため。舗装・遮断機は代表の交差の弧長で作るが、`roadSampleAt`
+ * がノードを越えて隣のセグメントまで辿るので、範囲が端を越えても構わない。
+ */
+function groupLevelCrossings(crossings: Crossing[]): LevelCrossingGroup[] {
+  const levels = crossings.filter((c) => c.kind === 'level' && c.road && c.rail);
+  const clusters: Crossing[][] = [];
+
+  for (const crossing of levels) {
+    const cluster = clusters.find((members) =>
+      members.some((other) => sameCrossingSite(other, crossing)),
+    );
+    if (cluster) cluster.push(crossing);
+    else clusters.push([crossing]);
   }
-  return 'ground';
+
+  return clusters.map((members) => {
+    // 代表はまとまりの真ん中にいちばん近い交差。舗装の傾きと遮断機の
+    // 向きは、そこの道路の枠で決める。
+    const centre = new Vector3();
+    for (const c of members) centre.add(c.point);
+    centre.divideScalar(members.length);
+    const main = members.reduce((best, c) =>
+      c.point.distanceTo(centre) < best.point.distanceTo(centre) ? c : best,
+    );
+
+    let s0 = Infinity;
+    let s1 = -Infinity;
+    for (const c of members) {
+      // 代表の道路の弧長に直す (交差どうしは数 m しか離れていないので、
+      // 進行方向への射影で足りる)。
+      const along =
+        (c.point.x - main.point.x) * main.road!.dir.x +
+        (c.point.z - main.point.z) * main.road!.dir.y;
+      const half = panelHalfLength(c, c.rail!.cls);
+      s0 = Math.min(s0, main.road!.s + along - half);
+      s1 = Math.max(s1, main.road!.s + along + half);
+    }
+    return { main, crossings: members, s0, s1 };
+  });
+}
+
+/** 2 つの平面交差が「同じ 1 か所の踏切」か。 */
+function sameCrossingSite(a: Crossing, b: Crossing): boolean {
+  const dirA = a.road!.dir;
+  const dirB = b.road!.dir;
+  // 別の道路 (交差点の近くで交わる 2 本など) はまとめない。
+  if (Math.abs(dirA.x * dirB.x + dirA.y * dirB.y) < 0.9) return false;
+  const dx = b.point.x - a.point.x;
+  const dz = b.point.z - a.point.z;
+  const lateral = Math.abs(-dx * dirA.y + dz * dirA.x);
+  if (lateral > CROSSING_MERGE_LATERAL) return false;
+  if (Math.abs(a.point.y - b.point.y) > 2) return false;
+  const along = Math.abs(dx * dirA.x + dz * dirA.y);
+  const reach =
+    panelHalfLength(a, a.rail!.cls) + panelHalfLength(b, b.rail!.cls) + CROSSING_MERGE_GAP;
+  return along <= reach;
 }
 
 /** 断面の帯が中心線からどれだけ離れているか (中心線をまたぐ帯は 0)。 */

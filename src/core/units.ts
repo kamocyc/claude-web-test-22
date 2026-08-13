@@ -80,6 +80,17 @@ export const DECK_THICKNESS = 1.1;
 /** 左側通行かどうか (日本仕様)。信号や停止線の配置に影響する。 */
 export const DRIVE_ON_LEFT = true;
 
+/** 交差点端から横断歩道までの離隔と、横断歩道の奥行き [m]。 */
+export const CROSSWALK_OFFSET = 0.6;
+export const CROSSWALK_DEPTH = 3.6;
+/**
+ * 交差点端から停止線までの距離 [m]。
+ *
+ * 描画 (`build/markings.ts`) と走行 (`sim/`) の両方が見る。車が止まる
+ * 位置は路面に描いた停止線でなければならないので、同じ値を共有する。
+ */
+export const STOP_LINE_OFFSET = CROSSWALK_OFFSET + CROSSWALK_DEPTH + 0.6;
+
 /** 標準軌間 [m]。 */
 export const RAIL_GAUGE = 1.435;
 

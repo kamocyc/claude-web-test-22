@@ -1,7 +1,8 @@
 import { Vector2, Vector3 } from 'three';
 import { Alignment } from '../core/alignment';
 import { curveFromTangents } from '../core/curve';
-import { SURFACE_LIFT, clamp } from '../core/units';
+import { polygonHeightSampler } from '../core/meshbuilder';
+import { STOP_LINE_OFFSET, SURFACE_LIFT, clamp } from '../core/units';
 import type { NetworkClass } from '../network/classes';
 import type { Junction } from '../network/junction';
 import { exitLaneFor, lanesOf, solveApproachLanes, type Lane } from '../network/lanes';
@@ -38,6 +39,13 @@ export interface GraphLane {
   node?: NodeId;
   /** 信号のある交差点の進路なら、その位相 (同じ位相が同時に青)。 */
   phase?: number;
+  /**
+   * この進路に入る前に止まる位置 (進路の入口からの手前距離 [m])。
+   *
+   * 路面に描いた停止線と同じ値を使う。交差点の面の際まで出て止まると、
+   * 横断歩道を塞いだ車が並ぶことになる。
+   */
+  stopLine?: number;
   /** 同時に進入してはいけない他の進路。 */
   conflicts: number[];
 }
@@ -58,6 +66,15 @@ function speedOf(cls: NetworkClass): number {
   return (cls.designSpeed / 3.6) * 0.85;
 }
 
+/**
+ * 描画に使った路面の高さ。踏切のまわりでは路面が線路に合わせて上下・
+ * 傾斜するので、線形をそのままたどると車が舗装の下に潜る。
+ */
+export type SurfaceQuery = (segment: SegmentId, s: number, y: number) => {
+  dy: number;
+  roll: number;
+};
+
 /** セグメント上の車線 (トリムした範囲だけ)。 */
 class SegmentLanePath implements LanePath {
   readonly length: number;
@@ -67,6 +84,8 @@ class SegmentLanePath implements LanePath {
     private readonly s0: number,
     private readonly s1: number,
     private readonly forward: boolean,
+    private readonly segment: SegmentId,
+    private readonly surface?: SurfaceQuery,
   ) {
     this.length = Math.max(0, s1 - s0);
   }
@@ -75,10 +94,12 @@ class SegmentLanePath implements LanePath {
     const along = clamp(d, 0, this.length);
     const s = this.forward ? this.s0 + along : this.s1 - along;
     const sample = this.alignment.sampleAt(s);
+    // 路面と同じ補正を通す。踏切の前後で舗装は 0.8 m ほど上下する。
+    const blend = this.surface?.(this.segment, s, sample.pos.y) ?? { dy: 0, roll: 0 };
     return {
       pos: new Vector3(
         sample.pos.x + sample.right.x * this.offset,
-        sample.pos.y + SURFACE_LIFT,
+        sample.pos.y + blend.dy + this.offset * blend.roll + SURFACE_LIFT,
         sample.pos.z + sample.right.z * this.offset,
       ),
       dir: this.forward ? sample.forward.clone() : sample.forward.clone().negate(),
@@ -96,6 +117,11 @@ class ConnectorPath implements LanePath {
     to: { pos: Vector3; dir: Vector3 },
     /** 制御点を伸ばす割合。転回のように両端が向かい合う進路では大きくする。 */
     tension = 1 / 3,
+    /**
+     * 交差点面の高さ。進路は両端を結んだだけの縦断なので、面が反って
+     * いる交差点 (勾配の違う枝が集まる所) では途中が面の下に潜る。
+     */
+    private readonly floor?: (x: number, z: number) => number | null,
   ) {
     const a = new Vector2(from.pos.x, from.pos.z);
     const b = new Vector2(to.pos.x, to.pos.z);
@@ -108,7 +134,10 @@ class ConnectorPath implements LanePath {
 
   poseAt(d: number): { pos: Vector3; dir: Vector3 } {
     const sample = this.alignment.sampleAt(clamp(d, 0, this.alignment.length));
-    return { pos: sample.pos.clone(), dir: sample.forward.clone() };
+    const pos = sample.pos.clone();
+    const floor = this.floor?.(pos.x, pos.z);
+    if (floor !== null && floor !== undefined && floor > pos.y) pos.y = floor;
+    return { pos, dir: sample.forward.clone() };
   }
 }
 
@@ -132,6 +161,7 @@ export function buildLaneGraph(
   network: Network,
   junctions: Map<NodeId, Junction>,
   ranges: Map<SegmentId, { s0: number; s1: number }>,
+  options: { surface?: SurfaceQuery } = {},
 ): LaneGraph {
   const lanes: GraphLane[] = [];
   /** セグメントの車線 ID。`segment:index` で引く。 */
@@ -152,7 +182,15 @@ export function buildLaneGraph(
       const created = add({
         kind: 'segment',
         vehicleKind: cls.kind === 'rail' ? 'train' : 'car',
-        path: new SegmentLanePath(alignment, lane.offset, range.s0, range.s1, lane.forward),
+        path: new SegmentLanePath(
+          alignment,
+          lane.offset,
+          range.s0,
+          range.s1,
+          lane.forward,
+          seg.id,
+          options.surface,
+        ),
         speedLimit: speedOf(cls),
         segment: seg.id,
       });
@@ -163,6 +201,21 @@ export function buildLaneGraph(
   const laneId = (lane: Lane): number | undefined =>
     bySegment.get(`${lane.segment}:${lane.index}`);
 
+  /** 交差点面の高さを引く関数 (いちばん内側のリング = 車道面)。 */
+  const floors = new Map<NodeId, (x: number, z: number) => number | null>();
+  const floorOf = (junction: Junction): ((x: number, z: number) => number | null) => {
+    const found = floors.get(junction.node);
+    if (found) return found;
+    const ring = junction.rings[junction.rings.length - 1] ?? [];
+    const sampler = polygonHeightSampler(ring);
+    const lifted = (x: number, z: number): number | null => {
+      const y = sampler(x, z);
+      return y === null ? null : y + SURFACE_LIFT;
+    };
+    floors.set(junction.node, lifted);
+    return lifted;
+  };
+
   /** 車線どうしを交差点の中で繋ぐ。 */
   const connect = (
     junction: Junction,
@@ -171,6 +224,7 @@ export function buildLaneGraph(
     phase: number | undefined,
     speed: number,
     tension?: number,
+    stopLine?: number,
   ): void => {
     const from = laneId(entry);
     const to = laneId(exit);
@@ -187,10 +241,11 @@ export function buildLaneGraph(
     const connector = add({
       kind: 'connector',
       vehicleKind: fromLane.vehicleKind,
-      path: new ConnectorPath(start, end, tension),
+      path: new ConnectorPath(start, end, tension, floorOf(junction)),
       speedLimit: speed,
       node: junction.node,
       phase,
+      stopLine,
     });
     fromLane.next.push(connector.id);
     connector.next.push(to);
@@ -219,6 +274,7 @@ type Connect = (
   phase: number | undefined,
   speed: number,
   tension?: number,
+  stopLine?: number,
 ) => void;
 
 /** 転回で膨らませる制御点の長さ [m]。 */
@@ -265,7 +321,9 @@ function connectRoads(junction: Junction, connect: Connect): void {
             exit.approach.branch.cls.designSpeed,
           );
           const factor = movement === 'through' ? 0.7 : 0.4;
-          connect(junction, entry.lane, target, phase, (limit / 3.6) * factor);
+          // 止まる位置は路面に描いた停止線。交差点の面の際まで出ない。
+          const stopLine = junction.kind === 'intersection' ? STOP_LINE_OFFSET : undefined;
+          connect(junction, entry.lane, target, phase, (limit / 3.6) * factor, undefined, stopLine);
         }
       }
     });

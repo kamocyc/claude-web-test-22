@@ -52,6 +52,14 @@ function sweepBox(
   addTube(mb, sections, color, true);
 }
 
+export interface BridgeOptions {
+  /**
+   * その地点に橋脚を建ててよいか。橋の下は道路・線路が通っているのが
+   * 普通なので、等間隔に配るだけでは車道のど真ん中に柱が立つ。
+   */
+  canPlace?: (x: number, z: number, y: number) => boolean;
+}
+
 /**
  * 高架区間の下部構造を作る。
  * 路面自体は地表区間と同じ帯として別に描かれるので、ここでは桁・高欄・
@@ -62,6 +70,7 @@ export function buildBridge(
   samples: AlignmentSample[],
   cls: NetworkClass,
   field: Heightfield,
+  options: BridgeOptions = {},
 ): void {
   if (samples.length < 2) return;
   const hw = cls.halfWidth;
@@ -88,10 +97,13 @@ export function buildBridge(
     );
   }
 
-  buildPiers(mb, samples, cls, field, deckBottom);
+  buildPiers(mb, samples, cls, field, deckBottom, options);
   buildAbutment(mb, samples[0], cls, field, deckBottom, 1);
   buildAbutment(mb, samples[samples.length - 1], cls, field, deckBottom, -1);
 }
+
+/** 橋脚の位置をずらして探す幅 [m]。径間の見え方が崩れない範囲。 */
+const PIER_SHIFTS = [0, 3, -3, 6, -6, 9, -9];
 
 function buildPiers(
   mb: MeshBuilder,
@@ -99,17 +111,37 @@ function buildPiers(
   cls: NetworkClass,
   field: Heightfield,
   deckBottom: number,
+  options: BridgeOptions,
 ): void {
   const s0 = samples[0].s;
   const s1 = samples[samples.length - 1].s;
   const span = s1 - s0;
+  const canPlace = options.canPlace ?? (() => true);
   // 両端の橋台の内側に、等間隔で橋脚を配る。
   const count = Math.max(0, Math.round(span / PIER_PITCH) - 1);
   for (let i = 1; i <= count; i++) {
-    const s = s0 + (span * i) / (count + 1);
-    const sample = interpolateSample(samples, s);
+    const wanted = s0 + (span * i) / (count + 1);
+    // 真下を道路・線路が通っている所は避け、径間の中で前後にずらす。
+    // どこにも建てられなければ、その 1 基は諦める (桁は連続しているので
+    // 見た目は径間が 1 つ長くなるだけ)。
+    let sample = null;
+    let ground = 0;
+    for (const shift of PIER_SHIFTS) {
+      const s = wanted + shift;
+      if (s <= s0 + 4 || s >= s1 - 4) continue;
+      const candidate = interpolateSample(samples, s);
+      if (!candidate) continue;
+      // 足元は整地後の地面。掘り下げられていれば橋脚もそこまで伸ばす。
+      const foot = Math.min(
+        field.baseHeightAt(candidate.pos.x, candidate.pos.z),
+        field.heightAt(candidate.pos.x, candidate.pos.z),
+      );
+      if (!canPlace(candidate.pos.x, candidate.pos.z, foot)) continue;
+      sample = candidate;
+      ground = foot;
+      break;
+    }
     if (!sample) continue;
-    const ground = field.baseHeightAt(sample.pos.x, sample.pos.z);
     const top = sample.pos.y + deckBottom;
     const height = top - ground;
     if (height < MIN_PIER_HEIGHT) continue;
@@ -183,6 +215,7 @@ export function buildJunctionDeck(
   ring: Vector3[],
   cls: NetworkClass,
   field: Heightfield,
+  options: BridgeOptions = {},
 ): void {
   if (ring.length < 3) return;
   const top = ring.map((p) => new Vector3(p.x, p.y + SURFACE_LIFT - 0.15, p.z));
@@ -199,10 +232,15 @@ export function buildJunctionDeck(
   const centre = new Vector3();
   for (const p of top) centre.add(p);
   centre.divideScalar(top.length);
-  const ground = field.baseHeightAt(centre.x, centre.z);
+  const ground = Math.min(
+    field.baseHeightAt(centre.x, centre.z),
+    field.heightAt(centre.x, centre.z),
+  );
   const bottom = centre.y - DECK_THICKNESS;
   const height = bottom - ground;
   if (height < MIN_PIER_HEIGHT) return;
+  // 交差点の真下を別の線形が通っていれば、橋脚は建てない。
+  if (options.canPlace && !options.canPlace(centre.x, centre.z, ground)) return;
 
   const thickness = Math.min(1.6, 0.6 + height * 0.05);
   addBox(

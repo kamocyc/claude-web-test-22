@@ -1,29 +1,51 @@
 import { describe, expect, it } from 'vitest';
-import { Vector2, Vector3 } from 'three';
-import { drawParallel, type Waypoint } from '../src/app/sketch';
+import { MeshBasicMaterial, Vector2, Vector3 } from 'three';
+import { BuildTool } from '../src/app/buildTool';
+import { draw, drawParallel, parallelTracks, type Waypoint } from '../src/app/sketch';
 import { HorizontalCurve } from '../src/core/curve';
 import { getClass } from '../src/network/classes';
 import { findCrossings } from '../src/network/crossings';
 import { solveJunctions } from '../src/network/junction';
 import { Network, type SegmentId } from '../src/network/network';
-import { defaultSpacing, offsetCurve, parallelTracks } from '../src/network/parallel';
+import {
+  findParallelGroups,
+  findParallelReference,
+  offsetCurve,
+  parallelAlignment,
+  parallelSpacing,
+} from '../src/network/parallel';
 import { computeStructureProfile } from '../src/network/structure';
+import { WorldBuilder } from '../src/render/worldBuilder';
 import { Heightfield } from '../src/terrain/heightfield';
+import { TerrainMesh } from '../src/terrain/terrainMesh';
 
 /** 平らな地形。起伏で結果が揺れないようにする。 */
 function flatField(): Heightfield {
   return new Heightfield();
 }
 
-/** 並列敷設した線路。返り値はセグメント ID の一覧 (敷いた順)。 */
+/** 谷を 1 本刻んだ地形。橋になる区間を作るのに使う。 */
+function valleyField(halfWidth = 60, depth = -20): Heightfield {
+  const field = new Heightfield();
+  for (let iz = 0; iz <= field.cells; iz++) {
+    for (let ix = 0; ix <= field.cells; ix++) {
+      const y = Math.abs(field.worldX(ix)) < halfWidth ? depth : 0;
+      field.base[field.index(ix, iz)] = y;
+      field.work[field.index(ix, iz)] = y;
+    }
+  }
+  return field;
+}
+
+/** 並べて敷いた線路。返り値はスパンごとのセグメント ID。 */
 function layParallel(
   network: Network,
   points: Waypoint[],
   count: number,
   classId = 'rail_single',
-  options: { straight?: boolean } = {},
+  options: { straight?: boolean; field?: Heightfield } = {},
 ): SegmentId[][] {
-  return drawParallel(network, flatField(), classId, points, {
+  return drawParallel(network, options.field ?? flatField(), classId, points, {
     count,
     straight: options.straight ?? true,
   }).map((span) => span.map((r) => r.segment));
@@ -45,6 +67,25 @@ function spacingBetween(network: Network, a: SegmentId, b: SegmentId): number[] 
     out.push(best);
   }
   return out;
+}
+
+/** 敷設ツールで 1 スパン引く (カーソルを動かしてクリックするのと同じ)。 */
+function drawWithTool(
+  tool: BuildTool,
+  points: Vector3[],
+  modifiers = { straight: false, noSnap: false },
+): void {
+  for (const point of points) {
+    tool.update(point, modifiers);
+    tool.click();
+  }
+  tool.cancel();
+}
+
+function toolOn(network: Network, field: Heightfield, classId: string): BuildTool {
+  const tool = new BuildTool(network, field, () => {});
+  tool.setClass(classId);
+  return tool;
 }
 
 describe('オフセット曲線', () => {
@@ -78,27 +119,213 @@ describe('オフセット曲線', () => {
     }
   });
 
-  it('並べる本数と向きは、左側通行になるよう決まる', () => {
+  it('間隔は舗装 (道床) の縁が触れ合う幅になる', () => {
     const rail = getClass('rail_single');
-    const spacing = defaultSpacing(rail);
-    // 道床の縁が触れ合う幅。重なると面が二重になる。
-    expect(spacing).toBeGreaterThanOrEqual(rail.halfWidth * 2);
-
-    const pair = parallelTracks(rail, 2);
-    expect(pair.map((t) => t.offset)).toEqual([-spacing / 2, spacing / 2]);
-    // 左側通行なので、右側の線は逆向きに走る。
-    expect(pair.map((t) => t.reversed)).toEqual([false, true]);
-
-    const triple = parallelTracks(rail, 3);
-    expect(triple.map((t) => t.offset)).toEqual([-spacing, 0, spacing]);
-    expect(triple.map((t) => t.reversed)).toEqual([false, false, true]);
-
-    // 対向のある道路は向きを変えない (もともと両方向に走れる)。
-    expect(parallelTracks(getClass('road_small'), 2).every((t) => !t.reversed)).toBe(true);
+    const road = getClass('road_small');
+    expect(parallelSpacing(rail)).toBeGreaterThanOrEqual(rail.halfWidth * 2);
+    // 種別が違えば、それぞれの半幅を足した間隔になる。
+    expect(parallelSpacing(rail, road)).toBeCloseTo(
+      Math.round((rail.halfWidth + road.halfWidth + 0.2) * 10) / 10,
+      6,
+    );
   });
 });
 
-describe('並列敷設', () => {
+describe('平行スナップ', () => {
+  it('既存の線路の隣にカーソルを置くと、規定の間隔にスナップする', () => {
+    const network = new Network();
+    layParallel(network, [
+      { x: -150, z: 0, y: 0 },
+      { x: 150, z: 0, y: 0 },
+    ], 1);
+
+    const cls = getClass('rail_single');
+    const spacing = parallelSpacing(cls);
+    // 中途半端な距離 (7 m) に置いても、間隔ちょうどの位置に寄る。
+    const found = findParallelReference(network, cls, new Vector3(0, 0, 7));
+    expect(found).not.toBeNull();
+    expect(Math.abs(found!.offset)).toBeCloseTo(spacing, 6);
+    expect(Math.hypot(found!.pos.x - 0, found!.pos.z - 0)).toBeCloseTo(spacing, 3);
+
+    // 遠すぎる所・線形の上には寄らない。
+    expect(findParallelReference(network, cls, new Vector3(0, 0, 40))).toBeNull();
+    expect(findParallelReference(network, cls, new Vector3(0, 0, 0.5))).toBeNull();
+  });
+
+  it('曲線に平行して引くと、間隔がどこでも一定になる', () => {
+    const network = new Network();
+    const field = flatField();
+    // 曲がった線路を 1 本引く。
+    draw(network, field, 'rail_single', [
+      { x: -200, z: 0, y: 0 },
+      { x: 0, z: 0, y: 0 },
+      { x: 160, z: 90, y: 0 },
+    ]);
+    const original = [...network.segments.keys()];
+
+    const cls = getClass('rail_single');
+    const spacing = parallelSpacing(cls);
+    const tool = toolOn(network, field, 'rail_single');
+    // 1 本目の右側をなぞる。カーソルは大まかでよい (スナップが決める)。
+    for (const id of original) {
+      const alignment = network.alignmentOf(id);
+      const start = alignment.sampleAt(0);
+      const end = alignment.sampleAt(alignment.length);
+      drawWithTool(tool, [
+        new Vector3(
+          start.pos.x + start.right.x * (spacing + 2),
+          0,
+          start.pos.z + start.right.z * (spacing + 2),
+        ),
+        new Vector3(
+          end.pos.x + end.right.x * (spacing - 1.5),
+          0,
+          end.pos.z + end.right.z * (spacing - 1.5),
+        ),
+      ]);
+    }
+
+    const added = [...network.segments.keys()].filter((id) => !original.includes(id));
+    expect(added).toHaveLength(original.length);
+    for (let i = 0; i < original.length; i++) {
+      for (const distance of spacingBetween(network, original[i], added[i])) {
+        expect(Math.abs(distance - spacing)).toBeLessThan(0.15);
+      }
+    }
+  });
+
+  it('平行に敷いた線形は、高さと勾配を基準の線形から引き継ぐ', () => {
+    const network = new Network();
+    const field = flatField();
+    // 起伏のある縦断で 1 本引く。
+    draw(network, field, 'rail_single', [
+      { x: -150, z: 0, y: 0 },
+      { x: 150, z: 0, y: 4 },
+    ]);
+    const [reference] = [...network.segments.keys()];
+    const alignment = network.alignmentOf(reference);
+    const spacing = parallelSpacing(getClass('rail_single'));
+
+    const parallel = parallelAlignment(alignment, 0, alignment.length, spacing);
+    expect(parallel).not.toBeNull();
+    for (let i = 0; i <= 10; i++) {
+      const t = i / 10;
+      const a = alignment.sampleAt(alignment.length * t).pos;
+      const b = parallel!.sampleAt(parallel!.length * t).pos;
+      expect(Math.abs(a.y - b.y)).toBeLessThan(0.02);
+    }
+  });
+
+  it('逆向きに引いても、間隔と高さは同じで向きだけが逆になる', () => {
+    const network = new Network();
+    const field = flatField();
+    draw(network, field, 'rail_single', [
+      { x: -150, z: 0, y: 0 },
+      { x: 150, z: 0, y: 3 },
+    ]);
+    const [reference] = [...network.segments.keys()];
+    const alignment = network.alignmentOf(reference);
+    const spacing = parallelSpacing(getClass('rail_single'));
+
+    const forward = parallelAlignment(alignment, 0, alignment.length, spacing)!;
+    const backward = parallelAlignment(alignment, alignment.length, 0, spacing)!;
+    expect(backward.length).toBeCloseTo(forward.length, 3);
+    // 始点と終点が入れ替わる。
+    expect(backward.sampleAt(0).pos.distanceTo(forward.sampleAt(forward.length).pos)).toBeLessThan(
+      0.05,
+    );
+    // どちらの向きでも、基準の同じ側に同じ間隔で並ぶ。
+    for (const parallel of [forward, backward]) {
+      for (let i = 0; i <= 10; i++) {
+        const p = parallel.sampleAt((parallel.length * i) / 10).pos;
+        const q = alignment.sampleAt(alignment.length * (i / 10)).pos;
+        // 高さも基準と同じ (弧長の向きが逆でも縦断は入れ替わるだけ)。
+        const mirrored = forward === parallel ? q : alignment.sampleAt(
+          alignment.length * (1 - i / 10),
+        ).pos;
+        expect(Math.abs(p.y - mirrored.y)).toBeLessThan(0.05);
+      }
+    }
+    const mid = backward.sampleAt(backward.length / 2).pos;
+    const refMid = alignment.sampleAt(alignment.length / 2).pos;
+    expect(Math.hypot(mid.x - refMid.x, mid.z - refMid.z)).toBeCloseTo(spacing, 1);
+  });
+
+  it('スナップなし (Ctrl) では平行にならず、指した所に引ける', () => {
+    const network = new Network();
+    const field = flatField();
+    draw(network, field, 'rail_single', [
+      { x: -150, z: 0, y: 0 },
+      { x: 150, z: 0, y: 0 },
+    ]);
+    const spacing = parallelSpacing(getClass('rail_single'));
+    const tool = toolOn(network, field, 'rail_single');
+    const before = network.segments.size;
+
+    drawWithTool(
+      tool,
+      [new Vector3(-100, 0, spacing + 3), new Vector3(100, 0, spacing + 3)],
+      { straight: false, noSnap: true },
+    );
+    expect(network.segments.size).toBe(before + 1);
+    const added = [...network.segments.keys()].pop()!;
+    // 指した位置 (間隔 + 3 m) のまま引けている。
+    const distances = spacingBetween(network, [...network.segments.keys()][0], added);
+    expect(Math.min(...distances)).toBeGreaterThan(spacing + 1);
+  });
+
+  it('平行スナップを切ると寄らない', () => {
+    const network = new Network();
+    const field = flatField();
+    draw(network, field, 'rail_single', [
+      { x: -150, z: 0, y: 0 },
+      { x: 150, z: 0, y: 0 },
+    ]);
+    const spacing = parallelSpacing(getClass('rail_single'));
+    const tool = toolOn(network, field, 'rail_single');
+    tool.setParallelSnap(false);
+    tool.update(new Vector3(0, 0, spacing + 2.5), { straight: false, noSnap: false });
+    expect(tool.status().snap).not.toBe('parallel');
+    expect(tool.status().parallelSnap).toBe(false);
+  });
+});
+
+describe('平行に並んだ線形の判定', () => {
+  it('複線は 1 つのまとまりとして見つかり、離れた線形は入らない', () => {
+    const network = new Network();
+    const [span] = layParallel(network, [
+      { x: -150, z: 0, y: 0 },
+      { x: 150, z: 0, y: 0 },
+    ], 2);
+    // 遠く離れた 3 本目。
+    draw(network, flatField(), 'rail_single', [
+      { x: -150, z: 80, y: 0 },
+      { x: 150, z: 80, y: 0 },
+    ]);
+
+    const groups = findParallelGroups(network);
+    expect(groups).toHaveLength(1);
+    expect(groups[0].members.slice().sort((a, b) => a - b)).toEqual(
+      span.slice().sort((a, b) => a - b),
+    );
+  });
+
+  it('交差する線形や、繋がっている線形は平行とみなさない', () => {
+    const network = new Network();
+    const field = flatField();
+    draw(network, field, 'rail_single', [
+      { x: -150, z: 0, y: 0 },
+      { x: 150, z: 0, y: 0 },
+    ]);
+    draw(network, field, 'rail_single', [
+      { x: 0, z: -150, y: 0 },
+      { x: 0, z: 150, y: 0 },
+    ]);
+    expect(findParallelGroups(network)).toHaveLength(0);
+  });
+});
+
+describe('平行に並んだ線形の扱い', () => {
   it('複線は 2 本の線路になり、間隔はどこでも一定', () => {
     const network = new Network();
     const spans = layParallel(
@@ -115,7 +342,7 @@ describe('並列敷設', () => {
     expect(spans).toHaveLength(2);
     expect(network.segments.size).toBe(4);
 
-    const spacing = defaultSpacing(getClass('rail_single'));
+    const spacing = parallelSpacing(getClass('rail_single'));
     for (const span of spans) {
       for (const distance of spacingBetween(network, span[0], span[1])) {
         expect(distance).toBeGreaterThan(spacing - 0.15);
@@ -150,47 +377,47 @@ describe('並列敷設', () => {
       { x: 150, z: 0, y: 0 },
     ], 3);
     expect(span).toHaveLength(3);
-    const spacing = defaultSpacing(getClass('rail_single'));
+    const spacing = parallelSpacing(getClass('rail_single'));
     for (const distance of spacingBetween(network, span[0], span[1])) {
       expect(Math.abs(distance - spacing)).toBeLessThan(0.15);
     }
     for (const distance of spacingBetween(network, span[0], span[2])) {
       expect(Math.abs(distance - spacing * 2)).toBeLessThan(0.2);
     }
+    // 左側通行では、中央 (上り) は線形の向きのまま。
+    expect(parallelTracks(getClass('rail_single'), 3).map((t) => t.reversed)).toEqual([
+      false,
+      false,
+      true,
+    ]);
   });
 
-  it('続けて引くと、線ごとに前のスパンの端点へ繋がる', () => {
-    const network = new Network();
-    const spans = layParallel(network, [
-      { x: -200, z: 0, y: 0 },
-      { x: 0, z: 0, y: 0 },
-      { x: 200, z: 0, y: 0 },
-    ], 2);
-    // 4 本のセグメントに対しノードは 6 個 (継ぎ目で 2 個を共有)。
-    expect(network.segments.size).toBe(4);
-    expect(network.nodes.size).toBe(6);
-    for (let track = 0; track < 2; track++) {
-      const first = network.getSegment(spans[0][track]);
-      const second = network.getSegment(spans[1][track]);
-      const shared = [first.a, first.b].filter((n) => n === second.a || n === second.b);
-      expect(shared).toHaveLength(1);
-    }
-  });
-
-  it('道路を横切ると、線ごとに踏切ができる', () => {
+  it('道路を横切ると線ごとに交差ができるが、踏切としては 1 か所にまとめる', () => {
     const network = new Network();
     const field = flatField();
     layParallel(network, [
       { x: 0, z: -200, y: 0 },
       { x: 0, z: 200, y: 0 },
     ], 2);
-    drawParallel(network, field, 'road_medium', [
+    draw(network, field, 'road_medium', [
       { x: -200, z: 0, y: 0 },
       { x: 200, z: 0, y: 0 },
-    ], { count: 1, straight: true });
+    ], { straight: true });
 
     const crossings = findCrossings(network).filter((c) => c.kind === 'level');
     expect(crossings).toHaveLength(2);
+
+    const world = new WorldBuilder(network, field, new TerrainMesh(field, new MeshBasicMaterial()));
+    const result = world.rebuild();
+    expect(result.stats.levelCrossings).toBe(1);
+    // 遮断機は踏切の外側に 2 基だけ。線路の間には立たない。
+    const gates = result.props.filter((p) => p.kind === 'crossingGate');
+    expect(gates).toHaveLength(2);
+    const spacing = parallelSpacing(getClass('rail_single'));
+    for (const gate of gates) {
+      // 2 本の線路 (z = ±spacing/2) の間にいない。
+      expect(Math.abs(gate.position.x)).toBeGreaterThan(spacing / 2 + 3);
+    }
   });
 
   it('片側の線だけを分岐させられる', () => {
@@ -204,11 +431,11 @@ describe('並列敷設', () => {
     // 右側の線の途中から側線を分ける。
     const target = network.getSegment(span[1]);
     const node = network.splitSegment(target.id, network.alignmentOf(target.id).length / 2);
-    drawParallel(network, field, 'rail_yard', [
+    draw(network, field, 'rail_yard', [
       { x: node.pos.x, z: node.pos.z, y: 0 },
       { x: node.pos.x + 120, z: node.pos.z + 20, y: 0 },
       { x: node.pos.x + 240, z: node.pos.z + 60, y: 0 },
-    ], { count: 1 });
+    ]);
 
     const junctions = solveJunctions(network).junctions;
     const switches = [...junctions.values()].filter(
@@ -221,33 +448,68 @@ describe('並列敷設', () => {
     expect(network.getNode(untouched.b).segments).toHaveLength(1);
   });
 
-  it('谷を渡ると、線ごとに橋ができる', () => {
-    const field = new Heightfield();
-    // 中央だけ深い谷。
-    for (let iz = 0; iz <= field.cells; iz++) {
-      for (let ix = 0; ix <= field.cells; ix++) {
-        const y = Math.abs(field.worldX(ix)) < 60 ? -20 : 0;
-        field.base[field.index(ix, iz)] = y;
-        field.work[field.index(ix, iz)] = y;
-      }
-    }
+  it('谷を渡ると、並んだ線の橋が同じ位置で始まり同じ位置で終わる', () => {
+    const field = valleyField();
     const network = new Network();
-    const [span] = drawParallel(
+    const [span] = layParallel(
       network,
-      field,
-      'rail_single',
       [
         { x: -200, z: 0, y: 0 },
         { x: 200, z: 0, y: 0 },
       ],
-      { count: 2, straight: true },
-    ).map((results) => results.map((r) => r.segment));
+      2,
+      'rail_single',
+      { field },
+    );
 
+    // 揃える前は、線ごとに橋の境界が決まる。
     for (const id of span) {
       const alignment = network.alignmentOf(id);
       const runs = computeStructureProfile(alignment, field, { s0: 0, s1: alignment.length });
       expect(runs.some((run) => run.mode === 'bridge')).toBe(true);
     }
+
+    // 組み立てを通すと、橋の区間が線どうしで揃う。
+    const world = new WorldBuilder(network, field, new TerrainMesh(field, new MeshBasicMaterial()));
+    const result = world.rebuild();
+    // 橋の始まり・終わりの断面が、線どうしで真横に並ぶ。複線の 2 本目は
+    // 逆向きに敷かれているので、境界の位置 (x) を揃えて比べる。
+    const bridgeEdges = span.map((id) => {
+      const runs = (result.structures.get(id) ?? []).filter((r) => r.mode === 'bridge');
+      expect(runs).toHaveLength(1);
+      const alignment = network.alignmentOf(id);
+      return [alignment.sampleAt(runs[0].s0).pos.x, alignment.sampleAt(runs[0].s1).pos.x].sort(
+        (a, b) => a - b,
+      );
+    });
+    expect(Math.abs(bridgeEdges[0][0] - bridgeEdges[1][0])).toBeLessThan(1.5);
+    expect(Math.abs(bridgeEdges[0][1] - bridgeEdges[1][1])).toBeLessThan(1.5);
+  });
+
+  it('複線の架線柱は門型 1 基にまとまり、線路の間に立たない', () => {
+    const field = flatField();
+    const network = new Network();
+    const [span] = layParallel(network, [
+      { x: -200, z: 0, y: 0 },
+      { x: 200, z: 0, y: 0 },
+    ], 2, 'rail_single', { field });
+
+    const world = new WorldBuilder(network, field, new TerrainMesh(field, new MeshBasicMaterial()));
+    const result = world.rebuild();
+    const poles = result.props.filter((p) => p.kind === 'catenaryPole');
+    expect(poles.length).toBeGreaterThan(0);
+
+    const spacing = parallelSpacing(getClass('rail_single'));
+    const stations = new Map<number, number>();
+    for (const pole of poles) {
+      // 2 本の線路の間 (|z| < spacing/2) には立たない。
+      expect(Math.abs(pole.position.z)).toBeGreaterThan(spacing / 2);
+      const key = Math.round(pole.position.x);
+      stations.set(key, (stations.get(key) ?? 0) + 1);
+    }
+    // 同じ断面に左右 1 本ずつ (門型) が建つ。
+    for (const count of stations.values()) expect(count).toBe(2);
+    void span;
   });
 });
 

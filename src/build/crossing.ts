@@ -108,6 +108,11 @@ export interface LevelCrossingBuild {
  * 道床と枕木は舗装の下に隠れ、レールだけが頭を出す。
  */
 export interface LevelCrossingOptions {
+  /**
+   * 舗装を敷く道路の弧長の範囲。複線を渡る踏切のように、複数の交差を
+   * 1 か所の踏切としてまとめるときに渡す。省略すると交差 1 つぶん。
+   */
+  span?: { s0: number; s1: number };
   /** 遮断機を置いてよい場所か (線路や他の道路と重ならないか)。 */
   canPlace?: (x: number, z: number, y: number) => boolean;
   /** 足元の地面の高さ。 */
@@ -132,9 +137,9 @@ export function buildLevelCrossing(
   const groundY = options.groundY ?? ((_x, _z, surfaceY) => surfaceY);
 
   const halfLength = panelHalfLength(crossing, railClass);
-
-  const sRoad0 = road.s - halfLength;
-  const sRoad1 = road.s + halfLength;
+  // まとめた踏切では、いちばん外の線路の外側までが 1 枚の舗装になる。
+  const sRoad0 = Math.min(options.span?.s0 ?? Infinity, road.s - halfLength);
+  const sRoad1 = Math.max(options.span?.s1 ?? -Infinity, road.s + halfLength);
 
   paintPanel(mb, roadPath, sRoad0, sRoad1, roadClass);
 
@@ -148,10 +153,12 @@ export function buildLevelCrossing(
     // 進行方向の左 = 断面オフセットが負の側。
     const side = forward ? -1 : 1;
     // 線路や他の道路に当たる場合は、踏切から遠ざかる向きに置き直す。
-    let placed: { base: Vector3; sample: RoadSample; distance: number } | null = null;
+    let placed: { base: Vector3; sample: RoadSample; station: number } | null = null;
     for (const extra of [0, 1.5, 3, 5]) {
-      const distance = halfLength + GATE_STANDOFF + extra;
-      const sample = roadPath.sampleAt(forward ? road.s - distance : road.s + distance);
+      // 遮断機は舗装の外側。まとめた踏切では、線路の間ではなく
+      // まとまり全体の外に立つ。
+      const station = forward ? sRoad0 - GATE_STANDOFF - extra : sRoad1 + GATE_STANDOFF + extra;
+      const sample = roadPath.sampleAt(station);
       if (!sample) continue;
 
       const mode = modeAt(sample);
@@ -166,7 +173,7 @@ export function buildLevelCrossing(
       const surfaceY = sample.pos.y + roadClass.curbHeight;
       const baseY = onBridge ? surfaceY : groundY(x, z, surfaceY);
       if (!canPlace(x, z, baseY)) continue;
-      placed = { base: new Vector3(x, baseY, z), sample, distance };
+      placed = { base: new Vector3(x, baseY, z), sample, station };
       break;
     }
     if (!placed) continue;
@@ -177,8 +184,7 @@ export function buildLevelCrossing(
     gates.push({ base: placed.base, across, facing, length: boomLength });
 
     // 停止線は遮断機の少し手前。ノードを跨いだ場合はその先のセグメントに引く。
-    const stopDistance = placed.distance + 0.8;
-    const stop = roadPath.sampleAt(forward ? road.s - stopDistance : road.s + stopDistance);
+    const stop = roadPath.sampleAt(placed.station + (forward ? -0.8 : 0.8));
     if (stop) {
       stopStations.push({
         segment: stop.segment,

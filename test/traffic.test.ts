@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { Vector3 } from 'three';
 import { draw, type Waypoint } from '../src/app/sketch';
+import { CROSSWALK_DEPTH, CROSSWALK_OFFSET, STOP_LINE_OFFSET } from '../src/core/units';
 import { solveJunctions } from '../src/network/junction';
 import { Network } from '../src/network/network';
 import type { SegmentId } from '../src/network/network';
@@ -166,6 +167,47 @@ describe('交通シミュレーション', () => {
     });
     // 赤に変わってから交差点を抜けきるまでの猶予。
     expect(worst).toBeLessThan(8);
+  });
+
+  it('交差点では停止線で止まる (横断歩道を塞がない)', () => {
+    const network = crossroads();
+    const graph = laneGraphOf(network);
+    const traffic = new Traffic(graph, { seed: 7 });
+
+    // 止まっている車の先頭が、交差点の面からどれだけ手前にあるか。
+    // 見るのは行列の先頭だけ (後ろの車は前の車で止まっている)。
+    const stops: number[] = [];
+    run(traffic, 90, (vehicles) => {
+      for (const vehicle of vehicles) {
+        if (vehicle.speed > 0.05) continue;
+        const lane = graph.lanes[traffic.laneOf(vehicle)];
+        if (lane.kind !== 'segment') continue;
+        // 停止線を引くのは交差点だけ。行き止まりの転回は面の際で止まる。
+        if (!lane.next.some((id) => graph.lanes[id]?.stopLine !== undefined)) continue;
+        const front = vehicle.bodies[0].pos;
+        const edge = lane.path.poseAt(lane.path.length).pos;
+        const gap = front.distanceTo(edge) - vehicle.size.length / 2;
+        if (gap >= 12) continue;
+        const dir = vehicle.bodies[0].dir;
+        const blocked = vehicles.some((other) => {
+          if (other === vehicle) return false;
+          const to = other.bodies[other.bodies.length - 1].pos.clone().sub(front);
+          return to.dot(dir) > 0 && to.length() < 14;
+        });
+        if (!blocked) stops.push(gap);
+      }
+    });
+    expect(stops.length).toBeGreaterThan(20);
+
+    // 停止線は交差点の面から STOP_LINE_OFFSET 手前。先頭の車はそこに揃う
+    // (追従の釣り合いで数十 cm 前後する分だけを許す)。
+    for (const gap of stops) {
+      expect(gap).toBeGreaterThan(STOP_LINE_OFFSET - 0.6);
+      expect(gap).toBeLessThan(STOP_LINE_OFFSET + 1.5);
+      // 横断歩道 (交差点の面から CROSSWALK_OFFSET + CROSSWALK_DEPTH) を
+      // 塞いでいない。
+      expect(gap).toBeGreaterThan(CROSSWALK_OFFSET + CROSSWALK_DEPTH);
+    }
   });
 
   it('行き止まりでは転回して戻ってくる', () => {

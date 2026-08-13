@@ -9,17 +9,18 @@ import {
   anchorFromNode,
   anchorFromSegment,
   computePlacement,
+  placeSegment,
   type Anchor,
   type PlaceResult,
   type PlacementPreview,
 } from '../network/editing';
 import type { Network, SegmentId } from '../network/network';
 import {
-  defaultSpacing,
-  offsetCurve,
-  parallelTracks,
-  placeParallel,
-  type TrackAnchors,
+  findParallelReference,
+  parallelAlignment,
+  previewFromAlignment,
+  stationOf,
+  type ParallelReference,
 } from '../network/parallel';
 import { checkPlacement } from '../network/rules';
 import { evaluateAlignment, type SegmentDiagnostics } from '../network/validation';
@@ -46,11 +47,13 @@ export interface ToolStatus {
   radius: number;
   grade: number;
   diagnostics: SegmentDiagnostics | null;
-  snap: 'none' | 'node' | 'segment';
+  snap: 'none' | 'node' | 'segment' | 'parallel';
   hoverSegment: SegmentId | null;
   cost: number;
-  /** 並列敷設の本数。 */
-  parallel: number;
+  /** 平行スナップが有効か。 */
+  parallelSnap: boolean;
+  /** いま平行に敷こうとしている相手 (無ければ null)。 */
+  parallelTo: SegmentId | null;
   /** 空でなければ敷設できない。理由をそのまま表示する。 */
   blockers: string[];
 }
@@ -70,8 +73,8 @@ export class BuildTool {
   classId = 'road_medium';
   /** 地形からの高さ [m]。立体交差やトンネルはこれで作る。 */
   elevationOffset = 0;
-  /** 並列敷設の本数。複線・三線はこれで作る。 */
-  parallelCount = 1;
+  /** 既存の線形に平行してスナップするか。複線・側道はこれで作る。 */
+  parallelSnap = true;
 
   readonly previewGroup = new Group();
   private readonly previewMesh: Mesh;
@@ -80,12 +83,14 @@ export class BuildTool {
   private cursor: Vector3 | null = null;
   private preview: PlacementPreview | null = null;
   private endAnchor: Anchor | null = null;
-  private snapKind: 'none' | 'node' | 'segment' = 'none';
+  private snapKind: 'none' | 'node' | 'segment' | 'parallel' = 'none';
   private hoverSegment: SegmentId | null = null;
   private lastDiagnostics: SegmentDiagnostics | null = null;
   private blockers: string[] = [];
-  /** 並列敷設で、続けて引くときの各線の接続先。 */
-  private trackAnchors: TrackAnchors = [];
+  /** いま平行に敷こうとしている基準の線形。 */
+  private parallel: ParallelReference | null = null;
+  /** 平行スナップで組み立てた線形 (プレビューと同じもの)。 */
+  private parallelAlignmentPreview: Alignment | null = null;
 
   constructor(
     private readonly network: Network,
@@ -114,16 +119,10 @@ export class BuildTool {
     this.classId = classId;
   }
 
-  /** 並列敷設の本数を変える。 */
-  setParallel(count: number): void {
-    const next = clamp(Math.round(count), 1, 4);
-    if (next !== this.parallelCount) this.cancel();
-    this.parallelCount = next;
-  }
-
-  /** いま敷こうとしている並列の各線 (中心線からの横距と向き)。 */
-  private tracks(): ReturnType<typeof parallelTracks> {
-    return parallelTracks(this.cls, this.parallelCount);
+  /** 平行スナップの入り切りを変える。 */
+  setParallelSnap(on: boolean): void {
+    if (on !== this.parallelSnap) this.cancel();
+    this.parallelSnap = on;
   }
 
   adjustElevation(steps: number): void {
@@ -137,7 +136,8 @@ export class BuildTool {
     this.endAnchor = null;
     this.lastDiagnostics = null;
     this.blockers = [];
-    this.trackAnchors = [];
+    this.parallel = null;
+    this.parallelAlignmentPreview = null;
     this.updatePreviewMesh();
   }
 
@@ -167,7 +167,7 @@ export class BuildTool {
   private modifiers: CursorModifiers = { straight: false, noSnap: false };
 
   /** 現在のカーソル位置から、接続先を含めた到達点を決める。 */
-  private resolveTarget(): { anchor: Anchor; snap: 'none' | 'node' | 'segment' } {
+  private resolveTarget(): { anchor: Anchor; snap: 'none' | 'node' | 'segment' | 'parallel' } {
     const cursor = this.cursor!;
     const cls = this.cls;
     const free = new Vector3(
@@ -178,10 +178,19 @@ export class BuildTool {
 
     if (this.modifiers.noSnap) return { anchor: { pos: free }, snap: 'none' };
 
+    // 候補を集めて、カーソルからいちばん近い所へ寄せる。ノードの近くでは
+    // ノードに、路肩の外では平行の位置に付く、という素直な決まりになる。
+    const candidates: { anchor: Anchor; snap: 'node' | 'segment' | 'parallel'; distance: number }[] =
+      [];
+
     const nodeSnapRadius = Math.max(8, cls.halfWidth * 1.4);
     const node = this.network.findNodeNear(cursor, nodeSnapRadius);
     if (node) {
-      return { anchor: anchorFromNode(this.network, node, cls), snap: 'node' };
+      candidates.push({
+        anchor: anchorFromNode(this.network, node, cls),
+        snap: 'node',
+        distance: Math.hypot(node.pos.x - cursor.x, node.pos.z - cursor.z),
+      });
     }
 
     const onSegment = this.network.findSegmentNear(cursor, cls.halfWidth + 3);
@@ -189,14 +198,32 @@ export class BuildTool {
       const other = this.network.classOf(this.network.getSegment(onSegment.segment));
       // 種別が違う場合は交差 (踏切・立体交差) にしたいのでスナップしない。
       if (other.kind === cls.kind) {
-        return {
+        candidates.push({
           anchor: anchorFromSegment(this.network, onSegment.segment, onSegment.s),
           snap: 'segment',
-        };
+          distance: Math.hypot(onSegment.pos.x - cursor.x, onSegment.pos.z - cursor.z),
+        });
       }
     }
 
-    return { anchor: { pos: free }, snap: 'none' };
+    // 既存の線形の隣なら、その線形に平行な位置へ寄せる。
+    const parallel = this.findParallel(free);
+    if (parallel) {
+      candidates.push({
+        anchor: { pos: parallel.pos.clone() },
+        snap: 'parallel',
+        distance: Math.hypot(parallel.pos.x - cursor.x, parallel.pos.z - cursor.z),
+      });
+    }
+
+    const best = candidates.sort((a, b) => a.distance - b.distance)[0];
+    return best ? { anchor: best.anchor, snap: best.snap } : { anchor: { pos: free }, snap: 'none' };
+  }
+
+  /** 平行に敷ける基準の線形を探す (無効化されていれば null)。 */
+  private findParallel(at: Vector3, direction?: Vector2): ParallelReference | null {
+    if (!this.parallelSnap || this.modifiers.noSnap) return null;
+    return findParallelReference(this.network, this.cls, at, { direction });
   }
 
   private refreshPreview(): void {
@@ -207,10 +234,18 @@ export class BuildTool {
     if (!this.anchor) {
       this.preview = null;
       this.endAnchor = null;
+      this.parallelAlignmentPreview = null;
       this.updatePreviewMesh();
       return;
     }
 
+    // 平行に敷いている間は、基準の線形をそのまま横にずらした線形を引く。
+    if (this.parallel && !this.modifiers.noSnap && this.parallelPreview()) {
+      this.updatePreviewMesh();
+      return;
+    }
+
+    this.parallelAlignmentPreview = null;
     let end = target.anchor;
     if (this.modifiers.straight && target.snap === 'none') {
       end = { ...end, pos: this.snapAngle(this.anchor.pos, end.pos) };
@@ -224,6 +259,58 @@ export class BuildTool {
     this.updatePreviewMesh();
   }
 
+  /**
+   * 平行スナップのプレビューを組み立てる。
+   *
+   * 始点・カーソルをそれぞれ基準線形に投影し、その間を横にずらした線形に
+   * する。カーソルが基準の端を越えたらそこで止まるので、既存の線形の
+   * 区切り (ノード) と同じ位置で区切って敷ける。
+   */
+  private parallelPreview(): boolean {
+    const anchor = this.anchor;
+    const reference = this.parallel;
+    if (!reference || !anchor || !this.network.segments.has(reference.segment)) return false;
+
+    const solve = (ref: ParallelReference): Alignment | null => {
+      const alignment = this.network.alignmentOf(ref.segment);
+      const s0 = stationOf(alignment, anchor.pos.x, anchor.pos.z);
+      const s1 = stationOf(alignment, this.cursor!.x, this.cursor!.z);
+      return parallelAlignment(alignment, s0, s1, ref.offset);
+    };
+
+    let parallel = solve(reference);
+    if (!parallel) {
+      // 基準の端に来ている。引こうとしている向きに続く線形へ乗り換える
+      // (既存の複線を、区切りを跨いで続けて引ける)。
+      const direction = new Vector2(
+        this.cursor!.x - anchor.pos.x,
+        this.cursor!.z - anchor.pos.z,
+      );
+      const next =
+        direction.lengthSq() > 1e-6 ? this.findParallel(anchor.pos, direction.normalize()) : null;
+      if (next && next.segment !== reference.segment) {
+        this.parallel = next;
+        parallel = solve(next);
+      }
+    }
+    if (!parallel) {
+      this.preview = null;
+      this.endAnchor = null;
+      this.parallelAlignmentPreview = null;
+      return true;
+    }
+
+    this.parallelAlignmentPreview = parallel;
+    this.preview = previewFromAlignment(parallel);
+    // 既に敷いてある平行線の端に届いたら、そこへ繋ぐ。
+    const node = this.network.findNodeNear(this.preview.end, 2);
+    this.endAnchor = node
+      ? { pos: node.pos.clone(), node: node.id }
+      : { pos: this.preview.end.clone() };
+    this.snapKind = 'parallel';
+    return true;
+  }
+
   /** 始点からの方位を 15 度刻みに丸める。 */
   private snapAngle(from: Vector3, to: Vector3): Vector3 {
     const d = new Vector2(to.x - from.x, to.z - from.z);
@@ -233,50 +320,38 @@ export class BuildTool {
     return new Vector3(from.x + Math.cos(angle) * len, to.y, from.z + Math.sin(angle) * len);
   }
 
-  /** 並列の 1 本ぶんの線形。中心線のプレビューを横にずらして作る。 */
-  private trackAlignment(preview: PlacementPreview, offset: number): Alignment {
-    const horizontal = offsetCurve(preview.horizontal, offset);
+  /** いま敷こうとしている線形。 */
+  private previewAlignment(preview: PlacementPreview): Alignment {
+    if (this.parallelAlignmentPreview) return this.parallelAlignmentPreview;
     return new Alignment(
-      horizontal,
+      preview.horizontal,
       new VerticalProfile(
         this.anchor!.pos.y,
         preview.end.y,
         preview.startGrade,
         preview.endGrade,
-        horizontal.length,
+        preview.horizontal.length,
       ),
     );
   }
 
-  /** プレビューの線形を実際の断面で描き直す。並列敷設では本数ぶん描く。 */
+  /** プレビューの線形を実際の断面で描き直す。 */
   private updatePreviewMesh(): void {
     const mb = new MeshBuilder();
     const preview = this.preview;
     if (preview && this.anchor) {
       const cls = this.cls;
-      const tracks = this.tracks();
-      const blockers = new Set<string>();
-      this.lastDiagnostics = null;
-      tracks.forEach((track, i) => {
-        const alignment = this.trackAlignment(preview, track.offset);
-        // 診断は中心に近い線のものを代表として出す。
-        if (i === 0) this.lastDiagnostics = evaluateAlignment(alignment, cls);
-        // 置けるかどうかはクリック前に分かるようにする。
-        const single = tracks.length === 1;
-        for (const message of checkPlacement({
-          network: this.network,
-          cls,
-          alignment,
-          start: single ? this.anchor! : { pos: alignment.sampleAt(0).pos },
-          end: single
-            ? this.endAnchor ?? { pos: preview.end }
-            : { pos: alignment.sampleAt(alignment.length).pos },
-        }).blockers) {
-          blockers.add(message);
-        }
-        buildRibbon(mb, alignment.sample(2), profileFor(cls), { skirt: false, cls });
-      });
-      this.blockers = [...blockers];
+      const alignment = this.previewAlignment(preview);
+      this.lastDiagnostics = evaluateAlignment(alignment, cls);
+      // 置けるかどうかはクリック前に分かるようにする。
+      this.blockers = checkPlacement({
+        network: this.network,
+        cls,
+        alignment,
+        start: this.anchor,
+        end: this.endAnchor ?? { pos: preview.end },
+      }).blockers;
+      buildRibbon(mb, alignment.sample(2), profileFor(cls), { skirt: false, cls });
     } else {
       this.lastDiagnostics = null;
       this.blockers = [];
@@ -305,6 +380,9 @@ export class BuildTool {
     const target = this.resolveTarget();
     if (!this.anchor) {
       this.anchor = target.anchor;
+      // 始点が既存の線形の隣なら、そこから平行に敷き始める。既に敷いた
+      // 平行線の端 (ノード) から続ける場合も同じ。
+      this.parallel = this.findParallel(target.anchor.pos);
       this.refreshPreview();
       return;
     }
@@ -315,81 +393,33 @@ export class BuildTool {
     if (this.blockers.length > 0) return;
 
     const preview = this.preview;
-    const tracks = this.tracks();
-    const single = tracks.length === 1;
-    // 1 本のときは、スナップした接続先 (ノード・既存線形の途中) をそのまま
-    // 使う。並列のときは線ごとに端点が違うので、その位置の近くにある
-    // ノードを探して繋ぐ (既に敷いた複線の続きを引ける)。
-    const starts: TrackAnchors = single
-      ? [this.anchor]
-      : this.trackAnchors.length === tracks.length
-        ? this.trackAnchors
-        : [];
-    const ends: TrackAnchors = single ? [this.endAnchor] : [];
-
-    const results = placeParallel(
-      this.network,
-      this.classId,
-      tracks,
-      preview,
-      this.anchor.pos.y,
-      { starts, ends, snap: single ? undefined : (pos) => this.nodeNear(pos) },
-    );
+    const result = placeSegment(this.network, this.classId, this.anchor, this.endAnchor, preview);
 
     // 終点を始点にして続けて引けるようにする。接線は敷設後の線形から
     // 取り直す (折れをなめらかにした分だけ、プレビューとずれるため)。
-    this.trackAnchors = results.map((result) => {
-      const node = this.network.nodes.get(result.endNode);
-      return node ? { pos: node.pos.clone(), node: node.id } : undefined;
-    });
-    const centre = this.continuation(results, preview);
-    this.anchor = centre;
-    if (!centre) this.trackAnchors = [];
+    this.anchor = this.continuation(result, preview);
+    // 平行に敷いていたなら、基準の線形を取り直す。既存の線形の端まで
+    // 来ていれば、そのまま隣のセグメントへ引き継がれる。
+    this.parallel =
+      this.parallel && this.anchor
+        ? this.findParallel(this.anchor.pos, preview.endTangent)
+        : null;
     this.preview = null;
     this.endAnchor = null;
+    this.parallelAlignmentPreview = null;
     this.onChanged();
   }
 
-  /** その位置にあるノード (並列敷設で、隣の線を掴まないだけの近さで探す)。 */
-  private nodeNear(pos: Vector3): Anchor | undefined {
-    const radius = Math.min(4, defaultSpacing(this.cls) * 0.4);
-    const node = this.network.findNodeNear(pos, radius);
-    return node ? { pos: node.pos.clone(), node: node.id } : undefined;
-  }
-
-  /**
-   * 続けて引くための中心線のアンカー。
-   *
-   * 1 本なら敷いた線形からそのまま引き継ぐ。並列のときは中心に線が無い
-   * ことがあるので、敷いた各線の端点と接線を平均して中心を復元する。
-   */
-  private continuation(results: PlaceResult[], preview: PlacementPreview): Anchor | null {
-    const ends = results
-      .map((result) => this.network.nodes.get(result.endNode))
-      .filter((node): node is NonNullable<typeof node> => node !== undefined);
-    if (ends.length === 0) return null;
-    if (results.length === 1) {
-      const inherited = anchorFromNode(this.network, ends[0], this.cls);
-      return {
-        ...inherited,
-        tangent: inherited.tangent ?? preview.endTangent.clone(),
-        grade: inherited.grade ?? preview.endGrade,
-      };
-    }
-
-    const pos = new Vector3();
-    const tangent = new Vector2();
-    let grade = 0;
-    for (const node of ends) {
-      const inherited = anchorFromNode(this.network, node, this.cls);
-      pos.add(node.pos);
-      tangent.add(inherited.tangent ?? preview.endTangent);
-      grade += inherited.grade ?? preview.endGrade;
-    }
-    pos.divideScalar(ends.length);
-    grade /= ends.length;
-    if (tangent.lengthSq() < 1e-9) tangent.copy(preview.endTangent);
-    return { pos, tangent: tangent.normalize(), grade };
+  /** 続けて引くためのアンカー。敷いた線形から接線と勾配を引き継ぐ。 */
+  private continuation(result: PlaceResult, preview: PlacementPreview): Anchor | null {
+    const end = this.network.nodes.get(result.endNode);
+    if (!end) return null;
+    const inherited = anchorFromNode(this.network, end, this.cls);
+    return {
+      ...inherited,
+      tangent: inherited.tangent ?? preview.endTangent.clone(),
+      grade: inherited.grade ?? preview.endGrade,
+    };
   }
 
   status(): ToolStatus {
@@ -406,9 +436,10 @@ export class BuildTool {
       diagnostics: this.lastDiagnostics,
       snap: this.snapKind,
       hoverSegment: this.hoverSegment,
-      cost: length * this.cls.costPerMeter * this.parallelCount,
+      cost: length * this.cls.costPerMeter,
       blockers: this.blockers,
-      parallel: this.parallelCount,
+      parallelSnap: this.parallelSnap,
+      parallelTo: this.parallel?.segment ?? null,
     };
   }
 }

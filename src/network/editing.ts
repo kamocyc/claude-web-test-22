@@ -122,7 +122,13 @@ export function resolveAnchor(network: Network, anchor: Anchor): NetNode {
     return network.getNode(anchor.node);
   }
   if (anchor.split) {
-    return network.splitSegment(anchor.split.segment, anchor.split.s);
+    if (network.segments.has(anchor.split.segment)) {
+      return network.splitSegment(anchor.split.segment, anchor.split.s);
+    }
+    // 相手が既に分割されている (始点と終点で同じ線形に取り付いた場合など)。
+    // その点は分かれた片方の上に乗っているので、そちらを分割する。
+    const half = network.findSegmentNear(anchor.pos, 3);
+    if (half) return network.splitSegment(half.segment, half.s);
   }
   return network.addNode(anchor.pos);
 }

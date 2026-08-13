@@ -39,6 +39,13 @@ export interface Vehicle {
   color: RGB;
   /** 両ごとの姿勢 (先頭から順)。 */
   bodies: BodyPose[];
+  /**
+   * 進入すると決めた交差点の進路。
+   *
+   * 停止線を越えてから信号や進路の取り合いで気が変わると、横断歩道の上や
+   * 交差点の中で止まることになる。越える前に決め、越えたらそのまま渡る。
+   */
+  commit?: number;
 }
 
 /** 加速度・減速度 [m/s^2]。 */
@@ -54,6 +61,8 @@ const MIN_GAP = 2.5;
 const LOOKAHEAD = 90;
 /** 交差点の進路に入る前に、競合の有無を確かめ始める距離 [m]。 */
 const ENTRY_CHECK = 14;
+/** 停止線の無い進路 (分岐器・転回) で、交差点の面の手前に取る余裕 [m]。 */
+const STOP_MARGIN = 0.5;
 /** 連結する車両どうしの間隔 [m]。 */
 const COUPLING = 0.8;
 /** 車両を湧かせるときに、まわりに空けておく距離 [m]。 */
@@ -183,6 +192,10 @@ export class Traffic {
 
     // 前方の車線を順に見て、速度制限・信号・競合・前車を拾う。
     const at = this.locate(vehicle.route, vehicle.head);
+    // 進入すると決めた進路に乗ったら、そこから先は位置で押さえられる。
+    if (vehicle.commit !== undefined && vehicle.route.indexOf(vehicle.commit) <= at.index) {
+      vehicle.commit = undefined;
+    }
     let ahead = -at.s;
     for (let i = at.index; i < vehicle.route.length; i++) {
       const lane = this.graph.lanes[vehicle.route[i]];
@@ -192,24 +205,35 @@ export class Traffic {
       if (ahead <= 25) limit = Math.min(limit, lane.speedLimit);
 
       if (i > at.index && lane.kind === 'connector') {
+        // 止まる位置は停止線。停止線を引いていない進路 (分岐器・転回) は
+        // 交差点の面の際で止める。
+        const line = ahead - (lane.stopLine ?? STOP_MARGIN);
         const entry = ahead;
         // 合流先 (進路を抜けた先の車線) に空きがあるか。別の進路から
         // 合流してくる車は、互いの進路の上にいる間は見えないので、
         // 入る前にここで確かめないと重なってしまう。
         const target = lane.next[0];
         const free = target === undefined ? Infinity : tailIn.get(target) ?? Infinity;
-        if (lane.phase !== undefined && signalStateAt(this.time, lane.phase) !== 0) {
-          stopIn = Math.min(stopIn, entry - 0.5);
+        /** 進入すると決めたときの押さえ。 */
+        const reserve = (): void => {
+          // 同じ枠を 2 台が同時に取ってしまわないよう、判断した順に確定する。
+          occupied.add(lane.id);
+          if (target !== undefined) tailIn.set(target, 0);
+          // 停止線を越えていれば、もう引き返さない。
+          if (line <= 0) vehicle.commit = lane.id;
+        };
+
+        if (vehicle.commit === lane.id) {
+          reserve();
+        } else if (lane.phase !== undefined && signalStateAt(this.time, lane.phase) !== 0) {
+          stopIn = Math.min(stopIn, line);
         } else if (
           entry < ENTRY_CHECK &&
           (free < room || lane.conflicts.some((c) => occupied.has(c)))
         ) {
-          stopIn = Math.min(stopIn, entry - 0.5);
+          stopIn = Math.min(stopIn, line);
         } else if (entry < ENTRY_CHECK) {
-          // 進入すると決めたら、この場で押さえる。同じ枠を 2 台が同時に
-          // 取ってしまわないよう、判断した順に確定させる。
-          occupied.add(lane.id);
-          if (target !== undefined) tailIn.set(target, 0);
+          reserve();
         }
       }
       ahead += lane.path.length;

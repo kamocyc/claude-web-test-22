@@ -1,18 +1,16 @@
 import { Vector3 } from 'three';
-import { getClass } from '../network/classes';
+import { clamp } from '../core/units';
+import { getClass, type NetworkClass } from '../network/classes';
 import {
   anchorFromNode,
   computePlacement,
   placeSegment,
   type Anchor,
   type PlaceResult,
+  type PlacementPreview,
 } from '../network/editing';
 import type { Network } from '../network/network';
-import {
-  parallelTracks,
-  placeParallel,
-  type TrackAnchors,
-} from '../network/parallel';
+import { offsetCurve, parallelSpacing } from '../network/parallel';
 import type { Heightfield } from '../terrain/heightfield';
 
 /**
@@ -80,11 +78,45 @@ export function draw(
   return results;
 }
 
+/** 並べて敷く 1 本ぶん。 */
+interface ParallelTrack {
+  /** 中心線からの横距 [m] (進行方向の右手が正)。 */
+  offset: number;
+  /** 線形の向きを反転して敷くか。 */
+  reversed: boolean;
+}
+
+/**
+ * `count` 本を中心線の左右に振り分ける。
+ *
+ * 一方通行の種別 (線路・ランプ) を並べたときは、左側通行になるよう右半分を
+ * 逆向きに敷く。2 本並べれば複線、3 本なら中央が上り方向の三線になる。
+ */
+export function parallelTracks(
+  cls: NetworkClass,
+  count: number,
+  spacing = parallelSpacing(cls),
+): ParallelTrack[] {
+  const n = clamp(Math.round(count), 1, 8);
+  const out: ParallelTrack[] = [];
+  for (let i = 0; i < n; i++) {
+    const offset = (i - (n - 1) / 2) * spacing;
+    out.push({ offset, reversed: cls.oneWay && offset > 1e-6 });
+  }
+  return out;
+}
+
+/** 並べて敷くときの、線ごとの接続先。指定がなければ新しいノードを作る。 */
+type TrackAnchors = (Anchor | undefined)[];
+
 /**
  * 経由点を順に繋いで、同じ線形を横に並べて引く (複線・三線)。
  *
- * 各スパンで中心線を 1 度だけ解き、その曲線をずらして 1 本ずつ敷くので、
- * 並んだ線どうしの間隔はどこでも同じになる。返り値はスパンごとの結果。
+ * 敷設ツールの平行スナップと違って、**まだ何も無い所に複数の線をまとめて
+ * 置く**ためのもの。サンプルやインターチェンジのように、あらかじめ用意した
+ * 町並みを組み立てるときに使う。各スパンで中心線を 1 度だけ解き、その曲線を
+ * ずらして 1 本ずつ敷くので、並んだ線どうしの間隔はどこでも同じになる。
+ * 返り値はスパンごとの結果。
  */
 export function drawParallel(
   network: Network,
@@ -107,17 +139,16 @@ export function drawParallel(
       straight: options.straight ?? false,
       cls,
     });
-    const results = placeParallel(network, classId, tracks, preview, centre.pos.y, {
-      starts,
-      // 引き始めだけ、その位置にある既存のノードへ繋ぐ (draw と同じ)。
-      snap:
-        i === 1 && !options.start
-          ? (pos) => {
-              const node = network.findNodeNear(pos, 3);
-              return node ? { pos: node.pos.clone(), node: node.id } : undefined;
-            }
-          : undefined,
-    });
+    // 引き始めだけ、その位置にある既存のノードへ繋ぐ (draw と同じ)。
+    const snap =
+      i === 1 && !options.start
+        ? (pos: Vector3): Anchor | undefined => {
+            const node = network.findNodeNear(pos, 3);
+            return node ? { pos: node.pos.clone(), node: node.id } : undefined;
+          }
+        : undefined;
+
+    const results = placeTracks(network, classId, tracks, preview, centre.pos.y, starts, snap);
     spans.push(results);
     starts = results.map((result) => {
       const node = network.nodes.get(result.endNode);
@@ -130,6 +161,37 @@ export function drawParallel(
     };
   }
   return spans;
+}
+
+/** 中心線のプレビューから、並べる各線を 1 本ずつ敷く。 */
+function placeTracks(
+  network: Network,
+  classId: string,
+  tracks: ParallelTrack[],
+  preview: PlacementPreview,
+  startY: number,
+  starts: TrackAnchors,
+  snap?: (pos: Vector3) => Anchor | undefined,
+): PlaceResult[] {
+  const results: PlaceResult[] = [];
+  for (let i = 0; i < tracks.length; i++) {
+    const track = tracks[i];
+    const horizontal = offsetCurve(preview.horizontal, track.offset);
+    const startPos = new Vector3(horizontal.p0.x, startY, horizontal.p0.y);
+    const endPos = new Vector3(horizontal.p1.x, preview.end.y, horizontal.p1.y);
+    const start: Anchor = starts[i] ?? snap?.(startPos) ?? { pos: startPos };
+    const end: Anchor = snap?.(endPos) ?? { pos: endPos };
+    const result = placeSegment(network, classId, start, end, {
+      ...preview,
+      horizontal,
+      end: endPos,
+      endTangent: horizontal.tangentAt(horizontal.length),
+    });
+    // 逆向きの線は、敷いてから向きだけ入れ替える (形は変わらない)。
+    if (track.reversed) network.reverseSegment(result.segment);
+    results.push(result);
+  }
+  return results;
 }
 
 /**

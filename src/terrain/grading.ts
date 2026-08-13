@@ -61,6 +61,7 @@ export class TerrainGrading {
   private readonly core: Uint8Array;
   private readonly coreDistance: Float32Array;
   private readonly blocked: Uint8Array;
+  private readonly ceiling: Float32Array;
   private readonly protectedRects: ProtectedRect[] = [];
 
   constructor(field: Heightfield) {
@@ -71,6 +72,7 @@ export class TerrainGrading {
     this.core = new Uint8Array(n);
     this.coreDistance = new Float32Array(n);
     this.blocked = new Uint8Array(n);
+    this.ceiling = new Float32Array(n).fill(INF);
   }
 
   reset(): void {
@@ -78,6 +80,7 @@ export class TerrainGrading {
     this.core.fill(0);
     this.coreDistance.fill(0);
     this.blocked.fill(0);
+    this.ceiling.fill(INF);
     this.protectedRects.length = 0;
   }
 
@@ -178,6 +181,25 @@ export class TerrainGrading {
   blockQuad(a: Vector3, b: Vector3, c: Vector3, d: Vector3): void {
     this.block(a, b, c);
     this.block(a, c, d);
+  }
+
+  /**
+   * その範囲の地形を、指定した高さより上に出さない (天井)。
+   *
+   * 橋の下に使う。橋の区間では整地の伝播を止めているので、そのままだと
+   * 自然地形が残る。谷を渡るぶんには問題ないが、**近くのトンネル坑口や
+   * 立体交差の都合で「地形より低い所も橋にした」区間**では、地形が桁の
+   * 上に被さって道路が埋まってしまう。地形が桁より高い所だけを削る。
+   */
+  carveTriangle(a: Vector3, b: Vector3, c: Vector3): void {
+    this.rasterize(a, b, c, (i, y) => {
+      if (y < this.ceiling[i]) this.ceiling[i] = y;
+    });
+  }
+
+  carveQuad(a: Vector3, b: Vector3, c: Vector3, d: Vector3): void {
+    this.carveTriangle(a, b, c);
+    this.carveTriangle(a, c, d);
   }
 
   private rasterize(
@@ -288,13 +310,16 @@ export class TerrainGrading {
 
     const base = f.base;
     const work = f.work;
+    const ceiling = this.ceiling;
     for (let i = 0; i < n; i++) {
       if (blocked[i]) {
         work[i] = base[i];
-        continue;
+      } else {
+        const v = base[i];
+        work[i] = v > upper[i] ? upper[i] : v < lower[i] ? lower[i] : v;
       }
-      const v = base[i];
-      work[i] = v > upper[i] ? upper[i] : v < lower[i] ? lower[i] : v;
+      // 橋桁の下は、整地を遮断していても地形が桁より上に出てはいけない。
+      if (work[i] > ceiling[i]) work[i] = ceiling[i];
     }
   }
 }
