@@ -3,3 +3,6 @@ dist/
 .vite/
 *.log
 .DS_Store
+
+# 検証中に作る一時的なテスト (コミットしない)
+test/zz-*.test.ts
