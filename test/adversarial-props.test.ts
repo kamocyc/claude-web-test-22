@@ -1101,7 +1101,7 @@ const SCENARIOS: Scenario[] = [
   {
     name: '踏切のすぐ脇 (15 m) に交差点',
     build: (n, f) => {
-      draw(n, f, 'rail_double', [{ x: 0, z: -300 }, { x: 0, z: 300 }], { straight: true });
+      draw(n, f, 'rail_single', [{ x: 0, z: -300 }, { x: 0, z: 300 }], { straight: true });
       draw(n, f, 'road_medium', [{ x: -250, z: 0 }, { x: 250, z: 0 }], { straight: true });
       draw(n, f, 'road_small', [{ x: 15, z: -150 }, { x: 15, z: 150 }], { straight: true });
     },
@@ -1109,16 +1109,16 @@ const SCENARIOS: Scenario[] = [
   {
     name: '線路のすぐ横を並走する道路',
     build: (n, f) => {
-      draw(n, f, 'rail_double', [{ x: 0, z: -300 }, { x: 0, z: 300 }], { straight: true });
+      draw(n, f, 'rail_single', [{ x: 0, z: -300 }, { x: 0, z: 300 }], { straight: true });
       draw(n, f, 'road_medium', [{ x: 14, z: -300 }, { x: 14, z: 300 }], { straight: true });
     },
   },
-  { name: '斜め 30 度の踏切', build: crossing('rail_double', 'road_medium', 30) },
-  { name: '直交する踏切', build: crossing('rail_double', 'road_medium', 90) },
+  { name: '斜め 30 度の踏切', build: crossing('rail_single', 'road_medium', 30) },
+  { name: '直交する踏切', build: crossing('rail_single', 'road_medium', 90) },
   {
     name: '跨線橋の直下 (立体交差)',
     build: (n, f) => {
-      draw(n, f, 'rail_double', [{ x: 0, z: -300 }, { x: 0, z: 300 }], { straight: true });
+      draw(n, f, 'rail_single', [{ x: 0, z: -300 }, { x: 0, z: 300 }], { straight: true });
       draw(n, f, 'road_small', [
         { x: -150, z: 0, y: 9 },
         { x: 0, z: 0, y: 9 },
@@ -1175,7 +1175,7 @@ const SCENARIOS: Scenario[] = [
         { x: 0, z: 300, y: 14 },
       ], { straight: true });
       // 交差点の隅 (支柱の立つ辺り) を通るように、斜めに線路を通す。
-      draw(n, f, 'rail_double', [
+      draw(n, f, 'rail_single', [
         { x: -300, z: -300 + 22 },
         { x: 300, z: 300 + 22 },
       ], { straight: true });
@@ -1215,7 +1215,7 @@ const SCENARIOS: Scenario[] = [
         { x: 0, z: -300, y: 14 },
         { x: 0, z: 300, y: 14 },
       ], { straight: true });
-      draw(n, f, 'rail_double', [
+      draw(n, f, 'rail_single', [
         { x: -300, z: 26, y: 14 },
         { x: 300, z: 26, y: 14 },
       ], { straight: true });
@@ -1315,8 +1315,8 @@ const SCENARIOS: Scenario[] = [
   {
     name: '踏切が 2 箇所 (25 m 間隔) に並ぶ',
     build: (n, f) => {
-      draw(n, f, 'rail_double', [{ x: 0, z: -300 }, { x: 0, z: 300 }], { straight: true });
-      draw(n, f, 'rail_double', [{ x: 25, z: -300 }, { x: 25, z: 300 }], { straight: true });
+      draw(n, f, 'rail_single', [{ x: 0, z: -300 }, { x: 0, z: 300 }], { straight: true });
+      draw(n, f, 'rail_single', [{ x: 25, z: -300 }, { x: 25, z: 300 }], { straight: true });
       draw(n, f, 'road_medium', [{ x: -250, z: 0 }, { x: 250, z: 0 }], { straight: true });
     },
   },
@@ -1331,7 +1331,7 @@ const SCENARIOS: Scenario[] = [
         { x: 120, z: 100, y: 6 },
         { x: 200, z: 60, y: 0 },
       ]);
-      draw(n, f, 'rail_double', [
+      draw(n, f, 'rail_single', [
         { x: -200, z: 200, y: 0 },
         { x: -60, z: 190, y: 2 },
         { x: 60, z: 150, y: 4 },
@@ -1353,7 +1353,7 @@ const SCENARIOS: Scenario[] = [
     // 補正の範囲 (core) が道路方向に長く伸びる。
     name: '勾配 3% の線路を斜め 30 度で渡る踏切',
     build: (n, f) => {
-      draw(n, f, 'rail_double', [
+      draw(n, f, 'rail_single', [
         { x: -300, z: 0, y: -9 },
         { x: 300, z: 0, y: 9 },
       ], { straight: true });
@@ -1369,7 +1369,7 @@ const SCENARIOS: Scenario[] = [
     // 高さから最も離れるので、Occupancy・小物の足元の穴が出るならここ。
     name: '急勾配 (12%) の生活道路が平坦な複線を 25 度で渡る',
     build: (n, f) => {
-      draw(n, f, 'rail_double', [{ x: -300, z: 0, y: 0 }, { x: 300, z: 0, y: 0 }], {
+      draw(n, f, 'rail_single', [{ x: -300, z: 0, y: 0 }, { x: 300, z: 0, y: 0 }], {
         straight: true,
       });
       const a = (25 * Math.PI) / 180;
@@ -1385,7 +1385,7 @@ const SCENARIOS: Scenario[] = [
     // 段差 (0) を潰す余地もない。遮断機を寄せる余地もない側の挙動を見る。
     name: '勾配のある線路を歩道なしの自動車専用道が渡る',
     build: (n, f) => {
-      draw(n, f, 'rail_double', [
+      draw(n, f, 'rail_single', [
         { x: -300, z: 0, y: -6 },
         { x: 300, z: 0, y: 6 },
       ], { straight: true });
@@ -1397,7 +1397,7 @@ const SCENARIOS: Scenario[] = [
     // 溢れるので、継ぎ目で路面が段差にならないかを見る。
     name: '踏切のすぐ脇 (10 m) に道路のノード (勾配のある線路)',
     build: (n, f) => {
-      draw(n, f, 'rail_double', [
+      draw(n, f, 'rail_single', [
         { x: -300, z: 0, y: -9 },
         { x: 300, z: 0, y: 9 },
       ], { straight: true });
@@ -1412,7 +1412,7 @@ const SCENARIOS: Scenario[] = [
     // 浅い角度の踏切。舗装が線路に沿って長く伸びるので、線路の路肩
     // (架線柱の建つ位置) がまるごと道路の中に入る。
     name: '浅い角度 (14 度) の踏切',
-    build: crossing('rail_double', 'road_large', 14),
+    build: crossing('rail_single', 'road_large', 14),
   },
 
   // ---- ここから: 大きくなった分岐器のまわり ----
@@ -1420,10 +1420,10 @@ const SCENARIOS: Scenario[] = [
   {
     name: '分岐器 (30 度) と並走する道路',
     build: (n, f) => {
-      draw(n, f, 'rail_double', [{ x: -300, z: 0 }, { x: 300, z: 0 }], { straight: true });
+      draw(n, f, 'rail_single', [{ x: -300, z: 0 }, { x: 300, z: 0 }], { straight: true });
       const target = [...n.segments.keys()][0];
       n.splitSegment(target, n.alignmentOf(target).length / 2);
-      draw(n, f, 'rail_double', [{ x: 0, z: 0 }, { x: 260, z: 150 }], { straight: true });
+      draw(n, f, 'rail_single', [{ x: 0, z: 0 }, { x: 260, z: 150 }], { straight: true });
       draw(n, f, 'road_medium', [{ x: -300, z: -16 }, { x: 300, z: -16 }], { straight: true });
     },
   },
@@ -1432,11 +1432,11 @@ const SCENARIOS: Scenario[] = [
     // `minRadius * tan(角/2)` で長くなる。架線柱の建つ範囲が大きく削られる。
     name: '分岐器 (10 度・トリムが最大)',
     build: (n, f) => {
-      draw(n, f, 'rail_double', [{ x: -300, z: 0 }, { x: 300, z: 0 }], { straight: true });
+      draw(n, f, 'rail_single', [{ x: -300, z: 0 }, { x: 300, z: 0 }], { straight: true });
       const target = [...n.segments.keys()][0];
       n.splitSegment(target, n.alignmentOf(target).length / 2);
       const a = (10 * Math.PI) / 180;
-      draw(n, f, 'rail_double', [
+      draw(n, f, 'rail_single', [
         { x: 0, z: 0 },
         { x: 300 * Math.cos(a), z: 300 * Math.sin(a) },
       ], { straight: true });
@@ -1446,10 +1446,10 @@ const SCENARIOS: Scenario[] = [
     // 分岐器のすぐ先 (30 m) に踏切。分岐器の交差点面と踏切の舗装が近接する。
     name: '分岐器の 30 m 先に踏切',
     build: (n, f) => {
-      draw(n, f, 'rail_double', [{ x: -300, z: 0 }, { x: 300, z: 0 }], { straight: true });
+      draw(n, f, 'rail_single', [{ x: -300, z: 0 }, { x: 300, z: 0 }], { straight: true });
       const target = [...n.segments.keys()][0];
       n.splitSegment(target, n.alignmentOf(target).length / 2);
-      draw(n, f, 'rail_double', [{ x: 0, z: 0 }, { x: 250, z: 140 }], { straight: true });
+      draw(n, f, 'rail_single', [{ x: 0, z: 0 }, { x: 250, z: 140 }], { straight: true });
       draw(n, f, 'road_medium', [{ x: 30, z: -200 }, { x: 30, z: 200 }], { straight: true });
     },
   },
@@ -1518,7 +1518,7 @@ function rng(seed: number): () => number {
 }
 
 const ROAD_IDS = ['road_small', 'road_medium', 'road_large', 'road_highway'];
-const RAIL_IDS = ['rail_single', 'rail_double', 'rail_yard'];
+const RAIL_IDS = ['rail_single', 'rail_single', 'rail_yard'];
 
 /** 道路・線路をでたらめに何本か引く。T 字の取り付きも混ぜる。 */
 function fuzzBuild(n: Network, f: Heightfield, seed: number): void {
@@ -1580,7 +1580,7 @@ function scanJunctions(): { name: string; junction: Junction }[] {
     ['road_large', 'road_small'],
     ['road_large', 'road_medium'],
     ['road_large', 'road_large'],
-    ['rail_double', 'rail_double'],
+    ['rail_single', 'rail_single'],
   ]) {
     for (let deg = 5; deg <= 90; deg += 5) {
       for (const span of [140, 600]) {
@@ -1685,7 +1685,7 @@ describe('小物の配置 (敵対的検証)', () => {
     const bad: string[] = [];
     for (const [a, b] of [
       ['rail_single', 'rail_single'],
-      ['rail_double', 'rail_double'],
+      ['rail_single', 'rail_single'],
       ['road_small', 'road_small'],
       ['road_medium', 'road_small'],
       ['road_highway', 'road_medium'],
@@ -2464,7 +2464,7 @@ describe('小物の配置 (敵対的検証)', () => {
     for (const which of ['catenary', 'utility'] as const) {
       const f = new Heightfield();
       const n = new Network();
-      const id = which === 'catenary' ? 'rail_double' : 'road_medium';
+      const id = which === 'catenary' ? 'rail_single' : 'road_medium';
       draw(n, f, id, [{ x: -150, z: 0 }, { x: 150, z: 0 }], { straight: true });
       const segId = [...n.segments.keys()][0];
       const cls = n.classOf(n.getSegment(segId));

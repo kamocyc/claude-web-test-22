@@ -131,7 +131,10 @@ export class HorizontalCurve {
     return out.divideScalar(len);
   }
 
-  /** 弧長 s における曲率 [1/m] (符号付き、左カーブが正)。 */
+  /**
+   * 弧長 s における曲率 [1/m]。
+   * 符号は曲率中心のある側で、`perp` (進行方向の右手) 側なら正 = 右カーブ。
+   */
   curvatureAt(s: number): number {
     const t = this.tAtDistance(s);
     const d = bezierDerivative(this.p0, this.c0, this.c1, this.p1, t, _d1);

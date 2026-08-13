@@ -9,11 +9,18 @@ import {
   anchorFromNode,
   anchorFromSegment,
   computePlacement,
-  placeSegment,
   type Anchor,
+  type PlaceResult,
   type PlacementPreview,
 } from '../network/editing';
 import type { Network, SegmentId } from '../network/network';
+import {
+  defaultSpacing,
+  offsetCurve,
+  parallelTracks,
+  placeParallel,
+  type TrackAnchors,
+} from '../network/parallel';
 import { checkPlacement } from '../network/rules';
 import { evaluateAlignment, type SegmentDiagnostics } from '../network/validation';
 import { createPreviewMaterial, setPreviewBlocked } from '../render/materials';
@@ -42,6 +49,8 @@ export interface ToolStatus {
   snap: 'none' | 'node' | 'segment';
   hoverSegment: SegmentId | null;
   cost: number;
+  /** 並列敷設の本数。 */
+  parallel: number;
   /** 空でなければ敷設できない。理由をそのまま表示する。 */
   blockers: string[];
 }
@@ -61,6 +70,8 @@ export class BuildTool {
   classId = 'road_medium';
   /** 地形からの高さ [m]。立体交差やトンネルはこれで作る。 */
   elevationOffset = 0;
+  /** 並列敷設の本数。複線・三線はこれで作る。 */
+  parallelCount = 1;
 
   readonly previewGroup = new Group();
   private readonly previewMesh: Mesh;
@@ -73,6 +84,8 @@ export class BuildTool {
   private hoverSegment: SegmentId | null = null;
   private lastDiagnostics: SegmentDiagnostics | null = null;
   private blockers: string[] = [];
+  /** 並列敷設で、続けて引くときの各線の接続先。 */
+  private trackAnchors: TrackAnchors = [];
 
   constructor(
     private readonly network: Network,
@@ -101,6 +114,18 @@ export class BuildTool {
     this.classId = classId;
   }
 
+  /** 並列敷設の本数を変える。 */
+  setParallel(count: number): void {
+    const next = clamp(Math.round(count), 1, 4);
+    if (next !== this.parallelCount) this.cancel();
+    this.parallelCount = next;
+  }
+
+  /** いま敷こうとしている並列の各線 (中心線からの横距と向き)。 */
+  private tracks(): ReturnType<typeof parallelTracks> {
+    return parallelTracks(this.cls, this.parallelCount);
+  }
+
   adjustElevation(steps: number): void {
     this.elevationOffset = clamp(this.elevationOffset + steps * ELEVATION_STEP, -30, 60);
     this.refreshPreview();
@@ -112,6 +137,7 @@ export class BuildTool {
     this.endAnchor = null;
     this.lastDiagnostics = null;
     this.blockers = [];
+    this.trackAnchors = [];
     this.updatePreviewMesh();
   }
 
@@ -207,32 +233,50 @@ export class BuildTool {
     return new Vector3(from.x + Math.cos(angle) * len, to.y, from.z + Math.sin(angle) * len);
   }
 
-  /** プレビューの線形を実際の断面で描き直す。 */
+  /** 並列の 1 本ぶんの線形。中心線のプレビューを横にずらして作る。 */
+  private trackAlignment(preview: PlacementPreview, offset: number): Alignment {
+    const horizontal = offsetCurve(preview.horizontal, offset);
+    return new Alignment(
+      horizontal,
+      new VerticalProfile(
+        this.anchor!.pos.y,
+        preview.end.y,
+        preview.startGrade,
+        preview.endGrade,
+        horizontal.length,
+      ),
+    );
+  }
+
+  /** プレビューの線形を実際の断面で描き直す。並列敷設では本数ぶん描く。 */
   private updatePreviewMesh(): void {
     const mb = new MeshBuilder();
     const preview = this.preview;
     if (preview && this.anchor) {
-      const alignment = new Alignment(
-        preview.horizontal,
-        new VerticalProfile(
-          this.anchor.pos.y,
-          preview.end.y,
-          preview.startGrade,
-          preview.endGrade,
-          preview.horizontal.length,
-        ),
-      );
       const cls = this.cls;
-      this.lastDiagnostics = evaluateAlignment(alignment, cls);
-      // 置けるかどうかはクリック前に分かるようにする。
-      this.blockers = checkPlacement({
-        network: this.network,
-        cls,
-        alignment,
-        start: this.anchor,
-        end: this.endAnchor ?? { pos: preview.end },
-      }).blockers;
-      buildRibbon(mb, alignment.sample(2), profileFor(cls), { skirt: false, cls });
+      const tracks = this.tracks();
+      const blockers = new Set<string>();
+      this.lastDiagnostics = null;
+      tracks.forEach((track, i) => {
+        const alignment = this.trackAlignment(preview, track.offset);
+        // 診断は中心に近い線のものを代表として出す。
+        if (i === 0) this.lastDiagnostics = evaluateAlignment(alignment, cls);
+        // 置けるかどうかはクリック前に分かるようにする。
+        const single = tracks.length === 1;
+        for (const message of checkPlacement({
+          network: this.network,
+          cls,
+          alignment,
+          start: single ? this.anchor! : { pos: alignment.sampleAt(0).pos },
+          end: single
+            ? this.endAnchor ?? { pos: preview.end }
+            : { pos: alignment.sampleAt(alignment.length).pos },
+        }).blockers) {
+          blockers.add(message);
+        }
+        buildRibbon(mb, alignment.sample(2), profileFor(cls), { skirt: false, cls });
+      });
+      this.blockers = [...blockers];
     } else {
       this.lastDiagnostics = null;
       this.blockers = [];
@@ -270,30 +314,82 @@ export class BuildTool {
     // 規格違反・重なり・建築限界不足は置かせない。
     if (this.blockers.length > 0) return;
 
-    const result = placeSegment(
+    const preview = this.preview;
+    const tracks = this.tracks();
+    const single = tracks.length === 1;
+    // 1 本のときは、スナップした接続先 (ノード・既存線形の途中) をそのまま
+    // 使う。並列のときは線ごとに端点が違うので、その位置の近くにある
+    // ノードを探して繋ぐ (既に敷いた複線の続きを引ける)。
+    const starts: TrackAnchors = single
+      ? [this.anchor]
+      : this.trackAnchors.length === tracks.length
+        ? this.trackAnchors
+        : [];
+    const ends: TrackAnchors = single ? [this.endAnchor] : [];
+
+    const results = placeParallel(
       this.network,
       this.classId,
-      this.anchor,
-      this.endAnchor,
-      this.preview,
+      tracks,
+      preview,
+      this.anchor.pos.y,
+      { starts, ends, snap: single ? undefined : (pos) => this.nodeNear(pos) },
     );
 
     // 終点を始点にして続けて引けるようにする。接線は敷設後の線形から
     // 取り直す (折れをなめらかにした分だけ、プレビューとずれるため)。
-    const endNode = this.network.nodes.get(result.endNode);
-    if (endNode) {
-      const inherited = anchorFromNode(this.network, endNode, this.cls);
-      this.anchor = {
-        ...inherited,
-        tangent: inherited.tangent ?? this.preview.endTangent.clone(),
-        grade: inherited.grade ?? this.preview.endGrade,
-      };
-    } else {
-      this.anchor = null;
-    }
+    this.trackAnchors = results.map((result) => {
+      const node = this.network.nodes.get(result.endNode);
+      return node ? { pos: node.pos.clone(), node: node.id } : undefined;
+    });
+    const centre = this.continuation(results, preview);
+    this.anchor = centre;
+    if (!centre) this.trackAnchors = [];
     this.preview = null;
     this.endAnchor = null;
     this.onChanged();
+  }
+
+  /** その位置にあるノード (並列敷設で、隣の線を掴まないだけの近さで探す)。 */
+  private nodeNear(pos: Vector3): Anchor | undefined {
+    const radius = Math.min(4, defaultSpacing(this.cls) * 0.4);
+    const node = this.network.findNodeNear(pos, radius);
+    return node ? { pos: node.pos.clone(), node: node.id } : undefined;
+  }
+
+  /**
+   * 続けて引くための中心線のアンカー。
+   *
+   * 1 本なら敷いた線形からそのまま引き継ぐ。並列のときは中心に線が無い
+   * ことがあるので、敷いた各線の端点と接線を平均して中心を復元する。
+   */
+  private continuation(results: PlaceResult[], preview: PlacementPreview): Anchor | null {
+    const ends = results
+      .map((result) => this.network.nodes.get(result.endNode))
+      .filter((node): node is NonNullable<typeof node> => node !== undefined);
+    if (ends.length === 0) return null;
+    if (results.length === 1) {
+      const inherited = anchorFromNode(this.network, ends[0], this.cls);
+      return {
+        ...inherited,
+        tangent: inherited.tangent ?? preview.endTangent.clone(),
+        grade: inherited.grade ?? preview.endGrade,
+      };
+    }
+
+    const pos = new Vector3();
+    const tangent = new Vector2();
+    let grade = 0;
+    for (const node of ends) {
+      const inherited = anchorFromNode(this.network, node, this.cls);
+      pos.add(node.pos);
+      tangent.add(inherited.tangent ?? preview.endTangent);
+      grade += inherited.grade ?? preview.endGrade;
+    }
+    pos.divideScalar(ends.length);
+    grade /= ends.length;
+    if (tangent.lengthSq() < 1e-9) tangent.copy(preview.endTangent);
+    return { pos, tangent: tangent.normalize(), grade };
   }
 
   status(): ToolStatus {
@@ -310,8 +406,9 @@ export class BuildTool {
       diagnostics: this.lastDiagnostics,
       snap: this.snapKind,
       hoverSegment: this.hoverSegment,
-      cost: length * this.cls.costPerMeter,
+      cost: length * this.cls.costPerMeter * this.parallelCount,
       blockers: this.blockers,
+      parallel: this.parallelCount,
     };
   }
 }

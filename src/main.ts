@@ -40,6 +40,7 @@ const ui = new Ui(uiRoot, {
     ui.setClass(classId);
   },
   onElevation: (steps) => tool.adjustElevation(steps),
+  onParallel: (count) => tool.setParallel(count),
   onConnectivityColors: (on) => {
     world.colorMode = on ? 'connectivity' : 'normal';
     dirty = true;
@@ -57,8 +58,8 @@ const ui = new Ui(uiRoot, {
     tool.cancel();
     dirty = true;
   },
-  onInterchange: () => {
-    buildInterchangeDemo(network, field);
+  onInterchange: (kind) => {
+    buildInterchangeDemo(network, field, kind);
     tool.cancel();
     dirty = true;
   },
@@ -76,6 +77,7 @@ function setMode(mode: ToolMode): void {
 
 setMode('build');
 ui.setClass(tool.classId);
+ui.setParallel(tool.parallelCount);
 buildDemoNetwork(network, field);
 
 // 動作確認・デバッグ用に主要オブジェクトを公開する。

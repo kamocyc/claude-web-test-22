@@ -16,6 +16,7 @@ import {
   placeSegment,
   type Anchor,
 } from '../src/network/editing';
+import type { Junction } from '../src/network/junction';
 import { Network, type SegmentId } from '../src/network/network';
 import { WorldBuilder } from '../src/render/worldBuilder';
 import { DEFAULT_TERRAIN, generateTerrain } from '../src/terrain/generator';
@@ -721,6 +722,7 @@ function harnessDriftViolations(scene: Scene, tolerance = 0.03): Violation[] {
   const out: Violation[] = [];
   const floor = new SurfaceFloor(scene);
   const blends = blendsOf(scene);
+  const roads = roadPolylines(scene);
   let compared = 0;
   for (const seg of scene.network.segments.values()) {
     const cls = scene.network.classOf(seg);
@@ -736,6 +738,12 @@ function harnessDriftViolations(scene: Scene, tolerance = 0.03): Violation[] {
           edge.height * scale,
           new Vector3(),
         );
+        // 踏切のように他の舗装に覆われている所は、いちばん高い頂点が
+        // 相手の舗装になる。断面の外側の点 (線路なら道床の法尻) は舗装の
+        // 下に潜るので、そこを比べても検査側のずれは分からない。路端の
+        // すぐ外 (15 cm) も、頂点を探す半径 6 cm の中に相手の路端が入る。
+        const cover = cls.kind === 'rail' ? roadCoverAt(roads, p.x, p.z) : null;
+        if (cover && cover.lateral <= cover.halfWidth + 0.15) continue;
         const vertex = floor.nearestVertexXZ(p.x, p.z, 0.06, p.y, 0.5);
         if (!vertex) continue;
         const top = floor.highestAt(vertex.x, vertex.z, 0.05, p.y + 0.5);
@@ -882,7 +890,23 @@ interface Mouth {
   right: Vector3;
   cls: ReturnType<Network['classOf']>;
   innerRing: Vector3[];
+  /** その交差点に集まる全ての枝の、いちばん内側の面の高さ。 */
+  levels: number[];
   label: string;
+}
+
+/** 枝のトリム位置における、いちばん内側の面 (車道面・道床天端) の高さ。 */
+function mouthLevel(
+  scene: Scene,
+  ap: Junction['approaches'][number],
+  blends: ReturnType<typeof blendsOf>,
+): number {
+  const profile = profileFor(ap.branch.cls);
+  const levels = Math.max(1, profile.length >> 1);
+  const range = scene.result.ranges.get(ap.branch.segment)!;
+  const s = ap.branch.atStart ? range.s0 : range.s1;
+  const sample = drawnSampleAt(scene, ap.branch.segment, s, blends);
+  return sample.pos.y + profile[Math.min(levels - 1, profile.length - 1)].height + SURFACE_LIFT;
 }
 
 function junctionMouths(scene: Scene): Mouth[] {
@@ -892,11 +916,13 @@ function junctionMouths(scene: Scene): Mouth[] {
     if (junction.rings.length === 0) continue;
     const inner = junction.rings[junction.rings.length - 1];
     if (inner.length < 3) continue;
+    const levels = junction.approaches.map((ap) => mouthLevel(scene, ap, blends));
     for (const ap of junction.approaches) {
       const range = scene.result.ranges.get(ap.branch.segment)!;
       const s = ap.branch.atStart ? range.s0 : range.s1;
       const sample = drawnSampleAt(scene, ap.branch.segment, s, blends);
       out.push({
+        levels,
         origin: sample.pos.clone(),
         // 交差点から外を向く水平方向。
         forward: new Vector3(ap.dir.x, 0, ap.dir.y).normalize(),
@@ -953,6 +979,11 @@ function mouthVerticalFaceViolations(scene: Scene): Violation[] {
       // 立体交差など、別の高さにある面は無関係。
       if (Math.abs(centroid.y - expected) > 3) continue;
       const span = Math.max(tri.a.y, tri.b.y, tri.c.y) - Math.min(tri.a.y, tri.b.y, tri.c.y);
+      // 枝どうしの面の高さが違う交差点 (勾配の違う分岐器) では、交差点面は
+      // その差をどこかで吸収しなければならない。差ぶんの立ち上がりは
+      // 縁石の残りではないので見逃す。
+      const levelSpan = Math.max(...mouth.levels) - Math.min(...mouth.levels);
+      if (span <= levelSpan + 0.02) continue;
       out.push({
         amount: span,
         where: centroid.clone(),
@@ -965,12 +996,19 @@ function mouthVerticalFaceViolations(scene: Scene): Violation[] {
 }
 
 /**
- * (10) 交差点の車道面が、枝の車道面と同じ高さで繋がっているか。
+ * (10) 交差点の車道面が、枝の車道面と段差なく繋がっているか。
  *
  * 口から 5 cm だけ内側に入った点で、交差点面 (いちばん内側のリングを描画と
- * 同じ earcut で分割したもの) の高さを引き、枝のトリム位置の断面の高さと
- * 比べる。許容 0.03 m は、5 cm 内側に入る分の勾配 (12% で 0.006 m) と
- * Float32 の丸めを見込んだ値。
+ * 同じ earcut で分割したもの) の高さを引き、**その交差点に集まる枝の面の
+ * 高さの範囲**に収まっているかを見る。
+ *
+ * 枝どうしの勾配が違うと、トリム位置の面の高さは枝ごとに違う (分岐器で
+ * 本線 3.1% と側線 1.8% が分かれると、23 m 先で 0.3 m の差になる)。
+ * 交差点面はその間をつながなければならないので、口のすぐ内側でも隣の枝の
+ * 高さへ向かって傾く。「どちらの面より下にも上にも出ない」ことが段差の
+ * ない繋ぎ方の条件で、全ての枝が同じ高さなら「枝の高さと一致」に一致する。
+ * 許容 0.03 m は、5 cm 内側に入る分の勾配 (12% で 0.006 m) と Float32 の
+ * 丸めを見込んだ値。
  */
 function mouthContinuityViolations(scene: Scene, tolerance = 0.03): Violation[] {
   const out: Violation[] = [];
@@ -987,9 +1025,12 @@ function mouthContinuityViolations(scene: Scene, tolerance = 0.03): Violation[] 
       const surfaceY = polygonSurfaceY(mouth.innerRing, x, z);
       if (surfaceY === null) continue;
       const expected = mouth.origin.y + innerHeight + SURFACE_LIFT;
-      if (Math.abs(surfaceY - expected) > tolerance) {
+      const low = Math.min(expected, ...mouth.levels);
+      const high = Math.max(expected, ...mouth.levels);
+      const gap = Math.max(low - surfaceY, surfaceY - high);
+      if (gap > tolerance) {
         out.push({
-          amount: Math.abs(surfaceY - expected),
+          amount: gap,
           where: new Vector3(x, surfaceY, z),
           what: `枝の口で車道面に段差: ${mouth.label} 交差点面=${surfaceY.toFixed(3)} 枝=${expected.toFixed(3)}`,
         });
@@ -1070,7 +1111,7 @@ function crossingScene(options: {
   const rail = { x: Math.sin(rot), z: Math.cos(rot) };
   const road = { x: Math.sin(rot + angle), z: Math.cos(rot + angle) };
   return buildScene(options.terrain ?? flat(railY), (net, field) => {
-    draw(net, field, options.railClass ?? 'rail_double', [
+    draw(net, field, options.railClass ?? 'rail_single', [
       { x: -rail.x * 260, z: -rail.z * 260, y: railY },
       { x: rail.x * 260, z: rail.z * 260, y: railY },
     ], { straight: true });
@@ -1096,7 +1137,7 @@ function turnoutScene(options: {
   const mg = options.mainGrade ?? 0;
   const yg = options.yardGrade ?? 0;
   return buildScene(flat(y0), (net, field) => {
-    draw(net, field, 'rail_double', [
+    draw(net, field, 'rail_single', [
       { x: 0, z: -300, y: y0 - mg * 300 },
       { x: 0, z: 300, y: y0 + mg * 300 },
     ], { straight: true });

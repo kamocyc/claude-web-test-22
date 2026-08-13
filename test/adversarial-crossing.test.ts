@@ -643,7 +643,7 @@ function crossingScene(options: {
         y: y0 + rg * d - crest * (d / 130) ** 2,
       });
     }
-    draw(net, field, options.railClass ?? 'rail_double', railPts, { straight: true });
+    draw(net, field, options.railClass ?? 'rail_single', railPts, { straight: true });
 
     const roadPts: Waypoint[] = [];
     for (const d of [-240, -120, -45, 45, 120, 240]) {
@@ -697,7 +697,7 @@ function nodeCrossingScene(distance: number, bendDeg = 14) {
   const y0 = 40;
   const rad = (bendDeg * Math.PI) / 180;
   return buildScene(flat(y0), (net, field) => {
-    draw(net, field, 'rail_double', [
+    draw(net, field, 'rail_single', [
       { x: -260, z: 0, y: y0 },
       { x: 260, z: 0, y: y0 },
     ], { straight: true });
@@ -731,7 +731,7 @@ function railNodeCrossingScene(distance: number) {
 function junctionCrossingScene(distance: number) {
   const y0 = 40;
   return buildScene(flat(y0), (net, field) => {
-    draw(net, field, 'rail_double', [
+    draw(net, field, 'rail_single', [
       { x: -260, z: 0, y: y0 },
       { x: 260, z: 0, y: y0 },
     ], { straight: true });

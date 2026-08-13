@@ -196,7 +196,7 @@ describe('交通シミュレーション', () => {
   it('列車は線路の上だけを走る', () => {
     const network = new Network();
     const field = flatField();
-    draw(network, field, 'rail_double', [
+    draw(network, field, 'rail_single', [
       { x: -400, z: 0, y: 0 },
       { x: 0, z: 0, y: 0 },
       { x: 400, z: 0, y: 0 },
@@ -222,8 +222,8 @@ describe('交通シミュレーション', () => {
           const found = lateralOf(network, body.pos, body.dir);
           expect(found).not.toBeNull();
           expect(railIds.has(found!.segment)).toBe(true);
-          // 軌道の中心から外れない (複線の軌道間隔は 4.2 m)。
-          expect(Math.abs(found!.lateral)).toBeLessThan(3);
+          // 軌道の中心から外れない。
+          expect(Math.abs(found!.lateral)).toBeLessThan(1);
           bodies++;
         }
       }

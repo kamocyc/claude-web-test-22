@@ -144,11 +144,16 @@ export function solveApproachLanes(junction: Junction): Map<SegmentId, ApproachL
       if (otherLanes.length === 0) continue;
       const movement = movementBetween(inbound, other.dir);
       if (movement === 'uturn') continue;
-      // 中央分離帯のある道路では対向車線を横切れないので、左側通行では
-      // 右折できない。自動車専用道の出入りがランプに限られるのはこのため。
-      if (movement === 'right' && (approach.branch.cls.divided || other.branch.cls.divided)) {
-        continue;
-      }
+      // 中央分離帯のある道路では対向車線を横切れない。左側通行では、
+      // 進行方向の右手へ出る進路がそれにあたる。自動車専用道の出入りが
+      // 走行車線側 (左) のランプに限られるのは、この 1 つの規則から出る。
+      //
+      // 例外は「同じ道路がまっすぐ続く枝」で、そこは対向車線ではなく
+      // 本線そのものなので、わずかに右へ曲がっていても通れる。
+      const rightward =
+        inbound.x * other.dir.y - inbound.y * other.dir.x > 0 &&
+        !(movement === 'through' && other.branch.cls.id === approach.branch.cls.id);
+      if (rightward && (approach.branch.cls.divided || other.branch.cls.divided)) continue;
       exits.push({ movement, approach: other, lanes: otherLanes });
     }
 

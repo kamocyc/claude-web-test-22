@@ -127,6 +127,26 @@ export class Network {
     this.touch();
   }
 
+  /**
+   * セグメントの向きを反転する。端点の位置も形も変わらず、a 側と b 側が
+   * 入れ替わるだけ。並列敷設で、左側通行になるよう片側の線路を逆向きに
+   * 敷くのに使う。
+   */
+  reverseSegment(id: SegmentId): void {
+    const seg = this.getSegment(id);
+    const a = seg.a;
+    seg.a = seg.b;
+    seg.b = a;
+    const ctrlA = seg.ctrlA;
+    seg.ctrlA = seg.ctrlB;
+    seg.ctrlB = ctrlA;
+    // 弧長の向きが逆になるので、端点の勾配は入れ替えたうえで符号を反転する。
+    const gradeA = seg.gradeA;
+    seg.gradeA = -seg.gradeB;
+    seg.gradeB = -gradeA;
+    this.touch();
+  }
+
   removeSegment(id: SegmentId): void {
     const seg = this.segments.get(id);
     if (!seg) return;

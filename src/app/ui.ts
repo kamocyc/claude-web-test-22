@@ -11,10 +11,12 @@ export interface UiCallbacks {
   onVehicles: (on: boolean) => void;
   onClass: (classId: string) => void;
   onElevation: (steps: number) => void;
+  /** 並列敷設の本数を変える。 */
+  onParallel: (count: number) => void;
   onRegenerate: () => void;
   onDemo: () => void;
   /** インターチェンジのサンプルを置く。 */
-  onInterchange: () => void;
+  onInterchange: (kind: 'diamond' | 'trumpet') => void;
   onClear: () => void;
 }
 
@@ -32,6 +34,7 @@ interface ToggleSpec {
 export class Ui {
   private readonly modeButtons = new Map<ToolMode, HTMLButtonElement>();
   private readonly classButtons = new Map<string, HTMLButtonElement>();
+  private readonly parallelButtons = new Map<number, HTMLButtonElement>();
   private readonly elevationLabel: HTMLElement;
   private readonly statusBody: HTMLElement;
   private readonly warningBody: HTMLElement;
@@ -74,6 +77,21 @@ export class Ui {
     elevationRow.append(down, this.elevationLabel, up);
     left.append(elevationRow);
     left.append(hint('PageUp / PageDown でも変更できます'));
+
+    left.append(sectionTitle('並列敷設'));
+    const parallelRow = el('div', 'row');
+    for (const count of [1, 2, 3, 4]) {
+      const button = el('button', 'chip') as HTMLButtonElement;
+      button.textContent = `${count} 本`;
+      button.addEventListener('click', () => {
+        callbacks.onParallel(count);
+        this.setParallel(count);
+      });
+      this.parallelButtons.set(count, button);
+      parallelRow.append(button);
+    }
+    left.append(parallelRow);
+    left.append(hint('同じ線形を横に並べて敷きます。線路の複線はこれで作ります'));
 
     left.append(sectionTitle('表示'));
     const toggles: ToggleSpec[] = [
@@ -118,7 +136,8 @@ export class Ui {
     mapRow.append(
       button('地形を再生成', callbacks.onRegenerate),
       button('サンプル', callbacks.onDemo),
-      button('インター', callbacks.onInterchange),
+      button('ダイヤ型 IC', () => callbacks.onInterchange('diamond')),
+      button('トランペット IC', () => callbacks.onInterchange('trumpet')),
       button('全消去', callbacks.onClear),
     );
     left.append(mapRow);
@@ -159,6 +178,12 @@ export class Ui {
     }
   }
 
+  setParallel(count: number): void {
+    for (const [key, button] of this.parallelButtons) {
+      button.classList.toggle('active', key === count);
+    }
+  }
+
   updateStatus(status: ToolStatus): void {
     this.elevationLabel.textContent = `${status.elevation >= 0 ? '+' : ''}${status.elevation} m`;
 
@@ -174,6 +199,7 @@ export class Ui {
     } else {
       rows.push(['操作', status.mode === 'build' ? 'クリックで始点を指定' : '対象をクリック']);
     }
+    if (status.parallel > 1) rows.push(['並列', `${status.parallel} 本`]);
     rows.push([
       'スナップ',
       status.snap === 'node' ? 'ノード' : status.snap === 'segment' ? '既存線形' : 'なし',

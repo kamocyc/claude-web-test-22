@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { Vector3 } from 'three';
 import { buildDemoNetwork } from '../src/app/demo';
-import { buildInterchange } from '../src/app/interchange';
-import { draw, type Waypoint } from '../src/app/sketch';
+import { buildInterchange, buildTrumpetInterchange } from '../src/app/interchange';
+import { draw, drawParallel, type Waypoint } from '../src/app/sketch';
 import { solveJunctions } from '../src/network/junction';
 import { Network, type SegmentId } from '../src/network/network';
 import { buildLaneGraph, type LaneGraph } from '../src/sim/lanegraph';
@@ -58,7 +58,7 @@ function rng(seed: number): () => number {
 }
 
 const ROAD_IDS = ['road_small', 'road_medium', 'road_large', 'road_highway', 'road_ramp'];
-const RAIL_IDS = ['rail_single', 'rail_double', 'rail_yard'];
+const RAIL_IDS = ['rail_single', 'rail_yard'];
 
 /** 道路・線路をでたらめに何本か引く。T 字の取り付きも混ぜる。 */
 function fuzzBuild(network: Network, field: Heightfield, seed: number): void {
@@ -91,7 +91,22 @@ function fuzzBuild(network: Network, field: Heightfield, seed: number): void {
 
 const SCENES: (() => Scene)[] = [
   () => sceneOf('サンプル', (n, f) => buildDemoNetwork(n, f), DEFAULT_TERRAIN.seed),
-  () => sceneOf('インター', (n, f) => buildInterchange(n, f), DEFAULT_TERRAIN.seed),
+  () => sceneOf('ダイヤ型 IC', (n, f) => buildInterchange(n, f), DEFAULT_TERRAIN.seed),
+  () => sceneOf('トランペット IC', (n, f) => buildTrumpetInterchange(n, f), DEFAULT_TERRAIN.seed),
+  () =>
+    sceneOf('複線 (並列敷設)', (n, f) => {
+      drawParallel(n, f, 'rail_single', [
+        { x: -300, z: 0, y: 0 },
+        { x: 0, z: 0, y: 0 },
+        { x: 300, z: 60, y: 0 },
+      ], { count: 2 });
+      // 片側だけ側線へ分ける。
+      draw(n, f, 'rail_yard', [
+        { x: -100, z: 2.3, y: 0 },
+        { x: 20, z: 45, y: 0 },
+        { x: 140, z: 95, y: 0 },
+      ]);
+    }),
   () =>
     sceneOf('鋭角の交差点', (n, f) => {
       draw(n, f, 'road_medium', [{ x: -220, z: 0, y: 0 }, { x: 220, z: 0, y: 0 }], {
@@ -118,7 +133,7 @@ const SCENES: (() => Scene)[] = [
     }),
   () =>
     sceneOf('分岐器とクロッシング', (n, f) => {
-      draw(n, f, 'rail_double', [{ x: -300, z: 0, y: 0 }, { x: 300, z: 0, y: 0 }], {
+      draw(n, f, 'rail_single', [{ x: -300, z: 0, y: 0 }, { x: 300, z: 0, y: 0 }], {
         straight: true,
       });
       draw(n, f, 'rail_single', [{ x: 0, z: -300, y: 0 }, { x: 0, z: 300, y: 0 }], {

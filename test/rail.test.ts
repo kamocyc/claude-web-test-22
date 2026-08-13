@@ -405,9 +405,8 @@ describe('線路の分岐', () => {
     let checked = 0;
     for (const [main, branch] of [
       ['rail_single', 'rail_yard'],
-      ['rail_double', 'rail_yard'],
-      ['rail_double', 'rail_double'],
-      ['rail_yard', 'rail_double'],
+      ['rail_single', 'rail_yard'],
+      ['rail_single', 'rail_single'],
     ]) {
       for (const deg of [8, 15, 20, 25, 30, 40, 55, 70, 90]) {
         for (const [la, lb, lc] of [

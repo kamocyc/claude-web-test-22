@@ -137,7 +137,8 @@ describe('サンプルネットワーク', () => {
     expect(result.stats.segments).toBeGreaterThan(10);
     expect(result.stats.intersections).toBeGreaterThanOrEqual(1);
     expect(result.stats.turnouts).toBeGreaterThanOrEqual(1);
-    expect(result.stats.levelCrossings).toBe(1);
+    // 複線 (並列 2 本) なので、1 本の道路に対して踏切は 2 か所できる。
+    expect(result.stats.levelCrossings).toBe(2);
     expect(result.stats.bridgeLength).toBeGreaterThan(20);
     expect(result.stats.tunnelLength).toBeGreaterThan(20);
 

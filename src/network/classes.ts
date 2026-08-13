@@ -36,7 +36,10 @@ export interface NetworkClass {
    * できない (自動車専用道の出入りがランプに限られるのはこのため)。
    */
   divided: boolean;
-  /** 線路の軌道中心オフセット [m]。道路では空。 */
+  /**
+   * 軌道の中心オフセット [m]。道路では空。
+   * 線路はどの種別も 1 本 ([0]) で、複線は並列敷設で作る。
+   */
   tracks: number[];
 
   /** 規格最小曲線半径 [m]。 */
@@ -115,33 +118,32 @@ function road(opts: {
   };
 }
 
+/**
+ * 線路の種別。軌道は 1 本だけで、複線・三線は並列敷設 (`network/parallel.ts`)
+ * で作る。1 本ずつ独立した線形なので、片側だけ分岐させる・片側だけ橋にする
+ * といったことが特別扱いなしにできる。
+ */
 function rail(opts: {
   id: string;
   label: string;
-  tracks: number[];
   shoulder: number;
   minRadius: number;
   maxGrade: number;
   designSpeed: number;
   costPerMeter: number;
 }): NetworkClass {
-  const extent = Math.max(...opts.tracks.map(Math.abs)) + opts.shoulder;
   return {
     id: opts.id,
     kind: 'rail',
     label: opts.label,
-    halfWidth: extent,
-    carriagewayHalfWidth: extent,
+    halfWidth: opts.shoulder,
+    carriagewayHalfWidth: opts.shoulder,
     sidewalkWidth: 0,
     curbHeight: 0,
-    lanes: opts.tracks.map((offset, i) => ({
-      offset,
-      width: 3.0,
-      direction: (opts.tracks.length > 1 && i > 0 ? -1 : 1) as 1 | -1,
-    })),
-    oneWay: opts.tracks.length <= 1,
+    lanes: [{ offset: 0, width: 3.0, direction: 1 }],
+    oneWay: true,
     divided: false,
-    tracks: opts.tracks,
+    tracks: [0],
     minRadius: opts.minRadius,
     maxGrade: opts.maxGrade,
     cornerRadius: 0,
@@ -237,8 +239,7 @@ export const NETWORK_CLASSES: NetworkClass[] = [
   }),
   rail({
     id: 'rail_single',
-    label: '線路 (単線)',
-    tracks: [0],
+    label: '線路',
     shoulder: 2.2,
     minRadius: 120,
     maxGrade: 0.035,
@@ -246,19 +247,8 @@ export const NETWORK_CLASSES: NetworkClass[] = [
     costPerMeter: 150,
   }),
   rail({
-    id: 'rail_double',
-    label: '線路 (複線)',
-    tracks: [-2.1, 2.1],
-    shoulder: 2.2,
-    minRadius: 160,
-    maxGrade: 0.03,
-    designSpeed: 130,
-    costPerMeter: 260,
-  }),
-  rail({
     id: 'rail_yard',
     label: '側線 (低規格)',
-    tracks: [0],
     shoulder: 1.8,
     minRadius: 50,
     maxGrade: 0.02,

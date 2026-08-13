@@ -1,6 +1,6 @@
 import { Vector3 } from 'three';
-import { buildInterchange } from './interchange';
-import { draw, smoothProfile, type Waypoint } from './sketch';
+import { buildInterchange, buildTrumpetInterchange } from './interchange';
+import { draw, drawParallel, smoothProfile, type Waypoint } from './sketch';
 import type { Network } from '../network/network';
 import type { Heightfield } from '../terrain/heightfield';
 
@@ -69,16 +69,18 @@ export function buildDemoNetwork(network: Network, field: Heightfield): void {
   }
   const railPoints: Waypoint[] = railZ.map((z) => ({ x: railX, z }));
   const fixedIndices = levelZ.map((z) => ({ index: railZ.indexOf(z), y: railY }));
-  draw(
+  // 複線は 2 本の線路を並べて敷く。1 本ずつ独立した線形なので、
+  // 片側だけ分岐させたり橋にしたりできる。
+  drawParallel(
     network,
     field,
-    'rail_double',
-    smoothProfile(field, railPoints, 'rail_double', {
+    'rail_single',
+    smoothProfile(field, railPoints, 'rail_single', {
       passes: 6,
       lift: 0,
       fixed: fixedIndices,
     }),
-    { straight: true },
+    { straight: true, count: 2 },
   );
 
   // 側線への分岐。分岐器ができる。
@@ -149,10 +151,16 @@ export function buildDemoNetwork(network: Network, field: Heightfield): void {
  * 高低差の少ない所を選んで置く。本線は側道より 9 m 高いので、平らな所に
  * 置けば橋と盛土だけで収まり、ランプの勾配も規格に収まる。
  */
-export function buildInterchangeDemo(network: Network, field: Heightfield): void {
+export function buildInterchangeDemo(
+  network: Network,
+  field: Heightfield,
+  kind: 'diamond' | 'trumpet' = 'diamond',
+): void {
   network.clear();
   const spot = flattestSpot(field);
-  buildInterchange(network, field, { center: spot.center, angle: spot.angle });
+  const options = { center: spot.center, angle: spot.angle };
+  if (kind === 'trumpet') buildTrumpetInterchange(network, field, options);
+  else buildInterchange(network, field, options);
 }
 
 /** 本線と側道が通る十字の範囲で、いちばん起伏の小さい場所と向きを選ぶ。 */
