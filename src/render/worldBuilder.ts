@@ -22,6 +22,7 @@ import { buildUtilityPoles } from '../build/streetside';
 import {
   alignmentSamplesInRange,
   buildBridge,
+  buildJunctionDeck,
   buildTunnel,
   structureFootprintHalfWidth,
 } from '../build/structures';
@@ -533,6 +534,12 @@ export class WorldBuilder {
     if (!cls) return;
 
     buildJunctionSurface(surface, junction.rings, cls);
+
+    // 高い所にある交差点には床版と橋脚を付ける。付けないと路面だけが宙に浮く。
+    const terrain = this.field.baseHeightAt(node.pos.x, node.pos.z);
+    if (classify(node.pos.y, terrain) === 'bridge' && junction.rings.length > 0) {
+      buildJunctionDeck(structure, junction.rings[0], cls, this.field);
+    }
 
     if (cls.kind === 'rail') {
       for (const connection of junction.connections) {

@@ -91,6 +91,7 @@ function pushAll(dst: number[], src: readonly number[]): void {
 
 const WHITE: readonly [number, number, number] = [1, 1, 1];
 export const UP = new Vector3(0, 1, 0);
+const DOWN = new Vector3(0, -1, 0);
 
 /** XZ 平面上のリングの符号付き面積。正なら (X, Z) 平面で反時計回り。 */
 export function signedAreaXZ(ring: readonly Vector3[]): number {
@@ -113,6 +114,8 @@ export function fillPolygon(
   color: readonly [number, number, number],
   uvScale = 0.1,
   grade = 0,
+  /** 下向きの面にする (橋桁の底面など)。 */
+  downward = false,
 ): void {
   if (ring.length < 3) return;
   const flat: number[] = [];
@@ -120,11 +123,12 @@ export function fillPolygon(
   const tris = earcutXZ(flat);
   if (tris.length === 0) return;
   const base = mb.vertexCount;
+  const normal = downward ? DOWN : UP;
   for (const p of ring) {
-    mb.vertex(p, UP, p.x * uvScale, p.z * uvScale, color, grade, 0);
+    mb.vertex(p, normal, p.x * uvScale, p.z * uvScale, color, grade, 0);
   }
-  // earcut の出力はリングの巻き方向に従うため、上向きになるよう三角形ごとに揃える。
-  const flipAll = signedAreaXZ(ring) > 0;
+  // earcut の出力はリングの巻き方向に従うため、狙った向きになるよう揃える。
+  const flipAll = signedAreaXZ(ring) > 0 !== downward;
   for (let i = 0; i < tris.length; i += 3) {
     if (flipAll) mb.triangle(base + tris[i], base + tris[i + 2], base + tris[i + 1]);
     else mb.triangle(base + tris[i], base + tris[i + 1], base + tris[i + 2]);

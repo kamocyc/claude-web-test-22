@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { MeshBasicMaterial } from 'three';
+import { Mesh, MeshBasicMaterial, Vector3 } from 'three';
 import { buildDemoNetwork } from '../src/app/demo';
 import { profileFor } from '../src/build/surface';
+import { getClass } from '../src/network/classes';
+import { anchorFromNode, computePlacement, placeSegment, type Anchor } from '../src/network/editing';
 import { Network } from '../src/network/network';
 import { findCrossings } from '../src/network/crossings';
 import { WorldBuilder } from '../src/render/worldBuilder';
@@ -22,6 +24,58 @@ function buildWorld(seed = DEFAULT_TERRAIN.seed) {
   const world = new WorldBuilder(network, field, terrainMesh);
   return { field, network, world, result: world.rebuild() };
 }
+
+/** 建設ツールと同じ手順で線形を引く (経由点は絶対座標)。 */
+function draw(network: Network, classId: string, points: Vector3[]): void {
+  const cls = getClass(classId);
+  const existing = network.findNodeNear(points[0], 3);
+  let anchor: Anchor = existing
+    ? anchorFromNode(network, existing, cls)
+    : { pos: points[0].clone() };
+  for (let i = 1; i < points.length; i++) {
+    const preview = computePlacement(anchor, points[i], { straight: true, cls });
+    const result = placeSegment(network, classId, anchor, { pos: points[i].clone() }, preview);
+    const endNode = network.nodes.get(result.endNode);
+    if (!endNode) break;
+    anchor = {
+      pos: endNode.pos.clone(),
+      node: endNode.id,
+      tangent: preview.endTangent.clone(),
+      grade: preview.endGrade,
+    };
+  }
+}
+
+describe('立体交差の上の交差点', () => {
+  it('床版と橋脚が付き、路面だけが宙に浮かない', () => {
+    const field = new Heightfield();
+    generateTerrain(field, DEFAULT_TERRAIN);
+    const network = new Network();
+    const y = field.baseHeightAt(0, 0) + 14;
+    draw(network, 'road_medium', [new Vector3(-120, y, 0), new Vector3(120, y, 0)]);
+    draw(network, 'road_small', [new Vector3(0, y, -120), new Vector3(0, y, 120)]);
+
+    const world = new WorldBuilder(network, field, new TerrainMesh(field, new MeshBasicMaterial()));
+    const result = world.rebuild();
+    expect(result.stats.intersections).toBe(1);
+
+    let junction = null;
+    for (const [, j] of world.junctions) if (j.kind === 'intersection') junction = j;
+    expect(junction).not.toBeNull();
+    const node = network.getNode(junction!.node).pos;
+    expect(node.y - field.baseHeightAt(node.x, node.z)).toBeGreaterThan(8);
+
+    // 交差点の下に構造物 (桁・橋脚) の頂点があること。
+    const structures = world.group.children.find((o) => o.name === 'structures') as Mesh;
+    const position = structures.geometry.attributes.position;
+    let under = 0;
+    for (let i = 0; i < position.count; i++) {
+      const near = Math.hypot(position.getX(i) - node.x, position.getZ(i) - node.z) < 12;
+      if (near && position.getY(i) < node.y) under++;
+    }
+    expect(under).toBeGreaterThan(0);
+  });
+});
 
 describe('サンプルネットワーク', () => {
   it('交差点・分岐器・踏切・立体交差・橋・トンネルが一通りできる', () => {

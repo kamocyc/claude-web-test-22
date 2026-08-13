@@ -1,6 +1,6 @@
 import { Vector3 } from 'three';
 import type { Alignment, AlignmentSample } from '../core/alignment';
-import type { MeshBuilder } from '../core/meshbuilder';
+import { extrudeSkirt, fillPolygon, type MeshBuilder } from '../core/meshbuilder';
 import { DECK_THICKNESS, SURFACE_LIFT } from '../core/units';
 import type { NetworkClass } from '../network/classes';
 import type { Heightfield } from '../terrain/heightfield';
@@ -170,6 +170,63 @@ function buildAbutment(
     CONCRETE,
   );
 }
+
+/**
+ * 高い所にある交差点の床版。
+ *
+ * 交差点面はセグメントと違って構造物を持たないので、立体交差の上に交差点を
+ * 作ると路面だけが宙に浮いて見える。リングを下へ押し出して桁の側面と底面を
+ * 作り、必要なら中央に橋脚を建てる。
+ */
+export function buildJunctionDeck(
+  mb: MeshBuilder,
+  ring: Vector3[],
+  cls: NetworkClass,
+  field: Heightfield,
+): void {
+  if (ring.length < 3) return;
+  const top = ring.map((p) => new Vector3(p.x, p.y + SURFACE_LIFT - 0.15, p.z));
+  extrudeSkirt(mb, top, DECK_THICKNESS, GIRDER);
+  fillPolygon(
+    mb,
+    top.map((p) => new Vector3(p.x, p.y - DECK_THICKNESS, p.z)),
+    CONCRETE_DARK,
+    0.1,
+    0,
+    true,
+  );
+
+  const centre = new Vector3();
+  for (const p of top) centre.add(p);
+  centre.divideScalar(top.length);
+  const ground = field.baseHeightAt(centre.x, centre.z);
+  const bottom = centre.y - DECK_THICKNESS;
+  const height = bottom - ground;
+  if (height < MIN_PIER_HEIGHT) return;
+
+  const thickness = Math.min(1.6, 0.6 + height * 0.05);
+  addBox(
+    mb,
+    new Vector3(centre.x, (bottom + ground - 1.2) / 2, centre.z),
+    AXIS_X,
+    UP,
+    AXIS_Z,
+    { x: cls.halfWidth * 0.4, y: (height + 1.2) / 2, z: thickness },
+    CONCRETE,
+  );
+  addBox(
+    mb,
+    new Vector3(centre.x, ground - 0.6, centre.z),
+    AXIS_X,
+    UP,
+    AXIS_Z,
+    { x: cls.halfWidth * 0.5, y: 0.9, z: thickness + 0.8 },
+    CONCRETE_DARK,
+  );
+}
+
+const AXIS_X = new Vector3(1, 0, 0);
+const AXIS_Z = new Vector3(0, 0, 1);
 
 /** トンネル断面の内空 (アーチ) の断面点を返す。 */
 function tunnelSection(cls: NetworkClass): { offset: number; height: number }[] {
