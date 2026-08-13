@@ -230,20 +230,32 @@ function buildPortal(
 ): void {
   const openingHalf = Math.max(...section.map((p) => p.offset));
   const crown = Math.max(...section.map((p) => p.height));
-  const ground = field.baseHeightAt(sample.pos.x, sample.pos.z);
-  const wallTop = Math.max(ground + 1.6, sample.pos.y + crown + 1.4);
   const bottom = sample.pos.y - 2.5;
-
   const pillarHalf = 1.1;
+
+  /**
+   * 坑門は地山の切り立った面を塞ぐためのもの。
+   * 土被りが深い所 (長いトンネルの途中でセグメントが分かれた所など) では
+   * 坑門そのものが地中にあるので、地表より高く立ち上げてはいけない。
+   * そうしないと、山の斜面から壁だけが飛び出して見える。
+   * 斜面では左右で地面の高さが違うので、柱ごとに足元の地面を見る。
+   */
+  const topAt = (x: number, z: number): number => {
+    const ground = Math.min(field.baseHeightAt(x, z), field.heightAt(x, z));
+    const exposed = sample.pos.y + crown + 1.4;
+    return ground > exposed ? Math.max(exposed, ground - 0.4) : Math.max(ground + 1.6, exposed);
+  };
+
+  let lowestTop = Infinity;
   for (const side of [-1, 1]) {
-    const center = new Vector3(
-      sample.pos.x + sample.right.x * side * (openingHalf + pillarHalf),
-      (wallTop + bottom) / 2,
-      sample.pos.z + sample.right.z * side * (openingHalf + pillarHalf),
-    );
+    const x = sample.pos.x + sample.right.x * side * (openingHalf + pillarHalf);
+    const z = sample.pos.z + sample.right.z * side * (openingHalf + pillarHalf);
+    const wallTop = topAt(x, z);
+    lowestTop = Math.min(lowestTop, wallTop);
+    if (wallTop <= bottom + 0.2) continue;
     addBox(
       mb,
-      center,
+      new Vector3(x, (wallTop + bottom) / 2, z),
       sample.right,
       UP,
       sample.forward,
@@ -253,14 +265,15 @@ function buildPortal(
   }
 
   const lintelBottom = sample.pos.y + crown;
-  if (wallTop > lintelBottom) {
+  const lintelTop = Math.min(lowestTop, topAt(sample.pos.x, sample.pos.z));
+  if (lintelTop > lintelBottom) {
     addBox(
       mb,
-      new Vector3(sample.pos.x, (wallTop + lintelBottom) / 2, sample.pos.z),
+      new Vector3(sample.pos.x, (lintelTop + lintelBottom) / 2, sample.pos.z),
       sample.right,
       UP,
       sample.forward,
-      { x: openingHalf + pillarHalf * 2, y: (wallTop - lintelBottom) / 2, z: 0.7 },
+      { x: openingHalf + pillarHalf * 2, y: (lintelTop - lintelBottom) / 2, z: 0.7 },
       CONCRETE,
     );
   }
