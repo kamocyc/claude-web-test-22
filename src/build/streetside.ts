@@ -10,8 +10,9 @@ import type { RGB } from './surface';
 /**
  * 路側の設備 (電柱と架空配電線)。
  *
- * 交差点・踏切・他の線形と重ならない所だけに立てる。判定は呼び出し側から
- * 渡される `canPlace` に任せ、ここでは形状だけを作る。
+ * 配電線は**途切れさせない**。電柱を建てられない所 (橋・トンネル・線路の
+ * 架線・他の線形と支障する所) では、その手前で地中に引き込み、向こう側で
+ * また立ち上げる。地上に線が無くても電力網としては繋がったままにする。
  */
 
 const CONCRETE: RGB = [0.66, 0.65, 0.62];
@@ -19,6 +20,8 @@ const CONCRETE_DARK: RGB = [0.52, 0.51, 0.49];
 const WIRE: RGB = [0.14, 0.14, 0.16];
 const INSULATOR: RGB = [0.34, 0.36, 0.38];
 const TRANSFORMER: RGB = [0.46, 0.45, 0.44];
+const CABLE_HEAD: RGB = [0.3, 0.31, 0.33];
+const HANDHOLE: RGB = [0.55, 0.55, 0.54];
 
 /** 電柱を建てる間隔 [m]。 */
 export const POLE_PITCH = 38;
@@ -31,35 +34,47 @@ const ARM_HALF = 0.85;
 /** 架線を張る横位置 (腕金上の位置)。 */
 const WIRE_OFFSETS = [-0.62, 0, 0.62];
 
-export interface UtilityPoleOptions {
-  /** その地点に立ててよいか (他の線形・交差点と重ならないか)。 */
-  canPlace: (x: number, z: number, y: number) => boolean;
-  /** 足元の地面の高さ。整地後の地形と路肩の高い方を返すこと。 */
-  groundY: (x: number, z: number, surfaceY: number) => number;
-  pitch?: number;
-  /** 通し番号の起点。区間をまたいで柱上変圧器の位置が揃うようにする。 */
-  serial?: number;
-}
-
-export interface UtilityPole {
+/** 建てる場所が決まった電柱。 */
+export interface PolePlan {
+  /** 通し番号 (間隔の格子上の位置)。飛んだ番号は建てられなかった所。 */
+  index: number;
+  /** 線形上の弧長 [m]。 */
+  station: number;
   /** 足元の位置。 */
   base: Vector3;
   /** 腕金の伸びる向き (道路を横切る向き)。 */
   across: Vector3;
-  /** 線路・道路の進行方向。 */
+  /** 道路の進行方向。 */
   along: Vector3;
 }
 
+/** 電柱の間の配電線。 */
+export interface PowerSpan {
+  a: PolePlan;
+  b: PolePlan;
+  /** 地中に潜る区間か。 */
+  underground: boolean;
+}
+
+export interface PolePlanOptions {
+  /** その地点に立ててよいか (他の線形・交差点・構造物と重ならないか)。 */
+  canPlace: (x: number, z: number, y: number) => boolean;
+  /** 足元の地面の高さ。 */
+  groundY: (x: number, z: number, surfaceY: number) => number;
+  pitch?: number;
+}
+
 /**
- * 線形に沿って電柱を建て、隣り合う柱の間に配電線を張る。
- * 建てられた電柱の一覧を返す (検証・デバッグ用)。
+ * 線形に沿って電柱の位置を決める。
+ *
+ * 建てられない所は飛ばすが、通し番号 (`index`) は進めるので、呼び出し側は
+ * 番号の飛びから「ここは地中に入る」と判断できる。
  */
-export function buildUtilityPoles(
-  mb: MeshBuilder,
+export function planUtilityPoles(
   samples: AlignmentSample[],
   cls: NetworkClass,
-  options: UtilityPoleOptions,
-): UtilityPole[] {
+  options: PolePlanOptions,
+): PolePlan[] {
   if (cls.kind !== 'road' || cls.sidewalkWidth < 1.0 || samples.length < 2) return [];
 
   const pitch = options.pitch ?? POLE_PITCH;
@@ -67,14 +82,14 @@ export function buildUtilityPoles(
   const total = samples[samples.length - 1].s - s0;
   if (total < 12) return [];
 
-  // 電柱は片側にまとめて建てる。塞がっていない候補が多い方を選ぶ。
-  const offset = cls.halfWidth - 0.55;
   // 区間を等分して置く。端に寄せて置くと、セグメントの継ぎ目で間隔が
   // 詰まったり空いたりして目立つ。
+  const offset = cls.halfWidth - 0.55;
   const count = Math.max(1, Math.round(total / pitch));
   const stations: number[] = [];
   for (let i = 0; i < count; i++) stations.push(s0 + (total * (i + 0.5)) / count);
 
+  // 電柱は片側にまとめて建てる。塞がっていない候補が多い方を選ぶ。
   let side = -1;
   let bestFree = -1;
   for (const candidate of [-1, 1]) {
@@ -94,36 +109,20 @@ export function buildUtilityPoles(
   }
   if (bestFree <= 0) return [];
 
-  const poles: UtilityPole[] = [];
-  // 配電線は、間に建てられなかった所があれば張らない (道路を斜めに横切る
-  // 電線ができてしまうため)。
-  let previous: { pole: UtilityPole; station: number } | null = null;
-  let serial = options.serial ?? 0;
-
-  for (const s of stations) {
-    const placed = positionAt(samples, s, offset * side);
-    const groundY = placed
-      ? options.groundY(placed.pos.x, placed.pos.z, placed.pos.y)
-      : 0;
-    if (!placed || !options.canPlace(placed.pos.x, placed.pos.z, groundY)) {
-      previous = null;
-      serial++;
-      continue;
-    }
-    const base = new Vector3(placed.pos.x, groundY - 0.15, placed.pos.z);
-    const across = placed.sample.right.clone().multiplyScalar(side).setY(0).normalize();
-    const along = placed.sample.forward.clone().setY(0).normalize();
-    const pole: UtilityPole = { base, across, along };
-
-    addPole(mb, pole, serial);
-    if (previous && s - previous.station < pitch * 2) {
-      addSpanWires(mb, previous.pole, pole);
-    }
-    poles.push(pole);
-    previous = { pole, station: s };
-    serial++;
-  }
-
+  const poles: PolePlan[] = [];
+  stations.forEach((station, index) => {
+    const placed = positionAt(samples, station, offset * side);
+    if (!placed) return;
+    const ground = options.groundY(placed.pos.x, placed.pos.z, placed.pos.y);
+    if (!options.canPlace(placed.pos.x, placed.pos.z, ground)) return;
+    poles.push({
+      index,
+      station,
+      base: new Vector3(placed.pos.x, ground - 0.15, placed.pos.z),
+      across: placed.sample.right.clone().multiplyScalar(side).setY(0).normalize(),
+      along: placed.sample.forward.clone().setY(0).normalize(),
+    });
+  });
   return poles;
 }
 
@@ -142,7 +141,24 @@ function positionAt(
   return { pos, sample };
 }
 
-function addPole(mb: MeshBuilder, pole: UtilityPole, serial: number): void {
+/** 電柱と配電線を作る。 */
+export function buildPowerLine(mb: MeshBuilder, poles: PolePlan[], spans: PowerSpan[]): void {
+  // 地中に入る端の柱には、腕金から足元まで引き下げる管を付ける。
+  const risers = new Set<PolePlan>();
+  for (const span of spans) {
+    if (!span.underground) continue;
+    risers.add(span.a);
+    risers.add(span.b);
+  }
+
+  poles.forEach((pole, serial) => addPole(mb, pole, serial, risers.has(pole)));
+  for (const span of spans) {
+    if (span.underground) continue;
+    addSpanWires(mb, span.a, span.b);
+  }
+}
+
+function addPole(mb: MeshBuilder, pole: PolePlan, serial: number, riser: boolean): void {
   const up = new Vector3(0, 1, 0);
   const { base, across, along } = pole;
 
@@ -207,10 +223,43 @@ function addPole(mb: MeshBuilder, pole: UtilityPole, serial: number): void {
       TRANSFORMER,
     );
   }
+
+  if (riser) addRiser(mb, pole);
+}
+
+/**
+ * 地中への引き込み。腕金の高さから足元まで管を下ろし、根元に
+ * ハンドホール (点検口) を置く。ここから先は地中線として繋がっている。
+ */
+function addRiser(mb: MeshBuilder, pole: PolePlan): void {
+  const up = new Vector3(0, 1, 0);
+  const top = ARM_HEIGHTS[ARM_HEIGHTS.length - 1] + 0.3;
+  addBox(
+    mb,
+    pole.base
+      .clone()
+      .add(new Vector3(0, top / 2, 0))
+      .addScaledVector(pole.across, -0.22),
+    pole.across,
+    up,
+    pole.along,
+    { x: 0.09, y: top / 2, z: 0.09 },
+    CABLE_HEAD,
+  );
+  addBox(
+    mb,
+    pole.base.clone().add(new Vector3(0, 0.06, 0)).addScaledVector(pole.along, 0.9),
+    pole.across,
+    up,
+    pole.along,
+    { x: 0.45, y: 0.06, z: 0.32 },
+    HANDHOLE,
+  );
 }
 
 /** 2 本の電柱の間に配電線を張る。 */
-function addSpanWires(mb: MeshBuilder, a: UtilityPole, b: UtilityPole): void {
+function addSpanWires(mb: MeshBuilder, a: PolePlan, b: PolePlan): void {
+  const sag = Math.min(0.5, 0.12 + a.base.distanceTo(b.base) * 0.006);
   for (const height of ARM_HEIGHTS) {
     for (const offset of WIRE_OFFSETS) {
       const from = a.base
@@ -221,7 +270,7 @@ function addSpanWires(mb: MeshBuilder, a: UtilityPole, b: UtilityPole): void {
         .clone()
         .add(new Vector3(0, height + 0.26, 0))
         .addScaledVector(b.across, offset);
-      addWire(mb, from, to, 0.35, 0.025, WIRE);
+      addWire(mb, from, to, sag, 0.025, WIRE);
     }
   }
 }

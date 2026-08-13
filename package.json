@@ -21,6 +21,7 @@
   "devDependencies": {
     "@types/earcut": "^3.0.0",
     "@types/three": "^0.185.0",
+    "playwright": "^1.62.1",
     "typescript": "^5.9.3",
     "vite": "^7.0.0",
     "vitest": "^3.0.0"

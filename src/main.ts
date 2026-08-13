@@ -40,6 +40,10 @@ const ui = new Ui(uiRoot, {
     ui.setClass(classId);
   },
   onElevation: (steps) => tool.adjustElevation(steps),
+  onConnectivityColors: (on) => {
+    world.colorMode = on ? 'connectivity' : 'normal';
+    dirty = true;
+  },
   onRegenerate: () => {
     terrainSeed = (terrainSeed * 1664525 + 1013904223) >>> 0;
     generateTerrain(field, { ...DEFAULT_TERRAIN, seed: terrainSeed });

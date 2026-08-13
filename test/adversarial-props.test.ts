@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { MeshBasicMaterial, Vector3 } from 'three';
 import { buildDemoNetwork } from '../src/app/demo';
 import { buildCatenary } from '../src/build/rail';
-import { buildUtilityPoles } from '../src/build/streetside';
+import { buildPowerLine, planUtilityPoles } from '../src/build/streetside';
 import { profileFor } from '../src/build/surface';
 import { MeshBuilder } from '../src/core/meshbuilder';
 import { SURFACE_LIFT } from '../src/core/units';
@@ -1392,10 +1392,18 @@ describe('小物の配置 (敵対的検証)', () => {
       if (which === 'catenary') {
         buildCatenary(mb, samples, cls, { canPlace: (x) => !blocked(x) });
       } else {
-        buildUtilityPoles(mb, samples, cls, {
+        // 電柱は「位置を決める」→「線を張る」の 2 段階。塞いだ帯には柱が
+        // 建たず、その前後の径間は地中に潜る (架空線を張らない)。
+        const poles = planUtilityPoles(samples, cls, {
           canPlace: (x) => !blocked(x),
-          groundY: (_x, _z, y) => y,
+          groundY: (_x: number, _z: number, y: number) => y,
         });
+        const spans = poles.slice(1).map((b, i) => ({
+          a: poles[i],
+          b,
+          underground: b.index !== poles[i].index + 1,
+        }));
+        buildPowerLine(mb, poles, spans);
       }
       const pos = mb.build().getAttribute('position');
       // 検査が空振りしていないこと (帯の外には柱が建っていること)。

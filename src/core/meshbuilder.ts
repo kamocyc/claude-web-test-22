@@ -162,6 +162,8 @@ export function extrudeSkirtTo(
   bottom: number[],
   color: readonly [number, number, number],
   closed = true,
+  /** 辺 i を作るか (交差点の枝の口を飛ばすのに使う)。 */
+  include: (i: number) => boolean = () => true,
 ): void {
   const n = ring.length;
   if (n < 2 || bottom.length < n) return;
@@ -169,6 +171,7 @@ export function extrudeSkirtTo(
   const normal = new Vector3();
   const last = closed ? n : n - 1;
   for (let i = 0; i < last; i++) {
+    if (!include(i)) continue;
     const j = (i + 1) % n;
     const a = ring[i];
     const b = ring[j];

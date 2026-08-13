@@ -59,6 +59,13 @@ export interface Junction {
   rings: Vector3[][];
   /** いちばん外側のリング (`rings[0]`)。整地の footprint や当たり判定に使う。 */
   ring: Vector3[];
+  /**
+   * リングの辺 i (点 i → 点 i+1) が「枝の口」かどうか。
+   *
+   * 枝の口ではセグメントの帯がそのまま続くので、歩道・縁石の帯や垂れ壁を
+   * 作ってはいけない (道路を横切る縁石ができてしまう)。
+   */
+  openEdge: boolean[];
   /** 信号制御されるか。 */
   signalized: boolean;
   /** 線路分岐での接続関係。 */
@@ -133,8 +140,10 @@ export function solveJunctions(
         updateApproachGeometry(network, ap, heightOffset);
       }
     }
-    junction.rings = buildRings(junction);
-    junction.ring = junction.rings[0] ?? [];
+    const built = buildRings(junction);
+    junction.rings = built.rings;
+    junction.ring = built.rings[0] ?? [];
+    junction.openEdge = built.openEdge;
     // 交差角が鋭すぎると枝の断面どうしが重なり、交差点面がねじれる。
     // 形を破綻させずに解く一般的な方法がないので、警告して知らせる。
     if (selfIntersects(junction.ring)) {
@@ -254,6 +263,7 @@ function solveNode(
     approaches,
     rings: [],
     ring: [],
+    openEdge: [],
     signalized,
     connections,
     warnings,
@@ -371,16 +381,18 @@ function sectionPoint(pos: Vector3, normal: Vector2, p: ProfilePoint): Vector3 {
  * する 2 次ベジエで隅丸めを入れる。全てのリングは同じ手順・同じ点数で作る
  * ので、隣り合うリングの間を帯で埋めれば交差点の歩道・縁石まで表現できる。
  */
-function buildRings(junction: Junction): Vector3[][] {
+function buildRings(junction: Junction): { rings: Vector3[][]; openEdge: boolean[] } {
   const aps = junction.approaches;
   const n = aps.length;
-  if (n < 2 || junction.kind === 'seam' || junction.kind === 'end') return [];
-  if (aps.every((a) => a.trim < 1e-3)) return [];
+  const empty = { rings: [], openEdge: [] };
+  if (n < 2 || junction.kind === 'seam' || junction.kind === 'end') return empty;
+  if (aps.every((a) => a.trim < 1e-3)) return empty;
 
   // 断面の点数は種別によって違う。いちばん多い枝に合わせ、足りない枝は
   // 内側の点を繰り返して幅 0 の帯にする。
   const levels = Math.max(...aps.map((a) => Math.max(1, a.section.length >> 1)));
   const rings: Vector3[][] = Array.from({ length: levels }, () => []);
+  const openEdge: boolean[] = [];
 
   for (let i = 0; i < n; i++) {
     const cur = aps[i];
@@ -388,6 +400,8 @@ function buildRings(junction: Junction): Vector3[][] {
     for (let k = 0; k < levels; k++) {
       rings[k].push(sideOf(cur, k, 'prev'), sideOf(cur, k, 'next'));
     }
+    // 断面の 2 点を結ぶ辺は枝の口。その先 (隅丸め) は交差点の外周。
+    openEdge.push(true, false);
 
     // 隅丸めを入れるかどうかは、外側のリングで一度だけ決める。
     // レベルごとに判定すると点数が揃わず、帯が組めなくなる。
@@ -404,10 +418,11 @@ function buildRings(junction: Junction): Vector3[][] {
           rings[k].push(quadratic(a, corner, b, t / 4));
         }
       }
+      openEdge.push(false, false, false);
     }
   }
 
-  return dedupeRings(rings);
+  return dedupeRings(rings, openEdge);
 }
 
 /** 断面の外側から `k` 番目の点を、指定した側で取り出す。 */
@@ -451,9 +466,12 @@ function quadratic(a: Vector3, c: Vector3, b: Vector3, t: number): Vector3 {
  * 重なった点を落とす。どのリングも同じ頂点数でなければ帯が作れないので、
  * いちばん外側のリングで残す点を決め、全リングに同じ取捨を適用する。
  */
-function dedupeRings(rings: Vector3[][]): Vector3[][] {
+function dedupeRings(
+  rings: Vector3[][],
+  openEdge: boolean[],
+): { rings: Vector3[][]; openEdge: boolean[] } {
   const outer = rings[0];
-  if (!outer) return [];
+  if (!outer) return { rings: [], openEdge: [] };
   const keep: number[] = [];
   for (let i = 0; i < outer.length; i++) {
     const last = keep.length > 0 ? outer[keep[keep.length - 1]] : null;
@@ -465,10 +483,21 @@ function dedupeRings(rings: Vector3[][]): Vector3[][] {
   ) {
     keep.pop();
   }
-  // 念のため、点数の揃わないリングは落とす (帯が組めないため)。
-  return rings
-    .filter((ring) => ring.length === outer.length)
-    .map((ring) => keep.map((i) => ring[i]));
+  return {
+    // 念のため、点数の揃わないリングは落とす (帯が組めないため)。
+    rings: rings
+      .filter((ring) => ring.length === outer.length)
+      .map((ring) => keep.map((i) => ring[i])),
+    // 点を落とすと辺が繋ぎ変わる。落とした点の辺の性質を引き継ぐ。
+    openEdge: keep.map((index, k) => {
+      const next = keep[(k + 1) % keep.length];
+      let open = false;
+      for (let i = index; i !== next; i = (i + 1) % openEdge.length) {
+        if (openEdge[i]) open = true;
+      }
+      return open;
+    }),
+  };
 }
 
 /**

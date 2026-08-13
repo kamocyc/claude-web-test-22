@@ -178,6 +178,23 @@
         line-height: 1.45;
       }
 
+      /* 敷設できないときの理由。一目で分かるように囲って強調する。 */
+      .readout .blocked {
+        margin-top: 8px;
+        padding: 8px 10px;
+        border: 1px solid #f0776b;
+        border-radius: 8px;
+        background: rgba(240, 119, 107, 0.14);
+        color: #ffb3aa;
+        line-height: 1.5;
+      }
+
+      .readout .blocked b {
+        display: block;
+        margin-bottom: 4px;
+        color: #f0776b;
+      }
+
       .help {
         position: absolute;
         left: 12px;

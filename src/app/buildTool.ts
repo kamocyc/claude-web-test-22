@@ -1,4 +1,4 @@
-import { Group, Mesh, Vector2, Vector3 } from 'three';
+import { Group, Mesh, Vector2, Vector3, type MeshStandardMaterial } from 'three';
 import { Alignment } from '../core/alignment';
 import { MeshBuilder } from '../core/meshbuilder';
 import { VerticalProfile } from '../core/profile';
@@ -14,8 +14,9 @@ import {
   type PlacementPreview,
 } from '../network/editing';
 import type { Network, SegmentId } from '../network/network';
+import { checkPlacement } from '../network/rules';
 import { evaluateAlignment, type SegmentDiagnostics } from '../network/validation';
-import { createPreviewMaterial } from '../render/materials';
+import { createPreviewMaterial, setPreviewBlocked } from '../render/materials';
 import type { Heightfield } from '../terrain/heightfield';
 
 export type ToolMode = 'build' | 'bulldoze' | 'inspect';
@@ -41,6 +42,8 @@ export interface ToolStatus {
   snap: 'none' | 'node' | 'segment';
   hoverSegment: SegmentId | null;
   cost: number;
+  /** 空でなければ敷設できない。理由をそのまま表示する。 */
+  blockers: string[];
 }
 
 const ELEVATION_STEP = 3;
@@ -61,6 +64,7 @@ export class BuildTool {
 
   readonly previewGroup = new Group();
   private readonly previewMesh: Mesh;
+  private readonly previewMaterial: MeshStandardMaterial;
   private anchor: Anchor | null = null;
   private cursor: Vector3 | null = null;
   private preview: PlacementPreview | null = null;
@@ -68,6 +72,7 @@ export class BuildTool {
   private snapKind: 'none' | 'node' | 'segment' = 'none';
   private hoverSegment: SegmentId | null = null;
   private lastDiagnostics: SegmentDiagnostics | null = null;
+  private blockers: string[] = [];
 
   constructor(
     private readonly network: Network,
@@ -75,7 +80,8 @@ export class BuildTool {
     private readonly onChanged: () => void,
   ) {
     this.previewGroup.name = 'preview';
-    this.previewMesh = new Mesh(new MeshBuilder().build(), createPreviewMaterial());
+    this.previewMaterial = createPreviewMaterial();
+    this.previewMesh = new Mesh(new MeshBuilder().build(), this.previewMaterial);
     this.previewMesh.frustumCulled = false;
     this.previewGroup.add(this.previewMesh);
   }
@@ -105,6 +111,7 @@ export class BuildTool {
     this.preview = null;
     this.endAnchor = null;
     this.lastDiagnostics = null;
+    this.blockers = [];
     this.updatePreviewMesh();
   }
 
@@ -217,10 +224,21 @@ export class BuildTool {
       );
       const cls = this.cls;
       this.lastDiagnostics = evaluateAlignment(alignment, cls);
+      // 置けるかどうかはクリック前に分かるようにする。
+      this.blockers = checkPlacement({
+        network: this.network,
+        cls,
+        alignment,
+        start: this.anchor,
+        end: this.endAnchor ?? { pos: preview.end },
+      }).blockers;
       buildRibbon(mb, alignment.sample(2), profileFor(cls), { skirt: false, cls });
     } else {
       this.lastDiagnostics = null;
+      this.blockers = [];
     }
+    // 置けないときはプレビューを赤くする。
+    setPreviewBlocked({ material: this.previewMaterial }, this.blockers.length > 0);
     const old = this.previewMesh.geometry;
     this.previewMesh.geometry = mb.build();
     old.dispose();
@@ -249,6 +267,8 @@ export class BuildTool {
 
     if (!this.preview || !this.endAnchor) return;
     if (this.preview.horizontal.length < 3) return;
+    // 規格違反・重なり・建築限界不足は置かせない。
+    if (this.blockers.length > 0) return;
 
     const result = placeSegment(
       this.network,
@@ -290,6 +310,7 @@ export class BuildTool {
       snap: this.snapKind,
       hoverSegment: this.hoverSegment,
       cost: length * this.cls.costPerMeter,
+      blockers: this.blockers,
     };
   }
 }

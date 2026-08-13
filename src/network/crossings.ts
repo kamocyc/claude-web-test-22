@@ -32,14 +32,14 @@ export interface Crossing {
   message?: string;
 }
 
-interface PolylinePoint {
+export interface PolylinePoint {
   s: number;
   x: number;
   z: number;
   y: number;
 }
 
-function toPolyline(alignment: Alignment, step = 3): PolylinePoint[] {
+export function toPolyline(alignment: Alignment, step = 3): PolylinePoint[] {
   const L = alignment.length;
   const n = Math.max(1, Math.ceil(L / step));
   const out: PolylinePoint[] = [];
@@ -131,7 +131,7 @@ function dedupeCrossings(crossings: Crossing[]): Crossing[] {
   return kept;
 }
 
-interface Hit {
+export interface Hit {
   sA: number;
   sB: number;
   x: number;
@@ -142,7 +142,7 @@ interface Hit {
   dirB: Vector2;
 }
 
-function intersectPolylines(a: PolylinePoint[], b: PolylinePoint[]): Hit[] {
+export function intersectPolylines(a: PolylinePoint[], b: PolylinePoint[]): Hit[] {
   const hits: Hit[] = [];
   for (let i = 0; i + 1 < a.length; i++) {
     const a0 = a[i];

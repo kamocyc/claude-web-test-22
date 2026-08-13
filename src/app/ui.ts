@@ -5,6 +5,8 @@ import type { ToolMode, ToolStatus } from './buildTool';
 
 export interface UiCallbacks {
   onMode: (mode: ToolMode) => void;
+  /** 接続の色分け表示を切り替える。 */
+  onConnectivityColors: (on: boolean) => void;
   onClass: (classId: string) => void;
   onElevation: (steps: number) => void;
   onRegenerate: () => void;
@@ -89,6 +91,12 @@ export class Ui {
         initial: true,
         apply: (on) => (viewUniforms.uContour.value = on ? 10 : 0),
       },
+      {
+        id: 'connectivity',
+        label: '接続の色分け (系統)',
+        initial: false,
+        apply: (on) => callbacks.onConnectivityColors(on),
+      },
     ];
     for (const toggle of toggles) {
       left.append(checkbox(toggle.label, toggle.initial, toggle.apply));
@@ -164,6 +172,14 @@ export class Ui {
       .map(([k, v]) => `<div class="line"><span>${k}</span><b>${v}</b></div>`)
       .join('');
 
+    // 敷設できない理由は、規格の警告より優先して大きく出す。
+    if (status.blockers.length > 0) {
+      this.statusBody.innerHTML +=
+        '<div class="blocked"><b>ここには敷設できません</b>' +
+        status.blockers.map((m) => `<div>${escapeHtml(m)}</div>`).join('') +
+        '</div>';
+      return;
+    }
     const messages = status.diagnostics?.messages ?? [];
     if (messages.length > 0) {
       this.statusBody.innerHTML += messages
@@ -183,6 +199,9 @@ export class Ui {
       ['トンネル', `${s.tunnelLength.toFixed(0)} m`],
       ['総延長', `${s.totalLength.toFixed(0)} m`],
       ['総工費', `¥${Math.round(s.cost).toLocaleString('ja-JP')}`],
+      ['道路網', `${s.roadNetworks} 系統`],
+      ['線路網', `${s.railNetworks} 系統`],
+      ['電力網', `${s.powerNetworks} 系統`],
     ];
     this.statsBody.innerHTML = rows
       .map(([k, v]) => `<div class="line"><span>${k}</span><b>${v}</b></div>`)

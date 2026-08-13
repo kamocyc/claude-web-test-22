@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { Mesh, MeshBasicMaterial, Vector3 } from 'three';
+import { Mesh, MeshBasicMaterial, Vector2, Vector3 } from 'three';
+import { Alignment } from '../src/core/alignment';
+import { curveFromTangents } from '../src/core/curve';
+import { VerticalProfile } from '../src/core/profile';
+import { checkPlacement } from '../src/network/rules';
 import { buildDemoNetwork } from '../src/app/demo';
 import { profileFor } from '../src/build/surface';
 import { getClass } from '../src/network/classes';
@@ -216,3 +220,67 @@ describe('サンプルネットワーク', () => {
     expect(changed).toBeGreaterThan(100);
   });
 });
+
+describe('敷設の制限', () => {
+  it('サンプルネットワークは敷設規則を全て満たしている', () => {
+    const { network } = buildWorld();
+
+    // 既存の各セグメントを「今から引く線形」として評価し直す。
+    // サンプルが規則違反を含んでいると、同じものを手で引けないことになる。
+    const violations: string[] = [];
+    for (const seg of network.segments.values()) {
+      const cls = network.classOf(seg);
+      const alignment = network.alignmentOf(seg.id);
+      const check = checkPlacement({
+        network,
+        cls,
+        alignment,
+        start: { pos: network.getNode(seg.a).pos.clone(), node: seg.a },
+        end: { pos: network.getNode(seg.b).pos.clone(), node: seg.b },
+        ignore: seg.id,
+      });
+      for (const blocker of check.blockers) violations.push(`seg${seg.id}: ${blocker}`);
+    }
+    expect(violations).toEqual([]);
+  });
+
+  it('規格を外れた線形・建築限界不足は敷設できない', () => {
+    const field = new Heightfield();
+    field.base.fill(20);
+    field.resetWork();
+    const network = new Network();
+    draw(network, 'road_medium', [new Vector3(-150, 20, 0), new Vector3(150, 20, 0)]);
+
+    const cls = getClass('road_medium');
+    // 桁下が足りない高さで既存道路を跨ぐ線形。
+    const low = straightAlignment(new Vector3(0, 22, -80), new Vector3(0, 22, 80));
+    const blocked = checkPlacement({
+      network,
+      cls,
+      alignment: low,
+      start: { pos: new Vector3(0, 22, -80) },
+      end: { pos: new Vector3(0, 22, 80) },
+    });
+    expect(blocked.blockers.join(' ')).toContain('建築限界');
+
+    // 十分高ければ通る。
+    const high = straightAlignment(new Vector3(0, 26, -80), new Vector3(0, 26, 80));
+    const allowed = checkPlacement({
+      network,
+      cls,
+      alignment: high,
+      start: { pos: new Vector3(0, 26, -80) },
+      end: { pos: new Vector3(0, 26, 80) },
+    });
+    expect(allowed.blockers).toEqual([]);
+  });
+});
+
+/** 2 点を結ぶ直線の線形 (テスト用)。 */
+function straightAlignment(a: Vector3, b: Vector3): Alignment {
+  const from = new Vector2(a.x, a.z);
+  const to = new Vector2(b.x, b.z);
+  const dir = to.clone().sub(from).normalize();
+  const horizontal = curveFromTangents(from, dir, to, dir);
+  return new Alignment(horizontal, VerticalProfile.linear(a.y, b.y, horizontal.length));
+}

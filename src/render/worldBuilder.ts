@@ -20,7 +20,13 @@ import {
   type ApproachFrame,
 } from '../build/markings';
 import { buildCatenary, buildTrack, buildTrackConnection } from '../build/rail';
-import { buildUtilityPoles } from '../build/streetside';
+import {
+  buildPowerLine,
+  planUtilityPoles,
+  POLE_PITCH,
+  type PolePlan,
+  type PowerSpan,
+} from '../build/streetside';
 import {
   alignmentSamplesInRange,
   buildBridge,
@@ -38,11 +44,13 @@ import {
   gradingSectionPoints,
   junctionGradingDrop,
   profileFor,
+  type RGB,
 } from '../build/surface';
 import type { NetworkClass } from '../network/classes';
 import { findCrossings, type Crossing } from '../network/crossings';
 import { solveJunctions, type Approach, type Junction } from '../network/junction';
 import type { Network, NodeId, SegmentId } from '../network/network';
+import { buildConnectivity, type Connectivity } from '../network/connectivity';
 import { Occupancy } from '../network/occupancy';
 import {
   classify,
@@ -85,6 +93,10 @@ export interface WorldStats {
   tunnelLength: number;
   totalLength: number;
   cost: number;
+  /** 行き来できるひと繋がりの系統の数。 */
+  roadNetworks: number;
+  railNetworks: number;
+  powerNetworks: number;
 }
 
 export type PropKind = 'signal' | 'stopSign' | 'crossingGate' | 'catenaryPole' | 'utilityPole';
@@ -107,7 +119,43 @@ export interface BuildResult {
   structures: Map<SegmentId, StructureRun[]>;
   /** 立てた小物の一覧。 */
   props: PropPlacement[];
+  /** 道路・線路の接続関係 (交通の判定に使える)。 */
+  connectivity: Connectivity;
+  /** 配電線の接続関係。 */
+  power: { poles: PolePlan[]; spans: PowerSpan[] };
 }
+
+/** 配電線の系統数 (地中区間も繋がっているものとして数える)。 */
+function countPowerNetworks(poles: PolePlan[], spans: PowerSpan[]): number {
+  const index = new Map<PolePlan, number>();
+  poles.forEach((pole, i) => index.set(pole, i));
+  const parent = poles.map((_, i) => i);
+  const find = (x: number): number => {
+    let root = x;
+    while (parent[root] !== root) root = parent[root];
+    return root;
+  };
+  for (const span of spans) {
+    const a = index.get(span.a);
+    const b = index.get(span.b);
+    if (a === undefined || b === undefined) continue;
+    const ra = find(a);
+    const rb = find(b);
+    if (ra !== rb) parent[ra] = rb;
+  }
+  const roots = new Set(poles.map((_, i) => find(i)));
+  return roots.size;
+}
+
+/** 系統の色分けに使う色。隣り合う番号どうしが紛らわしくない並びにする。 */
+const COMPONENT_TINTS: RGB[] = [
+  [0.34, 0.66, 0.95],
+  [0.96, 0.72, 0.28],
+  [0.46, 0.85, 0.52],
+  [0.9, 0.45, 0.75],
+  [0.55, 0.5, 0.95],
+  [0.95, 0.5, 0.38],
+];
 
 /** 小物を立てるときに、路面から確保する余裕 [m]。 */
 const PROP_CLEARANCE = 0.35;
@@ -133,6 +181,12 @@ export class WorldBuilder {
   private props: PropPlacement[] = [];
   /** 直近の rebuild で作った占有索引。小物の位置決めに使う。 */
   private occupancy!: Occupancy;
+
+  /**
+   * 面の塗り方。`connectivity` にすると、行き来できる系統ごとに色を変える。
+   * どこがどこと繋がっているのかを一目で確かめるための表示。
+   */
+  colorMode: 'normal' | 'connectivity' = 'normal';
 
   /** 最後に解いた交差点情報。ツール側のスナップやハイライトで使う。 */
   junctions = new Map<NodeId, Junction>();
@@ -177,6 +231,7 @@ export class WorldBuilder {
 
     const { junctions, trims } = solveJunctions(network, blendAt);
     this.junctions = junctions;
+    const connectivity = buildConnectivity(network, junctions);
 
     // 区間ごとの構造形式を決める。
     const ranges = new Map<SegmentId, { s0: number; s1: number }>();
@@ -258,6 +313,9 @@ export class WorldBuilder {
       tunnelLength: 0,
       totalLength: 0,
       cost: 0,
+      roadNetworks: 0,
+      railNetworks: 0,
+      powerNetworks: 0,
     };
     const diagnostics = new Map<SegmentId, SegmentDiagnostics>();
 
@@ -280,25 +338,208 @@ export class WorldBuilder {
         });
       }
 
-      this.buildSegment(surface, structure, seg.id, alignment, cls, runs, blends, stats);
+      this.buildSegment(
+        surface,
+        structure,
+        seg.id,
+        alignment,
+        cls,
+        runs,
+        blends,
+        stats,
+        this.tintFor(connectivity, seg.id),
+      );
       if (cls.kind === 'road') {
         buildLaneMarkings(overlay, alignment, range, cls);
       }
     }
 
     for (const junction of junctions.values()) {
-      this.buildJunction(surface, overlay, structure, junction, structures, warnings, stats);
+      const branch = junction.approaches[0]?.branch.segment;
+      this.buildJunction(
+        surface,
+        overlay,
+        structure,
+        junction,
+        structures,
+        warnings,
+        stats,
+        branch === undefined ? undefined : this.tintFor(connectivity, branch),
+      );
     }
 
     for (const crossing of crossings) {
       this.buildCrossing(overlay, crossing, structures, warnings, stats);
     }
 
+    const power = this.buildPower(structure, structures, ranges);
+    const powerNetworks = countPowerNetworks(power.poles, power.spans);
+    stats.roadNetworks = connectivity.components.filter((c) => c.kind === 'road').length;
+    stats.railNetworks = connectivity.components.filter((c) => c.kind === 'rail').length;
+    stats.powerNetworks = powerNetworks;
+
     this.replaceGeometry(this.surfaceMesh, surface);
     this.replaceGeometry(this.overlayMesh, overlay);
     this.replaceGeometry(this.structureMesh, structure);
 
-    return { warnings, stats, diagnostics, ranges, structures, props: this.props };
+    return {
+      warnings,
+      stats,
+      diagnostics,
+      ranges,
+      structures,
+      props: this.props,
+      connectivity,
+      power,
+    };
+  }
+
+  /** 系統ごとの色。`colorMode` が `normal` のときは色を変えない。 */
+  private tintFor(connectivity: Connectivity, segment: SegmentId): RGB | undefined {
+    if (this.colorMode !== 'connectivity') return undefined;
+    const component = connectivity.componentOf.get(segment);
+    return component === undefined ? undefined : COMPONENT_TINTS[component % COMPONENT_TINTS.length];
+  }
+
+  /**
+   * 配電線を組み立てる。
+   *
+   * 電柱はセグメントごとに間隔を割り付けるが、**線は途切れさせない**。
+   * 建てられなかった所 (橋・トンネル・線路の架線・他の線形と支障する所)
+   * では地中に潜り、向こう側でまた立ち上がる。ノードを越えて隣のセグメント
+   * へも繋ぐので、交差点を跨いでも 1 本の系統として繋がる。
+   */
+  private buildPower(
+    structure: MeshBuilder,
+    structures: Map<SegmentId, StructureRun[]>,
+    ranges: Map<SegmentId, { s0: number; s1: number }>,
+  ): { poles: PolePlan[]; spans: PowerSpan[] } {
+    const bySegment = new Map<SegmentId, PolePlan[]>();
+    const all: PolePlan[] = [];
+
+    for (const seg of this.network.segments.values()) {
+      const cls = this.network.classOf(seg);
+      if (cls.kind !== 'road') continue;
+      const range = ranges.get(seg.id);
+      const runs = structures.get(seg.id) ?? [];
+      if (!range) continue;
+
+      const alignment = this.network.alignmentOf(seg.id);
+      const samples = alignmentSamplesInRange(alignment, range.s0, range.s1, 4);
+      if (samples.length < 2) continue;
+
+      const poles = planUtilityPoles(samples, cls, {
+        // 橋・トンネルの区間には建てない。地面がない / 地中にある。
+        canPlace: (x, z, y) =>
+          this.occupancy.isFree(x, z, {
+            exceptSegments: [seg.id],
+            margin: PROP_CLEARANCE,
+            y,
+          }),
+        groundY: (x, z, surfaceY) =>
+          Math.max(this.field.heightAt(x, z), surfaceY + cls.curbHeight),
+      }).filter((pole) => modeAt(runs, pole.station) === 'ground');
+
+      if (poles.length > 0) bySegment.set(seg.id, poles);
+      all.push(...poles);
+    }
+
+    const spans: PowerSpan[] = [];
+    // 既に繋がっている柱どうしを二重に繋がないよう、union-find で追う。
+    const parent = new Map<PolePlan, PolePlan>();
+    const find = (p: PolePlan): PolePlan => {
+      let root = p;
+      while (parent.get(root) !== root) root = parent.get(root)!;
+      return root;
+    };
+    for (const pole of all) parent.set(pole, pole);
+
+    const link = (a: PolePlan, b: PolePlan, continuous: boolean): void => {
+      const ra = find(a);
+      const rb = find(b);
+      if (ra === rb) return;
+      parent.set(ra, rb);
+      const underground = !continuous || this.spanBlocked(a.base, b.base);
+      spans.push({ a, b, underground });
+    };
+
+    // セグメント内で隣り合う柱を繋ぐ。番号が飛んでいれば地中。
+    for (const poles of bySegment.values()) {
+      for (let i = 0; i + 1 < poles.length; i++) {
+        link(poles[i], poles[i + 1], poles[i + 1].index === poles[i].index + 1);
+      }
+    }
+
+    /**
+     * その枝の、ノードにいちばん近い電柱。柱の無いセグメント (橋・トンネル
+     * など) は通り抜けて先を探す。そうしないと、そこで系統が切れてしまう。
+     */
+    const nearestPole = (segment: SegmentId, atStart: boolean, depth = 0): PolePlan | null => {
+      const poles = bySegment.get(segment);
+      if (poles && poles.length > 0) return atStart ? poles[0] : poles[poles.length - 1];
+      if (depth >= 3) return null;
+      const seg = this.network.segments.get(segment);
+      if (!seg) return null;
+      const junction = this.junctions.get(atStart ? seg.b : seg.a);
+      const self = junction?.approaches.find((a) => a.branch.segment === segment);
+      if (!junction || !self) return null;
+      for (const other of junction.approaches) {
+        if (other.branch.segment === segment) continue;
+        if (other.branch.cls.kind !== 'road') continue;
+        if (self.dir.dot(other.dir) > -0.5) continue;
+        const found = nearestPole(other.branch.segment, other.branch.atStart, depth + 1);
+        if (found) return found;
+      }
+      return null;
+    };
+
+    // ノードを越えて隣のセグメントへ繋ぐ。まず、ほぼ直進する組を本線として
+    // 繋ぎ、そのあと交差点に集まる残りの枝を分岐 (引き込み) として繋ぐ。
+    // こうすると 1 つの道路網が 1 つの電力系統になる。
+    for (const junction of this.junctions.values()) {
+      const branches = junction.approaches.filter((a) => a.branch.cls.kind === 'road');
+      const poles = branches
+        .map((b) => nearestPole(b.branch.segment, b.branch.atStart))
+        .filter((p): p is PolePlan => p !== null);
+
+      for (let i = 0; i < branches.length; i++) {
+        for (let j = i + 1; j < branches.length; j++) {
+          if (branches[i].dir.dot(branches[j].dir) > -0.5) continue; // 直進に近い組
+          const a = nearestPole(branches[i].branch.segment, branches[i].branch.atStart);
+          const b = nearestPole(branches[j].branch.segment, branches[j].branch.atStart);
+          if (a && b) link(a, b, a.base.distanceTo(b.base) < POLE_PITCH * 2.5);
+        }
+      }
+      for (let i = 1; i < poles.length; i++) {
+        link(poles[0], poles[i], poles[0].base.distanceTo(poles[i].base) < POLE_PITCH * 2.5);
+      }
+    }
+
+    buildPowerLine(structure, all, spans);
+    for (const [segment, poles] of bySegment) {
+      for (const pole of poles) {
+        this.props.push({ kind: 'utilityPole', position: pole.base, segment });
+      }
+    }
+    return { poles: all, spans };
+  }
+
+  /**
+   * 2 本の柱の間に架空線を張れるか。
+   * 線路 (架線) の上や、橋・トンネルの構造物の上は跨げない。
+   */
+  private spanBlocked(a: Vector3, b: Vector3): boolean {
+    const steps = Math.max(2, Math.ceil(a.distanceTo(b) / 4));
+    for (let i = 0; i <= steps; i++) {
+      const t = i / steps;
+      const x = a.x + (b.x - a.x) * t;
+      const z = a.z + (b.z - a.z) * t;
+      const y = a.y + (b.y - a.y) * t;
+      const hit = this.occupancy.at(x, z, { kinds: ['rail'], margin: 2 });
+      // 高さが大きく違えば (掘割の上、高架の下) 支障しない。
+      if (hit && Math.abs(y - hit.y) < 8) return true;
+    }
+    return false;
   }
 
   /**
@@ -571,13 +812,13 @@ export class WorldBuilder {
     runs: StructureRun[],
     blends: RailBlend[],
     stats: WorldStats,
+    tint?: RGB,
   ): void {
     const profile = profileFor(cls);
     const ground = (x: number, z: number): number => this.field.heightAt(x, z);
     // 自分自身の上には当然乗るので、判定からは外す。
     const canPlace = (x: number, z: number, y?: number): boolean =>
       this.occupancy.isFree(x, z, { exceptSegments: [segment], margin: PROP_CLEARANCE, y });
-    let poleSerial = 0;
 
     for (const run of runs) {
       const raw = alignmentSamplesInRange(alignment, run.s0, run.s1, 2.5);
@@ -588,6 +829,7 @@ export class WorldBuilder {
         skirt: run.mode === 'ground',
         cls,
         groundY: ground,
+        tint,
       });
 
       if (run.mode === 'bridge') {
@@ -604,19 +846,6 @@ export class WorldBuilder {
         }
       }
 
-      // 電柱は地面に立てるものなので、橋・トンネルには置かない。
-      if (cls.kind === 'road' && run.mode === 'ground') {
-        const poles = buildUtilityPoles(structure, samples, cls, {
-          canPlace,
-          groundY: (x, z, surfaceY) =>
-            Math.max(this.field.heightAt(x, z), surfaceY + cls.curbHeight),
-          serial: poleSerial,
-        });
-        poleSerial += Math.max(1, Math.ceil((run.s1 - run.s0) / 38));
-        for (const pole of poles) {
-          this.props.push({ kind: 'utilityPole', position: pole.base, segment });
-        }
-      }
     }
 
     if (cls.kind === 'rail') {
@@ -640,6 +869,7 @@ export class WorldBuilder {
     structures: Map<SegmentId, StructureRun[]>,
     warnings: WorldWarning[],
     stats: WorldStats,
+    tint?: RGB,
   ): void {
     const node = this.network.getNode(junction.node);
     for (const message of junction.warnings) {
@@ -652,7 +882,14 @@ export class WorldBuilder {
     const cls = junction.approaches[0]?.branch.cls;
     if (!cls) return;
 
-    buildJunctionSurface(surface, junction.rings, cls, (x, z) => this.field.heightAt(x, z));
+    buildJunctionSurface(
+      surface,
+      junction.rings,
+      cls,
+      junction.openEdge,
+      (x, z) => this.field.heightAt(x, z),
+      tint,
+    );
 
     // 高い所にある交差点には床版と橋脚を付ける。付けないと路面だけが宙に浮く。
     const terrain = this.field.baseHeightAt(node.pos.x, node.pos.z);

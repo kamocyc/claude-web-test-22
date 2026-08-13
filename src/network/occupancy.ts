@@ -17,6 +17,8 @@ export interface Occupant {
   node?: NodeId;
   /** 中心線 (交差点ではリング) からの距離 [m]。負なら内側。 */
   distance: number;
+  /** その地点での線形の高さ [m]。 */
+  y: number;
 }
 
 export interface OccupancyQuery {
@@ -136,7 +138,12 @@ export class Occupancy {
       if (gap > 0) continue;
       if (differentLevel(span.y0 + (span.y1 - span.y0) * projection.t)) continue;
       if (!best || gap < best.distance) {
-        best = { kind: span.kind, segment: span.segment, distance: gap };
+        best = {
+          kind: span.kind,
+          segment: span.segment,
+          distance: gap,
+          y: span.y0 + (span.y1 - span.y0) * projection.t,
+        };
       }
     }
 
@@ -152,7 +159,7 @@ export class Occupancy {
       const gap = inside ? -d : d - margin;
       if (gap > 0) continue;
       if (!best || gap < best.distance) {
-        best = { kind: ring.kind, node: ring.node, distance: gap };
+        best = { kind: ring.kind, node: ring.node, distance: gap, y: ring.y };
       }
     }
 

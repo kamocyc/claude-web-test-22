@@ -29,6 +29,8 @@ export function createSurfaceMaterial(options?: {
   side?: typeof DoubleSide | undefined;
   /** 診断表示の on/off を制御する uniform。既定は全体共有のもの。 */
   diagnostics?: { value: number };
+  /** 1 にすると面を赤く塗る (敷設できないプレビュー)。 */
+  blocked?: { value: number };
 }): MeshStandardMaterial {
   const material = new MeshStandardMaterial({
     vertexColors: true,
@@ -43,8 +45,10 @@ export function createSurfaceMaterial(options?: {
     ...(options?.side ? { side: options.side } : {}),
   });
 
+  const blocked = options?.blocked ?? { value: 0 };
   material.onBeforeCompile = (shader: WebGLProgramParametersWithUniforms) => {
     shader.uniforms.uDiagnostics = options?.diagnostics ?? viewUniforms.uDiagnostics;
+    shader.uniforms.uBlocked = blocked;
     shader.vertexShader = shader.vertexShader
       .replace(
         '#include <common>',
@@ -62,6 +66,7 @@ vDiag = diag;`,
         '#include <common>',
         `#include <common>
 uniform float uDiagnostics;
+uniform float uBlocked;
 varying vec2 vDiag;
 
 vec3 riskColor(float risk) {
@@ -79,6 +84,9 @@ vec3 riskColor(float risk) {
 if (uDiagnostics > 0.5) {
   float risk = max(vDiag.x, vDiag.y);
   gl_FragColor.rgb = mix(gl_FragColor.rgb, riskColor(risk), 0.82);
+}
+if (uBlocked > 0.5) {
+  gl_FragColor.rgb = mix(gl_FragColor.rgb, vec3(0.92, 0.22, 0.18), 0.85);
 }`,
       );
   };
@@ -202,6 +210,9 @@ export function createPropMaterial(): MeshStandardMaterial {
  * 建設プレビュー用の半透明マテリアル。規格違反がすぐ分かるよう、
  * 全体設定にかかわらず常に診断色で表示する。
  */
+/** 敷設できないプレビューを赤く塗るための uniform。 */
+const previewBlocked = { value: 0 };
+
 export function createPreviewMaterial(): MeshStandardMaterial {
   return createSurfaceMaterial({
     transparent: true,
@@ -209,5 +220,18 @@ export function createPreviewMaterial(): MeshStandardMaterial {
     depthWrite: false,
     polygonOffsetUnits: -16,
     diagnostics: { value: 1 },
+    blocked: previewBlocked,
   });
+}
+
+/**
+ * 敷設できないときのプレビュー表示。
+ * 診断色より優先して赤く塗るので、置けないことが一目で分かる。
+ */
+export function setPreviewBlocked(
+  mesh: { material: MeshStandardMaterial },
+  blocked: boolean,
+): void {
+  previewBlocked.value = blocked ? 1 : 0;
+  mesh.material.opacity = blocked ? 0.9 : 0.75;
 }

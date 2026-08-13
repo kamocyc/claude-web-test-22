@@ -30,11 +30,15 @@ export function roadProfile(cls: NetworkClass): ProfilePoint[] {
     ];
   }
   const curb = cls.curbHeight;
+  // 縁石の立ち上がり面の下端で色を切り替える。1 点で兼ねると、車道の帯が
+  // 「縁石の色 → 舗装の色」のグラデーションになってしまう。
   return [
     { offset: -hw, height: curb, color: SIDEWALK },
     { offset: -cw, height: curb, color: CURB },
     { offset: -cw, height: 0, color: CURB },
+    { offset: -cw, height: 0, color: surface },
     { offset: cw, height: 0, color: surface },
+    { offset: cw, height: 0, color: CURB },
     { offset: cw, height: curb, color: CURB },
     { offset: hw, height: curb, color: SIDEWALK },
   ];
@@ -84,6 +88,23 @@ export interface RibbonOptions {
   cls: NetworkClass;
   /** 整地後の地形の高さ。垂れ壁を地面まで届かせるのに使う。 */
   groundY?: GroundQuery;
+  /** 系統ごとの色分け。指定すると断面の色をこの色に寄せる。 */
+  tint?: RGB;
+}
+
+/**
+ * 系統の色を混ぜる。断面の明暗 (歩道・縁石・車道) は残したいので、
+ * 明るさだけ元の色から借りる。
+ */
+export function applyTint(color: RGB, tint?: RGB): RGB {
+  if (!tint) return color;
+  const luma = 0.3 * color[0] + 0.6 * color[1] + 0.1 * color[2];
+  const k = 0.45 + luma * 0.9;
+  return [
+    Math.min(1, tint[0] * k),
+    Math.min(1, tint[1] * k),
+    Math.min(1, tint[2] * k),
+  ];
 }
 
 /** 整地後の地形の高さを引く関数。 */
@@ -142,7 +163,15 @@ export function buildRibbon(
         .normalize();
       normal.crossVectors(across, sample.forward).normalize();
       row.push(
-        mb.vertex(pos, normal, p.offset * 0.12, sample.s * 0.12, p.color, gradeRisk, curveRisk),
+        mb.vertex(
+          pos,
+          normal,
+          p.offset * 0.12,
+          sample.s * 0.12,
+          applyTint(p.color, options.tint),
+          gradeRisk,
+          curveRisk,
+        ),
       );
     }
     rows.push(row);
@@ -289,16 +318,20 @@ export function buildJunctionSurface(
   mb: MeshBuilder,
   rings: Vector3[][],
   cls: NetworkClass,
+  /** 辺 i が「枝の口」か。ここには歩道・縁石・垂れ壁を作らない。 */
+  openEdge: boolean[],
   ground?: GroundQuery,
+  tint?: RGB,
 ): void {
   if (rings.length === 0 || rings[0].length < 3) return;
   const profile = profileFor(cls);
   const lifted = rings.map((ring) => ring.map((p) => new Vector3(p.x, p.y + SURFACE_LIFT, p.z)));
+  const closed = (i: number): boolean => !openEdge[i];
 
-  fillPolygon(mb, lifted[lifted.length - 1], cls.surfaceColor, 0.12, 0);
+  fillPolygon(mb, lifted[lifted.length - 1], applyTint(cls.surfaceColor, tint), 0.12, 0);
   for (let k = 0; k + 1 < lifted.length; k++) {
-    const color = profile[Math.min(k, profile.length - 1)].color;
-    buildRingBand(mb, lifted[k], lifted[k + 1], color);
+    const color = applyTint(profile[Math.min(k, profile.length - 1)].color, tint);
+    buildRingBand(mb, lifted[k], lifted[k + 1], color, closed);
   }
   // 外周の垂れ壁は地面まで届かせる。勾配の違う枝が集まる交差点では、
   // 隅で 2〜3 m の段差ができることがあり、固定長では隠しきれない。
@@ -307,13 +340,21 @@ export function buildJunctionSurface(
     lifted[0],
     lifted[0].map((p) => skirtBottom(p.x, p.y, p.z, ground)),
     SKIRT_COLOR,
+    true,
+    closed,
   );
 }
 
 const SKIRT_COLOR: RGB = [0.3, 0.28, 0.26];
 
 /** 同じ頂点数の 2 本のリングの間を帯で埋める。 */
-function buildRingBand(mb: MeshBuilder, outer: Vector3[], inner: Vector3[], color: RGB): void {
+function buildRingBand(
+  mb: MeshBuilder,
+  outer: Vector3[],
+  inner: Vector3[],
+  color: RGB,
+  include: (i: number) => boolean = () => true,
+): void {
   const n = Math.min(outer.length, inner.length);
   if (n < 3) return;
   const centroid = new Vector3();
@@ -321,6 +362,7 @@ function buildRingBand(mb: MeshBuilder, outer: Vector3[], inner: Vector3[], colo
   centroid.divideScalar(outer.length);
 
   for (let i = 0; i < n; i++) {
+    if (!include(i)) continue;
     const j = (i + 1) % n;
     const quad = [outer[i], outer[j], inner[j], inner[i]];
     const geometric = newellNormal(quad);
