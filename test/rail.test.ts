@@ -1,12 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { Mesh, MeshBasicMaterial, Vector3 } from 'three';
+import { Mesh, MeshBasicMaterial, Vector2, Vector3 } from 'three';
 import { surfaceHeightAt } from '../src/build/surface';
 import { trackConnectionAlignment } from '../src/build/rail';
 import { SURFACE_LIFT } from '../src/core/units';
 import { getClass } from '../src/network/classes';
 import { anchorFromNode, computePlacement, placeSegment, type Anchor } from '../src/network/editing';
 import { Network } from '../src/network/network';
-import type { Junction } from '../src/network/junction';
+import { solveJunctions, type Junction } from '../src/network/junction';
 import { WorldBuilder } from '../src/render/worldBuilder';
 import { DEFAULT_TERRAIN, generateTerrain } from '../src/terrain/generator';
 import { Heightfield } from '../src/terrain/heightfield';
@@ -31,6 +31,23 @@ function draw(network: Network, classId: string, points: Vector3[]): void {
       grade: preview.endGrade,
     };
   }
+}
+
+/** 直線のセグメントを 1 本足す (端点は近ければ既存ノードに繋ぐ)。 */
+function addStraight(network: Network, classId: string, a: Vector3, b: Vector3): void {
+  const na = network.findNodeNear(a, 0.5) ?? network.addNode(a);
+  const nb = network.findNodeNear(b, 0.5) ?? network.addNode(b);
+  const p0 = new Vector2(a.x, a.z);
+  const p1 = new Vector2(b.x, b.z);
+  network.addSegment({
+    classId,
+    a: na.id,
+    b: nb.id,
+    ctrlA: p0.clone().lerp(p1, 1 / 3),
+    ctrlB: p0.clone().lerp(p1, 2 / 3),
+    gradeA: 0,
+    gradeB: 0,
+  });
 }
 
 function makeWorld(build: (network: Network, field: Heightfield) => void) {
@@ -377,6 +394,65 @@ describe('線路の分岐', () => {
     // 曲線を無視して弦で結んでいる (直前の実装では 4 m 近く出ていた)。
     expect(`${worst.toFixed(2)} m @ ${worstAt}`).toBe(`${Math.min(worst, 1.5).toFixed(2)} m @ ${worstAt}`);
   });
+
+  /**
+   * どんな分岐でも、交差点を通る進路は必ず道床の上を通っていなければ
+   * ならない。弦で結んだ道床では、分岐角が 30° を超えると曲線が道床から
+   * はみ出して、線路が宙に浮いていた。
+   */
+  it('どの分岐角・規格でも、進路が道床から外れない', () => {
+    const problems: string[] = [];
+    let checked = 0;
+    for (const [main, branch] of [
+      ['rail_single', 'rail_yard'],
+      ['rail_double', 'rail_yard'],
+      ['rail_double', 'rail_double'],
+      ['rail_yard', 'rail_double'],
+    ]) {
+      for (const deg of [8, 15, 20, 25, 30, 40, 55, 70, 90]) {
+        for (const [la, lb, lc] of [
+          [200, 200, 200],
+          [60, 60, 60],
+          [200, 40, 40],
+        ]) {
+          const network = new Network();
+          const rad = (deg * Math.PI) / 180;
+          addStraight(network, main, new Vector3(-la, 40, 0), new Vector3(0, 40, 0));
+          addStraight(network, main, new Vector3(0, 40, 0), new Vector3(lb, 40, 0));
+          addStraight(
+            network,
+            branch,
+            new Vector3(0, 40, 0),
+            new Vector3(Math.cos(rad) * lc, 40, Math.sin(rad) * lc),
+          );
+
+          for (const junction of solveJunctions(network).junctions.values()) {
+            if (junction.approaches.length < 3) continue;
+            const ballast = junction.rings[junction.rings.length - 1];
+            // 帯を組むには、どのリングも同じ点数でなければならない。
+            expect(new Set(junction.rings.map((r) => r.length)).size).toBe(1);
+            for (const conn of junction.connections) {
+              const from = junction.approaches.find((a) => a.branch.segment === conn.from)!;
+              const to = junction.approaches.find((a) => a.branch.segment === conn.to)!;
+              const alignment = trackConnectionAlignment(from, to);
+              if (!alignment) continue;
+              for (let i = 0; i <= 24; i++) {
+                const p = alignment.sampleAt((alignment.length * i) / 24).pos;
+                checked++;
+                if (ballast.length < 3 || surfaceHeightAt(ballast, p.x, p.z) === null) {
+                  problems.push(
+                    `${main}/${branch} ${deg}° L=${la},${lb},${lc}: (${p.x.toFixed(1)}, ${p.z.toFixed(1)}) に道床がない`,
+                  );
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    expect(checked).toBeGreaterThan(3000);
+    expect(problems.slice(0, 5)).toEqual([]);
+  }, 30000);
 
   /**
    * 交差点の道床は、セグメントの道床と同じ色でなければならない。
