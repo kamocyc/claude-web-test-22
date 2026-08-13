@@ -1,6 +1,7 @@
 import { Group, Mesh, Vector3, type Vector2 } from 'three';
 import type { Alignment } from '../core/alignment';
 import { MeshBuilder, signedAreaXZ } from '../core/meshbuilder';
+import { perp } from '../core/curve';
 import { TERRAIN_CELL, lerp, smoothstep } from '../core/units';
 import {
   applyRailBlend,
@@ -212,23 +213,20 @@ export class WorldBuilder {
       const road = crossing.road;
       const sinTheta = Math.abs(road.dir.x * rail.dir.y - road.dir.y * rail.dir.x);
       const skew = 1 / Math.max(0.26, sinTheta);
-      // 舗装の下 (+ 1 m) は道路のもの。ここから外へ向かって線路の断面へ
-      // 戻す。路肩の余裕幅は「舗装が先に押さえた格子点には触らない」規則が
-      // あるので、道路の footprint いっぱいまで広げる必要はない。
-      // 広げると、その分だけ線路が地形に埋まってしまう。
-      const inner = (road.cls.halfWidth + 1) * skew;
       const railSection = profileFor(rail.cls);
+      // 舗装の下は道路のもの。そこから道路に直交する向きに、線路の断面へ戻す。
+      const roadHalfWidth = road.cls.halfWidth;
       const list = crossingZones.get(rail.segment) ?? [];
       list.push({
-        s: rail.s,
         x: crossing.point.x,
         z: crossing.point.z,
-        roadDir: road.dir,
-        roadHalfWidth: road.cls.halfWidth + 1,
-        railExtent: gradingHalfWidth(rail.cls) + 2,
-        inner,
-        shoulder: inner + CROSSING_SHOULDER_RAMP,
-        outer: inner + CROSSING_SHOULDER_RAMP + CROSSING_SLOPE_RAMP,
+        roadDir: road.dir.clone(),
+        roadNormal: perp(road.dir),
+        // 線路の footprint が道路を横切る長さ。斜めなら長くなる。
+        railExtent: gradingHalfWidth(rail.cls) * skew + 4,
+        roadHalfWidth,
+        shoulder: roadHalfWidth + CROSSING_SHOULDER_RAMP,
+        outer: roadHalfWidth + CROSSING_SHOULDER_RAMP + CROSSING_SLOPE_RAMP,
         // 舗装の路端と同じ高さ (踏切では線路の描画高 ≒ 道路面)。
         // ただしレール頭頂面 (オフセット 0) より上には決してしない。
         // 舗装の外に出た所でレールが土に埋まって見えてしまう。
@@ -454,16 +452,17 @@ export class WorldBuilder {
           blends,
         );
         for (let i = 0; i + 1 < samples.length; i++) {
-          const mid = (samples[i].s + samples[i + 1].s) / 2;
-          const drop = crossingDrop(zones, mid, naturalDrop);
-          if (drop === null) continue;
-          // 踏切に寄せる分は断面全体を平行移動する。
           // 勾配のある所では、格子の量子化で地形が路端より高く出ることが
           // ある。1 マス分の高低差だけ余計に下げて逃げる。
           const grade = Math.abs(samples[i].grade + samples[i + 1].grade) / 2;
-          const shift = drop - naturalDrop + grade * TERRAIN_CELL;
+          const shift = grade * TERRAIN_CELL;
           const a = gradingSectionPoints(samples[i], section, shift);
           const b = gradingSectionPoints(samples[i + 1], section, shift);
+          // 踏切のまわりでは、点ごとに道路からの垂距で目標を持ち上げる。
+          if (zones.length > 0) {
+            liftForCrossings(a, samples[i].pos.y, zones, naturalDrop);
+            liftForCrossings(b, samples[i + 1].pos.y, zones, naturalDrop);
+          }
           for (let k = 0; k + 1 < section.length; k++) {
             const quad = [a[k], b[k], b[k + 1], a[k + 1]];
             const o0 = section[k].offset;
@@ -943,28 +942,54 @@ export class WorldBuilder {
   }
 }
 
+/**
+ * 踏切のまわりで、整地断面の各点を道路側の高さへ持ち上げる。
+ *
+ * 点ごとに見るのが肝心で、線路の弧長だけで判定すると、斜め踏切の鋭角側に
+ * できる楔形 (舗装には覆われていないのに、線路に沿って測ると踏切のすぐ
+ * そば) を取りこぼし、そこだけ道床が地面に沈む。
+ */
+function liftForCrossings(
+  points: Vector3[],
+  centreY: number,
+  zones: CrossingZone[],
+  naturalDrop: number,
+): void {
+  const naturalOffset = -naturalDrop;
+  // レール頭頂面より上には決して持ち上げない。勾配のある道路が斜めに
+  // 横切る踏切では、路端の高さが交点のレール高より上にあるため。
+  const ceiling = centreY - 0.03;
+  for (const p of points) {
+    const offset = crossingOffsetAt(zones, p.x, p.z, naturalOffset);
+    if (offset > naturalOffset) p.y = Math.min(ceiling, Math.max(p.y, centreY + offset));
+  }
+}
+
 /** 断面の帯が中心線からどれだけ離れているか (中心線をまたぐ帯は 0)。 */
 function bandDistance(a: number, b: number): number {
   if (a * b <= 0) return 0;
   return Math.min(Math.abs(a), Math.abs(b));
 }
 
-/** 踏切のまわりで、整地目標を道路側に寄せる範囲。 */
+/**
+ * 踏切のまわりで、整地目標を道路側に寄せる範囲。
+ *
+ * 判定は「道路の中心線からの垂距」で行う。線路の弧長で測ると、斜め踏切の
+ * 鋭角側にできる楔形 (舗装には覆われていないのに、線路の弧長で見ると
+ * 踏切のすぐ近く) を取りこぼし、そこだけ道床が埋まってしまう。
+ */
 interface CrossingZone {
-  /** 踏切の弧長 (線路側)。 */
-  s: number;
-  /** 踏切の位置 (整地の保護領域の中心)。 */
+  /** 踏切の位置。 */
   x: number;
   z: number;
-  /** 道路の向き (保護する矩形の長手方向)。 */
+  /** 道路の向き / 道路に直交する向き。 */
   roadDir: Vector2;
-  /** 保護する矩形の半幅 (道路の舗装 + 1 m)。 */
-  roadHalfWidth: number;
-  /** 保護する矩形の半長 (線路の footprint を覆う長さ)。 */
+  roadNormal: Vector2;
+  /** 踏切として扱う、道路に沿った範囲 [m]。 */
   railExtent: number;
-  /** 舗装の下。ここまでは道路側に完全に譲る [m]。 */
-  inner: number;
-  /** ここまでで道床天端の高さまで下げる [m]。 */
+  /** 舗装の半幅。ここまでは道路のもの。 */
+  roadHalfWidth: number;
+  /** 舗装の端からここまでで道床天端の高さまで下げる [m]。 */
   shoulder: number;
   /** ここまでで断面 (法尻) に戻す [m]。 */
   outer: number;
@@ -980,39 +1005,45 @@ const CROSSING_SHOULDER_RAMP = 3;
 const CROSSING_SLOPE_RAMP = 6;
 
 /**
- * 踏切を考慮した整地目標。`null` なら道路側に任せて何も焼き込まない。
+ * 踏切を考慮した、その一点での整地目標 (線形 Y からのオフセット)。
  *
  * 舗装の下だけを譲って外側を放置すると、道路と同じ高さの地形がそのまま
  * 残ってレールまで埋まる。逆に舗装のすぐ脇で線路の断面 (法尻) まで
  * 落とすと、路端の下が 1 m 近く掘られて道路が浮く。そこで
  *   舗装の端 → 道床天端 → 法尻
- * と 2 段階で戻し、路端では道路と同じ高さ、数メートル先ではレールが
- * 顔を出している状態にする。
+ * と 2 段階で戻す。舗装の下は道路が焼く (`TerrainGrading.protect`)。
  */
-function crossingDrop(zones: CrossingZone[], s: number, naturalDrop: number): number | null {
-  if (zones.length === 0) return naturalDrop;
-  const naturalOffset = -naturalDrop;
+function crossingOffsetAt(
+  zones: CrossingZone[],
+  x: number,
+  z: number,
+  naturalOffset: number,
+): number {
   let offset = naturalOffset;
   for (const zone of zones) {
-    const distance = Math.abs(s - zone.s);
-    if (distance <= zone.inner) return null;
-    if (distance >= zone.outer) continue;
+    const dx = x - zone.x;
+    const dz = z - zone.z;
+    if (Math.abs(dx * zone.roadDir.x + dz * zone.roadDir.y) > zone.railExtent) continue;
+    const across = Math.abs(dx * zone.roadNormal.x + dz * zone.roadNormal.y);
+    if (across >= zone.outer) continue;
     const zoneOffset =
-      distance < zone.shoulder
+      across < zone.shoulder
         ? lerp(
             zone.roadOffset,
             zone.shoulderOffset,
-            smoothstep((distance - zone.inner) / (zone.shoulder - zone.inner)),
+            smoothstep(
+              (across - zone.roadHalfWidth) / Math.max(1e-6, zone.shoulder - zone.roadHalfWidth),
+            ),
           )
         : lerp(
             zone.shoulderOffset,
             naturalOffset,
-            smoothstep((distance - zone.shoulder) / (zone.outer - zone.shoulder)),
+            smoothstep((across - zone.shoulder) / Math.max(1e-6, zone.outer - zone.shoulder)),
           );
     // 重なった場合は高い方を採る。低い方に合わせると路端の下が掘られる。
     offset = Math.max(offset, zoneOffset);
   }
-  return -offset;
+  return offset;
 }
 
 /**
