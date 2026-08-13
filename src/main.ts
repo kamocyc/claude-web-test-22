@@ -1,6 +1,6 @@
 import { Vector3 } from 'three';
 import { BuildTool, type ToolMode } from './app/buildTool';
-import { buildDemoNetwork } from './app/demo';
+import { buildDemoNetwork, buildInterchangeDemo } from './app/demo';
 import { Ui } from './app/ui';
 import { Viewport } from './app/viewport';
 import { Network } from './network/network';
@@ -44,6 +44,9 @@ const ui = new Ui(uiRoot, {
     world.colorMode = on ? 'connectivity' : 'normal';
     dirty = true;
   },
+  onVehicles: (on) => {
+    world.showVehicles = on;
+  },
   onRegenerate: () => {
     terrainSeed = (terrainSeed * 1664525 + 1013904223) >>> 0;
     generateTerrain(field, { ...DEFAULT_TERRAIN, seed: terrainSeed });
@@ -51,6 +54,11 @@ const ui = new Ui(uiRoot, {
   },
   onDemo: () => {
     buildDemoNetwork(network, field);
+    tool.cancel();
+    dirty = true;
+  },
+  onInterchange: () => {
+    buildInterchangeDemo(network, field);
     tool.cancel();
     dirty = true;
   },
@@ -176,10 +184,13 @@ window.addEventListener('keyup', (event) => {
 
 // ------------------------------------------------------------ メインループ
 
-const clock = { start: performance.now() };
+const clock = { start: performance.now(), last: performance.now() };
 
 function frame(): void {
-  const time = (performance.now() - clock.start) / 1000;
+  const now = performance.now();
+  const time = (now - clock.start) / 1000;
+  const dt = (now - clock.last) / 1000;
+  clock.last = now;
 
   if (dirty) {
     dirty = false;
@@ -189,7 +200,7 @@ function frame(): void {
 
   tool.update(cursor, modifiers);
   ui.updateStatus(tool.status());
-  world.animate(time);
+  world.animate(time, dt);
   viewport.render();
   requestAnimationFrame(frame);
 }

@@ -1,126 +1,8 @@
 import { Vector3 } from 'three';
-import { getClass } from '../network/classes';
-import {
-  anchorFromNode,
-  computePlacement,
-  placeSegment,
-  type Anchor,
-} from '../network/editing';
+import { buildInterchange } from './interchange';
+import { draw, smoothProfile, type Waypoint } from './sketch';
 import type { Network } from '../network/network';
 import type { Heightfield } from '../terrain/heightfield';
-
-interface Waypoint {
-  x: number;
-  z: number;
-  /** 絶対高さ。省略時は自然地形の高さ。 */
-  y?: number;
-}
-
-/**
- * 経由点を順に繋いで線形を引く。建設ツールと同じ手順を通るので、
- * 接線の引き継ぎ・自動交差点生成も同じように働く。
- * 始点の近くに既存ノードがあればそれに接続する。
- */
-function draw(
-  network: Network,
-  field: Heightfield,
-  classId: string,
-  points: Waypoint[],
-  options: { straight?: boolean } = {},
-): void {
-  const cls = getClass(classId);
-  const toVec = (p: Waypoint): Vector3 =>
-    new Vector3(p.x, p.y ?? field.baseHeightAt(p.x, p.z), p.z);
-
-  const first = toVec(points[0]);
-  const existing = network.findNodeNear(first, 3);
-  let anchor: Anchor = existing
-    ? anchorFromNode(network, existing, cls)
-    : { pos: first };
-
-  for (let i = 1; i < points.length; i++) {
-    const target = toVec(points[i]);
-    const preview = computePlacement(anchor, target, {
-      straight: options.straight ?? false,
-      cls,
-    });
-    const result = placeSegment(network, classId, anchor, { pos: target }, preview);
-    const endNode = network.nodes.get(result.endNode);
-    if (!endNode) break;
-    anchor = {
-      pos: endNode.pos.clone(),
-      node: endNode.id,
-      tangent: preview.endTangent.clone(),
-      grade: preview.endGrade,
-    };
-  }
-}
-
-/**
- * 経由点に縦断高さを与える。自然地形をならしたうえで、規格勾配を
- * 超えないよう前後から高さを制限する。
- */
-function smoothProfile(
-  field: Heightfield,
-  points: Waypoint[],
-  classId: string,
-  options: {
-    passes?: number;
-    lift?: number;
-    startY?: number;
-    /** 高さを固定する経由点 (踏切など、他の線形と高さを合わせたい点)。 */
-    fixed?: { index: number; y: number }[];
-  } = {},
-): Waypoint[] {
-  const cls = getClass(classId);
-  const passes = options.passes ?? 3;
-  const lift = options.lift ?? 1.5;
-  const heights = points.map((p) => field.baseHeightAt(p.x, p.z));
-
-  for (let pass = 0; pass < passes; pass++) {
-    const next = heights.slice();
-    for (let i = 1; i + 1 < heights.length; i++) {
-      next[i] = (heights[i - 1] + heights[i] * 2 + heights[i + 1]) / 4;
-    }
-    heights.splice(0, heights.length, ...next);
-  }
-
-  // 高さを固定したい点 (接続点や踏切) を反映する。
-  const locked = new Set<number>();
-  if (options.startY !== undefined) {
-    heights[0] = options.startY - lift;
-    locked.add(0);
-  }
-  for (const fix of options.fixed ?? []) {
-    heights[fix.index] = fix.y - lift;
-    locked.add(fix.index);
-  }
-
-  // 経由点間の勾配は規格の 9 割までに抑える。区間内の最大勾配は
-  // computePlacement 側でも規格に収まるよう調整される。
-  const limit = cls.maxGrade * 0.9;
-  const spans = points.map((p, i) =>
-    i === 0 ? 0 : Math.hypot(p.x - points[i - 1].x, p.z - points[i - 1].z),
-  );
-  for (let pass = 0; pass < 6; pass++) {
-    for (let i = 1; i < heights.length; i++) {
-      if (locked.has(i)) continue;
-      heights[i] = clampDelta(heights[i], heights[i - 1], limit * spans[i]);
-    }
-    for (let i = heights.length - 2; i >= 0; i--) {
-      if (locked.has(i)) continue;
-      heights[i] = clampDelta(heights[i], heights[i + 1], limit * spans[i + 1]);
-    }
-  }
-
-  return points.map((p, i) => ({ ...p, y: heights[i] + lift }));
-}
-
-function clampDelta(value: number, reference: number, max: number): number {
-  if (value > reference + max) return reference + max;
-  if (value < reference - max) return reference - max;
-  return value;
-}
 
 /**
  * 道路上で、路面が自然地形といちばん近い高さになっている地点を探す。
@@ -259,4 +141,56 @@ export function buildDemoNetwork(network: Network, field: Heightfield): void {
     draw(network, field, 'road_small', branch(240, 80));
     draw(network, field, 'road_small', branch(-230, -70));
   }
+}
+
+/**
+ * インターチェンジのサンプル。
+ *
+ * 高低差の少ない所を選んで置く。本線は側道より 9 m 高いので、平らな所に
+ * 置けば橋と盛土だけで収まり、ランプの勾配も規格に収まる。
+ */
+export function buildInterchangeDemo(network: Network, field: Heightfield): void {
+  network.clear();
+  const spot = flattestSpot(field);
+  buildInterchange(network, field, { center: spot.center, angle: spot.angle });
+}
+
+/** 本線と側道が通る十字の範囲で、いちばん起伏の小さい場所と向きを選ぶ。 */
+function flattestSpot(field: Heightfield): { center: { x: number; z: number }; angle: number } {
+  let best = { center: { x: 0, z: 0 }, angle: 0 };
+  let bestRange = Infinity;
+  for (const angle of [0, Math.PI / 2]) {
+    for (let x = -120; x <= 120; x += 60) {
+      for (let z = -120; z <= 120; z += 60) {
+        const range = crossRange(field, x, z, angle);
+        if (range < bestRange) {
+          bestRange = range;
+          best = { center: { x, z }, angle };
+        }
+      }
+    }
+  }
+  return best;
+}
+
+/** 十字に伸ばした線上の、地形の高低差 [m]。 */
+function crossRange(field: Heightfield, x: number, z: number, angle: number): number {
+  const cos = Math.cos(angle);
+  const sin = Math.sin(angle);
+  let lo = Infinity;
+  let hi = -Infinity;
+  for (const [du, dv] of [
+    [1, 0],
+    [0, 1],
+  ] as const) {
+    const reach = du === 1 ? 400 : 300;
+    for (let t = -reach; t <= reach; t += 40) {
+      const u = t * du;
+      const v = t * dv;
+      const y = field.baseHeightAt(x + u * cos - v * sin, z + u * sin + v * cos);
+      lo = Math.min(lo, y);
+      hi = Math.max(hi, y);
+    }
+  }
+  return hi - lo;
 }

@@ -19,6 +19,7 @@ import {
   buildCrosswalk,
   buildLaneMarkings,
   buildStopLine,
+  buildTurnArrows,
   type ApproachFrame,
   type SurfacePath,
 } from '../build/markings';
@@ -53,7 +54,12 @@ import {
 import type { NetworkClass } from '../network/classes';
 import { findCrossings, type Crossing } from '../network/crossings';
 import { solveJunctions, type Approach, type Junction } from '../network/junction';
+import { solveApproachLanes } from '../network/lanes';
 import type { Network, NodeId, SegmentId } from '../network/network';
+import { buildLaneGraph, signalPhaseOf, type LaneGraph } from '../sim/lanegraph';
+import { signalStateAt } from '../sim/signals';
+import { Traffic } from '../sim/traffic';
+import { VehicleView } from './vehicles';
 import { buildConnectivity, type Connectivity } from '../network/connectivity';
 import { Occupancy } from '../network/occupancy';
 import {
@@ -206,6 +212,14 @@ export class WorldBuilder {
   junctions = new Map<NodeId, Junction>();
   crossings: Crossing[] = [];
 
+  /** 最後に組み立てた車線グラフ。 */
+  laneGraph: LaneGraph = { lanes: [], spawnable: [] };
+  /** 車両のシミュレーション。 */
+  readonly traffic = new Traffic(this.laneGraph);
+  private readonly vehicleView = new VehicleView();
+  /** 車両を走らせるか。 */
+  showVehicles = true;
+
   constructor(
     private readonly network: Network,
     private readonly field: Heightfield,
@@ -225,7 +239,13 @@ export class WorldBuilder {
     this.structureMesh.receiveShadow = true;
     this.propGroup.name = 'props';
 
-    this.group.add(this.surfaceMesh, this.overlayMesh, this.structureMesh, this.propGroup);
+    this.group.add(
+      this.surfaceMesh,
+      this.overlayMesh,
+      this.structureMesh,
+      this.propGroup,
+      this.vehicleView.group,
+    );
   }
 
   rebuild(): BuildResult {
@@ -402,6 +422,12 @@ export class WorldBuilder {
     this.replaceGeometry(this.surfaceMesh, surface);
     this.replaceGeometry(this.overlayMesh, overlay);
     this.replaceGeometry(this.structureMesh, structure);
+
+    // 車線グラフは形が変わるたびに作り直す。走っている車両は捨てる
+    // (通れなくなった車線に取り残された車が残り続けるのを防ぐ)。
+    this.laneGraph = buildLaneGraph(network, junctions, ranges);
+    this.traffic.reset(this.laneGraph);
+    this.vehicleView.clear();
 
     return {
       warnings,
@@ -1033,12 +1059,25 @@ export class WorldBuilder {
 
     if (junction.kind !== 'intersection' && junction.kind !== 'joint') return;
 
+    // 進行方向別通行区分 (右折・左折車線) は交差点ごとに決まる。
+    const laneAssignment = solveApproachLanes(junction);
     for (const approach of junction.approaches) {
       const frame = this.approachFrame(approach);
-      if (junction.kind === 'intersection') {
-        buildCrosswalk(overlay, frame);
-        buildStopLine(overlay, frame);
-      }
+      if (junction.kind !== 'intersection') continue;
+      buildCrosswalk(overlay, frame);
+      buildStopLine(overlay, frame);
+      const lanes = laneAssignment.get(approach.branch.segment);
+      if (!lanes) continue;
+      buildTurnArrows(
+        overlay,
+        frame,
+        lanes.entry.map((entry) => ({
+          // 断面の横距は線形基準なので、外向き基準に直す。
+          offset: approach.branch.atStart ? entry.lane.offset : -entry.lane.offset,
+          width: entry.lane.width,
+          movements: entry.movements,
+        })),
+      );
     }
 
     if (junction.kind === 'intersection') {
@@ -1072,7 +1111,7 @@ export class WorldBuilder {
         facing: post.outward,
         inward: post.right.clone().negate(),
         armLength: cls.carriagewayHalfWidth + 1.0,
-        phase: index % 2,
+        phase: signalPhaseOf(index),
       });
       this.signals.push(assembly);
       this.propGroup.add(assembly.object);
@@ -1342,14 +1381,10 @@ export class WorldBuilder {
     this.props = [];
   }
 
-  /** 信号・遮断機のアニメーションを進める。 */
-  animate(time: number): void {
-    const signalPeriod = 26;
-    const t = time % signalPeriod;
+  /** 信号・遮断機・車両のアニメーションを進める。 */
+  animate(time: number, dt = 0): void {
     for (const signal of this.signals) {
-      const local = (t + signal.phase * (signalPeriod / 2)) % signalPeriod;
-      const state: 0 | 1 | 2 = local < 10 ? 0 : local < 12.5 ? 1 : 2;
-      setSignalState(signal, state);
+      setSignalState(signal, signalStateAt(time, signal.phase));
     }
 
     const gatePeriod = 34;
@@ -1361,6 +1396,15 @@ export class WorldBuilder {
     else if (g < 20) closed = 1 - (g - 16) / 4;
     const blink = Math.floor(time * 1.6) % 2 === 0;
     for (const gate of this.gates) setGateState(gate, closed, blink);
+
+    if (!this.showVehicles) {
+      this.vehicleView.clear();
+      return;
+    }
+    // 信号の現示は描画側と同じ時刻・同じ関数で見るので、青なのに止まった
+    // ままになることがない。
+    this.traffic.step(dt, time);
+    this.vehicleView.sync(this.traffic.vehicles);
   }
 }
 

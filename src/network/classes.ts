@@ -25,8 +25,17 @@ export interface NetworkClass {
   /** 歩道の高さ (縁石高) [m]。 */
   curbHeight: number;
 
-  /** 車線 (線路では軌道) の一覧。 */
+  /** 車線 (線路では軌道) の一覧。中心線から見て左 (offset が小) の順。 */
   lanes: LaneSpec[];
+  /** 一方通行か。ランプなど、全車線が同じ向きに走る種別で true。 */
+  oneWay: boolean;
+  /**
+   * 中央分離帯があるか。
+   *
+   * 分離帯のある道路では対向車線を横切れないので、左側通行では右折が
+   * できない (自動車専用道の出入りがランプに限られるのはこのため)。
+   */
+  divided: boolean;
   /** 線路の軌道中心オフセット [m]。道路では空。 */
   tracks: number[];
 
@@ -56,6 +65,12 @@ function road(opts: {
   laneCount: number;
   laneWidth: number;
   sidewalkWidth: number;
+  /** 車道の外側に取る路肩幅 [m]。歩道のない種別で舗装に余裕を持たせる。 */
+  shoulderWidth?: number;
+  /** 一方通行 (全車線が線形の向きに走る)。 */
+  oneWay?: boolean;
+  /** 中央分離帯があり、対向車線を横切れない。 */
+  divided?: boolean;
   minRadius: number;
   maxGrade: number;
   cornerRadius: number;
@@ -70,17 +85,24 @@ function road(opts: {
   for (let i = 0; i < opts.laneCount; i++) {
     const offset = -carriagewayHalfWidth + (i + 0.5) * opts.laneWidth;
     // 左側通行では中心線より左 (offset < 0) が進行方向、右が対向。
-    lanes.push({ offset, width: opts.laneWidth, direction: offset < 0 ? 1 : -1 });
+    // 一方通行では対向がないので、全車線が線形の向きに走る。
+    lanes.push({
+      offset,
+      width: opts.laneWidth,
+      direction: opts.oneWay || offset < 0 ? 1 : -1,
+    });
   }
   return {
     id: opts.id,
     kind: 'road',
     label: opts.label,
-    halfWidth: carriagewayHalfWidth + opts.sidewalkWidth,
+    halfWidth: carriagewayHalfWidth + opts.sidewalkWidth + (opts.shoulderWidth ?? 0),
     carriagewayHalfWidth,
     sidewalkWidth: opts.sidewalkWidth,
     curbHeight: opts.sidewalkWidth > 0 ? 0.15 : 0,
     lanes,
+    oneWay: opts.oneWay ?? false,
+    divided: opts.divided ?? false,
     tracks: [],
     minRadius: opts.minRadius,
     maxGrade: opts.maxGrade,
@@ -117,6 +139,8 @@ function rail(opts: {
       width: 3.0,
       direction: (opts.tracks.length > 1 && i > 0 ? -1 : 1) as 1 | -1,
     })),
+    oneWay: opts.tracks.length <= 1,
+    divided: false,
     tracks: opts.tracks,
     minRadius: opts.minRadius,
     maxGrade: opts.maxGrade,
@@ -184,6 +208,7 @@ export const NETWORK_CLASSES: NetworkClass[] = [
     laneCount: 4,
     laneWidth: 3.5,
     sidewalkWidth: 0,
+    divided: true,
     minRadius: 120,
     maxGrade: 0.05,
     cornerRadius: 15,
@@ -191,6 +216,23 @@ export const NETWORK_CLASSES: NetworkClass[] = [
     signalCapable: false,
     crosswalks: false,
     costPerMeter: 300,
+    surfaceColor: ASPHALT_DARK,
+  }),
+  road({
+    id: 'road_ramp',
+    label: 'ランプ (1 車線・一方通行)',
+    laneCount: 1,
+    laneWidth: 4.5,
+    sidewalkWidth: 0,
+    shoulderWidth: 1.5,
+    oneWay: true,
+    minRadius: 45,
+    maxGrade: 0.08,
+    cornerRadius: 8,
+    designSpeed: 50,
+    signalCapable: false,
+    crosswalks: false,
+    costPerMeter: 180,
     surfaceColor: ASPHALT_DARK,
   }),
   rail({

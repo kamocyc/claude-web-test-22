@@ -7,10 +7,14 @@ export interface UiCallbacks {
   onMode: (mode: ToolMode) => void;
   /** 接続の色分け表示を切り替える。 */
   onConnectivityColors: (on: boolean) => void;
+  /** 車両の走行表示を切り替える。 */
+  onVehicles: (on: boolean) => void;
   onClass: (classId: string) => void;
   onElevation: (steps: number) => void;
   onRegenerate: () => void;
   onDemo: () => void;
+  /** インターチェンジのサンプルを置く。 */
+  onInterchange: () => void;
   onClear: () => void;
 }
 
@@ -97,6 +101,12 @@ export class Ui {
         initial: false,
         apply: (on) => callbacks.onConnectivityColors(on),
       },
+      {
+        id: 'vehicles',
+        label: '車両を走らせる',
+        initial: true,
+        apply: (on) => callbacks.onVehicles(on),
+      },
     ];
     for (const toggle of toggles) {
       left.append(checkbox(toggle.label, toggle.initial, toggle.apply));
@@ -108,6 +118,7 @@ export class Ui {
     mapRow.append(
       button('地形を再生成', callbacks.onRegenerate),
       button('サンプル', callbacks.onDemo),
+      button('インター', callbacks.onInterchange),
       button('全消去', callbacks.onClear),
     );
     left.append(mapRow);
