@@ -295,7 +295,7 @@ export interface CatenaryOptions {
    * その地点に建ててよいか。踏切や立体交差では、線路の路肩がそのまま
    * 道路の真ん中になることがあるので、置く前に必ず確かめる。
    */
-  canPlace?: (x: number, z: number) => boolean;
+  canPlace?: (x: number, z: number, y: number) => boolean;
 }
 
 /** 架線柱と架線を作る。建てた柱の足元位置を返す。 */
@@ -382,12 +382,12 @@ export function buildCatenary(
 function pickSide(
   sample: AlignmentSample,
   offset: number,
-  canPlace: (x: number, z: number) => boolean,
+  canPlace: (x: number, z: number, y: number) => boolean,
 ): -1 | 0 | 1 {
   for (const side of [1, -1] as const) {
     const x = sample.pos.x + sample.right.x * offset * side;
     const z = sample.pos.z + sample.right.z * offset * side;
-    if (canPlace(x, z)) return side;
+    if (canPlace(x, z, sample.pos.y)) return side;
   }
   return 0;
 }

@@ -291,7 +291,7 @@ export class WorldBuilder {
     }
 
     for (const crossing of crossings) {
-      this.buildCrossing(overlay, crossing, warnings, stats);
+      this.buildCrossing(overlay, crossing, structures, warnings, stats);
     }
 
     this.replaceGeometry(this.surfaceMesh, surface);
@@ -575,8 +575,8 @@ export class WorldBuilder {
     const profile = profileFor(cls);
     const ground = (x: number, z: number): number => this.field.heightAt(x, z);
     // 自分自身の上には当然乗るので、判定からは外す。
-    const canPlace = (x: number, z: number): boolean =>
-      this.occupancy.isFree(x, z, { exceptSegments: [segment], margin: PROP_CLEARANCE });
+    const canPlace = (x: number, z: number, y?: number): boolean =>
+      this.occupancy.isFree(x, z, { exceptSegments: [segment], margin: PROP_CLEARANCE, y });
     let poleSerial = 0;
 
     for (const run of runs) {
@@ -754,9 +754,12 @@ export class WorldBuilder {
       const distance = approach.trim + setback + extra;
       const s = approach.branch.atStart ? distance : alignment.length - distance;
       if (s < 0.2 || s > alignment.length - 0.2) continue;
+      const mode = modeAt(runs, s);
+      // トンネルの中には立てない。地表に合わせると山の上に信号が生える。
+      if (mode === 'tunnel') continue;
       // 橋の上では床版の外に地面がない。高欄の内側に寄せて立てる。
       // 歩道のない種別では寄せる余地がないので、その枝には立てない。
-      const onBridge = runs.some((run) => run.mode === 'bridge' && s >= run.s0 && s <= run.s1);
+      const onBridge = mode === 'bridge';
       if (onBridge && cls.halfWidth - 0.6 <= cls.carriagewayHalfWidth + 0.2) continue;
       const lateral = onBridge ? cls.halfWidth - 0.6 : cls.halfWidth + 0.5;
       const sample = alignment.sampleAt(s);
@@ -764,23 +767,20 @@ export class WorldBuilder {
       const right = sample.right.clone().multiplyScalar(sign).setY(0).normalize();
       const x = sample.pos.x + right.x * lateral;
       const z = sample.pos.z + right.z * lateral;
-      if (onBridge) {
-        const outward = sample.forward.clone().multiplyScalar(sign).setY(0).normalize();
-        // 桁の上なので地形は見ない。路面の高さに合わせる。
-        const base = new Vector3(x, sample.pos.y + cls.curbHeight, z);
-        return { base, outward, right };
-      }
+      const surfaceY = sample.pos.y + cls.curbHeight;
+      // 桁の上では地形を見ない (地面は遥か下にある)。
+      const baseY = onBridge ? surfaceY : this.propGroundY(x, z, surfaceY);
       if (
         !this.occupancy.isFree(x, z, {
           exceptSegments: [approach.branch.segment],
           margin: PROP_CLEARANCE,
+          y: baseY,
         })
       ) {
         continue;
       }
       const outward = sample.forward.clone().multiplyScalar(sign).setY(0).normalize();
-      const base = new Vector3(x, this.propGroundY(x, z, sample.pos.y + cls.curbHeight), z);
-      return { base, outward, right };
+      return { base: new Vector3(x, baseY, z), outward, right };
     }
     return null;
   }
@@ -802,6 +802,7 @@ export class WorldBuilder {
   private buildCrossing(
     overlay: MeshBuilder,
     crossing: Crossing,
+    structures: Map<SegmentId, StructureRun[]>,
     warnings: WorldWarning[],
     stats: WorldStats,
   ): void {
@@ -824,12 +825,14 @@ export class WorldBuilder {
       road.cls,
       crossing.rail.cls,
       {
-        canPlace: (x, z) =>
+        canPlace: (x, z, y) =>
           this.occupancy.isFree(x, z, {
             exceptSegments: [road.segment],
             margin: PROP_CLEARANCE,
+            y,
           }),
         groundY: (x, z, surfaceY) => this.propGroundY(x, z, surfaceY),
+        modeAt: (sample) => modeAt(structures.get(sample.segment) ?? [], sample.s),
       },
     );
 
@@ -963,6 +966,14 @@ function liftForCrossings(
     const offset = crossingOffsetAt(zones, p.x, p.z, naturalOffset);
     if (offset > naturalOffset) p.y = Math.min(ceiling, Math.max(p.y, centreY + offset));
   }
+}
+
+/** その弧長がどの構造形式の区間に入るか。 */
+function modeAt(runs: StructureRun[], s: number): StructureRun['mode'] {
+  for (const run of runs) {
+    if (s >= run.s0 && s <= run.s1) return run.mode;
+  }
+  return 'ground';
 }
 
 /** 断面の帯が中心線からどれだけ離れているか (中心線をまたぐ帯は 0)。 */

@@ -216,28 +216,63 @@ function roadPolylines(scene: Scene) {
 }
 
 /**
- * その位置が道路の舗装に覆われているか。覆っているなら舗装面の高さを返す。
- * 「レールが地形に埋まっている」判定から、踏切の舗装の下を外すのに使う
- * (舗装の下でレールが隠れるのは仕様)。
+ * その位置にいちばん近い道路について、中心線からの垂距と、そこでの
+ * 舗装の路端 (断面のいちばん外側 = 歩道の外端) の描画高さを返す。
+ * 中心線は 1 m 刻みの折れ線なので、垂距の誤差は曲線でも数 mm。
  */
-function roadSurfaceAt(
+function roadCoverAt(
   roads: ReturnType<typeof roadPolylines>,
   x: number,
   z: number,
-): number | null {
+): { lateral: number; halfWidth: number; edgeY: number } | null {
+  let best: { lateral: number; halfWidth: number; edgeY: number } | null = null;
+  let bestDist = Infinity;
   for (const road of roads) {
+    const edgeHeight = profileFor(road.cls)[0].height;
     for (let i = 0; i < road.pts.length; i++) {
       const p = road.pts[i];
       const dx = x - p.x;
       const dz = z - p.z;
-      if (Math.abs(dx) > 60 || Math.abs(dz) > 60) continue;
+      const d = dx * dx + dz * dz;
+      if (d >= bestDist) continue;
+      bestDist = d;
       const r = road.rights[i];
-      const lateral = Math.abs(dx * r.x + dz * r.z);
-      const along = Math.abs(dx * -r.z + dz * r.x);
-      if (lateral <= road.cls.halfWidth && along <= 1.0) return p.y + SURFACE_LIFT;
+      best = {
+        lateral: Math.abs(dx * r.x + dz * r.z),
+        halfWidth: road.cls.halfWidth,
+        edgeY: p.y + edgeHeight + SURFACE_LIFT,
+      };
     }
   }
-  return null;
+  return best;
+}
+
+/**
+ * その点で「地形がレール頭頂面より上にあってもよい量」。null は判定対象外。
+ *
+ * 舗装の下 (垂距 <= 半幅) はレールが隠れて当然なので外す。そのすぐ外側も、
+ * 地形は舗装の路端と繋がらなければならない: 勾配のある道路が踏切を斜めに
+ * 横切ると路端そのものが交点のレール高より高くなるので (実測: 交差角 55°
+ * + 8% の踏切で、舗装の端の路端がレール頭頂面より 0.86 m 上)、路端の脇で
+ * 地形がレールを覆うのは幾何的に避けられない。
+ *
+ * そこで「路端がレールより高い分」を、擦り付け距離 (worldBuilder の
+ * CROSSING_SHOULDER_RAMP = 3 m) で 0 まで直線的に減らした値を許容量とする。
+ * 3 m 離れれば地形は道床天端まで落ちている想定なので、それを超える埋没は
+ * 不具合として扱う。
+ */
+function allowedRailCover(
+  roads: ReturnType<typeof roadPolylines>,
+  x: number,
+  z: number,
+  railTop: number,
+): number | null {
+  const cover = roadCoverAt(roads, x, z);
+  if (!cover) return 0;
+  if (cover.lateral <= cover.halfWidth) return null;
+  const outside = cover.lateral - cover.halfWidth;
+  if (outside >= 3) return 0;
+  return Math.max(0, cover.edgeY - railTop) * (1 - outside / 3);
 }
 
 /**
@@ -389,13 +424,14 @@ function railBuriedViolations(scene: Scene, tolerance = 0.05): Violation[] {
         for (const d of [-0.72, 0, 0.72]) {
           const x = sample.pos.x + sample.right.x * (offset + d);
           const z = sample.pos.z + sample.right.z * (offset + d);
-          if (roadSurfaceAt(roads, x, z) !== null) continue;
+          const allowed = allowedRailCover(roads, x, z, railTop);
+          if (allowed === null) continue; // 舗装の下
           const terrain = scene.field.heightAt(x, z);
-          if (terrain - railTop > tolerance) {
+          if (terrain - railTop > allowed + tolerance) {
             out.push({
-              amount: terrain - railTop,
+              amount: terrain - railTop - allowed,
               where: new Vector3(x, terrain, z),
-              what: `レールが埋まる: seg=${seg.id} s=${s.toFixed(1)} 頭頂面=${railTop.toFixed(2)} 地形=${terrain.toFixed(2)}`,
+              what: `レールが埋まる: seg=${seg.id} s=${s.toFixed(1)} 頭頂面=${railTop.toFixed(2)} 地形=${terrain.toFixed(2)} 許容=${allowed.toFixed(2)}`,
             });
           }
         }
@@ -405,45 +441,30 @@ function railBuriedViolations(scene: Scene, tolerance = 0.05): Violation[] {
   return out;
 }
 
-/** 踏切で「舗装に譲る」範囲 (worldBuilder の CrossingZone と同じ計算)。 */
-function crossingZonesOf(scene: Scene): Map<SegmentId, { s: number; inner: number; shoulder: number }[]> {
-  const map = new Map<SegmentId, { s: number; inner: number; shoulder: number }[]>();
-  for (const crossing of scene.world.crossings) {
-    if (crossing.kind !== 'level' || !crossing.rail || !crossing.road) continue;
-    const rail = crossing.rail;
-    const road = crossing.road;
-    const sinTheta = Math.abs(road.dir.x * rail.dir.y - road.dir.y * rail.dir.x);
-    const skew = 1 / Math.max(0.26, sinTheta);
-    // worldBuilder の CrossingZone と同じ値にしておく (舗装 + 1 m が inner、
-    // そこから 3 m = CROSSING_SHOULDER_RAMP で道床天端まで擦り付ける)。
-    const inner = (road.cls.halfWidth + 1) * skew;
-    const list = map.get(rail.segment) ?? [];
-    list.push({ s: rail.s, inner, shoulder: inner + 3 });
-    map.set(rail.segment, list);
-  }
-  return map;
-}
-
 /**
  * (3) 道床天端より上に地形が来ていないか。
- * 踏切の舗装とその擦り付け区間は、道床が隠れる仕様なので除外する。
+ *
+ * 踏切では、舗装の下 (垂距 <= 道路の半幅) で道床が隠れるのは仕様。その
+ * 外側も、路端から道床天端へ擦り付ける 3 m (CROSSING_SHOULDER_RAMP) の
+ * 間は天端より上に地形があってよい。そこで垂距が「半幅 + 3 m」以内の点は
+ * 判定から外す。
  */
 function ballastBuriedViolations(scene: Scene, tolerance = 0.05): Violation[] {
   const out: Violation[] = [];
-  const zones = crossingZonesOf(scene);
+  const roads = roadPolylines(scene);
   const blends = railBlendsOf(scene);
   for (const seg of scene.network.segments.values()) {
     const cls = scene.network.classOf(seg);
     if (cls.kind !== 'rail') continue;
     const top = Math.max(...cls.tracks.map(Math.abs)) + 1.7;
-    const list = zones.get(seg.id) ?? [];
     for (const s of groundStations(scene, seg.id, 1.5)) {
-      if (list.some((z) => Math.abs(s - z.s) <= z.shoulder)) continue;
       const sample = drawnSampleAt(scene, seg.id, s, blends);
       const ballastTop = sample.pos.y - RAIL_TOP_TO_BALLAST + SURFACE_LIFT;
       for (const offset of [-top + 0.2, 0, top - 0.2]) {
         const x = sample.pos.x + sample.right.x * offset;
         const z = sample.pos.z + sample.right.z * offset;
+        const cover = roadCoverAt(roads, x, z);
+        if (cover && cover.lateral <= cover.halfWidth + 3) continue;
         const terrain = scene.field.heightAt(x, z);
         if (terrain - ballastTop > tolerance) {
           out.push({
@@ -567,8 +588,19 @@ class SurfaceFloor {
     }
   }
 
-  /** (x, z) にいちばん近い頂点の XZ。半径内に無ければ null。 */
-  nearestVertexXZ(x: number, z: number, radius = 0.15): { x: number; z: number } | null {
+  /**
+   * 点 (x, y, z) にいちばん近い頂点の XZ。半径内に無ければ null。
+   *
+   * 高さでも絞るのが大事で、立体交差のように同じ XZ に別の面があると、
+   * XZ だけで探すと関係のない面の頂点を掴んでしまう。
+   */
+  nearestVertexXZ(
+    x: number,
+    z: number,
+    radius = 0.15,
+    y?: number,
+    radiusY = 0.1,
+  ): { x: number; z: number } | null {
     let best: { x: number; z: number } | null = null;
     let bestD = radius * radius;
     const cx = Math.round(x / this.cell);
@@ -578,6 +610,7 @@ class SurfaceFloor {
         const list = this.buckets.get(`${cx + dx},${cz + dz}`);
         if (!list) continue;
         for (let i = 0; i < list.length; i += 3) {
+          if (y !== undefined && Math.abs(list[i + 1] - y) > radiusY) continue;
           const d = (list[i] - x) ** 2 + (list[i + 2] - z) ** 2;
           if (d < bestD) {
             bestD = d;
@@ -589,8 +622,8 @@ class SurfaceFloor {
     return best;
   }
 
-  /** (x, z) のほぼ真上にある頂点の最高 Y。見つからなければ null。 */
-  highestAt(x: number, z: number, radius = 0.05): number | null {
+  /** (x, z) のほぼ真上にある頂点の最高 Y (`ceiling` より上は無視)。 */
+  highestAt(x: number, z: number, radius = 0.05, ceiling = Infinity): number | null {
     let best: number | null = null;
     const cx = Math.round(x / this.cell);
     const cz = Math.round(z / this.cell);
@@ -600,6 +633,7 @@ class SurfaceFloor {
         if (!list) continue;
         for (let i = 0; i < list.length; i += 3) {
           if (Math.abs(list[i] - x) > radius || Math.abs(list[i + 2] - z) > radius) continue;
+          if (list[i + 1] > ceiling) continue;
           if (best === null || list[i + 1] > best) best = list[i + 1];
         }
       }
@@ -607,8 +641,11 @@ class SurfaceFloor {
     return best;
   }
 
-  /** (x, z) のほぼ真下にある頂点の最低 Y。見つからなければ null。 */
-  lowestAt(x: number, z: number, radius = 0.05): number | null {
+  /**
+   * (x, z) のほぼ真下にある頂点の最低 Y。`ceiling` を与えると、それより
+   * 上の頂点は無視する (立体交差で上を通る面を拾わないため)。
+   */
+  lowestAt(x: number, z: number, radius = 0.05, ceiling = Infinity): number | null {
     let best: number | null = null;
     const cx = Math.round(x / this.cell);
     const cz = Math.round(z / this.cell);
@@ -618,6 +655,7 @@ class SurfaceFloor {
         if (!list) continue;
         for (let i = 0; i < list.length; i += 3) {
           if (Math.abs(list[i] - x) > radius || Math.abs(list[i + 2] - z) > radius) continue;
+          if (list[i + 1] > ceiling) continue;
           if (best === null || list[i + 1] < best) best = list[i + 1];
         }
       }
@@ -647,9 +685,9 @@ function skirtGapViolations(scene: Scene, tolerance = 0.05): Violation[] {
       const sample = drawnSampleAt(scene, seg.id, s, blends);
       for (const side of [-1, 1]) {
         const p = profilePointAt(sample, side * Math.abs(edge.offset), edge.height, new Vector3());
-        const vertex = floor.nearestVertexXZ(p.x, p.z);
+        const vertex = floor.nearestVertexXZ(p.x, p.z, 0.15, p.y);
         if (!vertex) continue;
-        const bottom = floor.lowestAt(vertex.x, vertex.z);
+        const bottom = floor.lowestAt(vertex.x, vertex.z, 0.05, p.y + 0.05);
         if (bottom === null) continue;
         const terrain = scene.field.heightAt(vertex.x, vertex.z);
         if (bottom - terrain > tolerance) {
@@ -677,7 +715,7 @@ function junctionSkirtGapViolations(scene: Scene, tolerance = 0.05): Violation[]
     if (Math.abs(node.pos.y - scene.field.baseHeightAt(node.pos.x, node.pos.z)) > 6) continue;
     for (const p of ring) {
       const top = p.y + SURFACE_LIFT;
-      const bottom = floor.lowestAt(p.x, p.z);
+      const bottom = floor.lowestAt(p.x, p.z, 0.05, top + 0.05);
       if (bottom === null) continue;
       const terrain = scene.field.heightAt(p.x, p.z);
       if (bottom - terrain > tolerance) {
@@ -717,9 +755,9 @@ function harnessDriftViolations(scene: Scene, tolerance = 0.03): Violation[] {
       const sample = drawnSampleAt(scene, seg.id, s, blends);
       for (const side of [-1, 1]) {
         const p = profilePointAt(sample, side * Math.abs(edge.offset), edge.height, new Vector3());
-        const vertex = floor.nearestVertexXZ(p.x, p.z, 0.06);
+        const vertex = floor.nearestVertexXZ(p.x, p.z, 0.06, p.y, 0.5);
         if (!vertex) continue;
-        const top = floor.highestAt(vertex.x, vertex.z);
+        const top = floor.highestAt(vertex.x, vertex.z, 0.05, p.y + 0.5);
         if (top === null) continue;
         compared++;
         if (Math.abs(top - p.y) > tolerance) {
@@ -741,6 +779,76 @@ function harnessDriftViolations(scene: Scene, tolerance = 0.03): Violation[] {
     });
   }
   return out;
+}
+
+/**
+ * (8) 橋・トンネルの取り付き部が塞がっているか。
+ *
+ * 地表区間と橋・トンネル区間の境目では、整地の伝播が遮断されて地形が
+ * 垂直に切り立つ (橋台・坑口の仕様)。その段差を橋台・坑門が覆っていないと、
+ * 地面の断面が丸見えになり、桁の下に穴が抜ける。
+ *
+ * 判定: 境界の前後 4 m の地形の低い方まで構造物が下りていること、および
+ * 構造物の上端が桁下 (路面 − 1.5 m) 以上まで来ていること。
+ * 探索半径は「路面の半幅 + 2 m」。主桁は半幅の 0.78 倍、橋台は半幅 + 0.6 m
+ * の位置にあり、中心線上には頂点が無いため。
+ */
+function structureJointViolations(scene: Scene): { violations: Violation[]; joints: number } {
+  const out: Violation[] = [];
+  let joints = 0;
+  const mesh = scene.world.group.getObjectByName('structures') as
+    | { geometry: { attributes: { position: { count: number; getX(i: number): number; getY(i: number): number; getZ(i: number): number } } } }
+    | undefined;
+  const pos = mesh?.geometry.attributes.position;
+  if (!pos) throw new Error('structures メッシュが見つからない');
+
+  for (const seg of scene.network.segments.values()) {
+    const cls = scene.network.classOf(seg);
+    const al = scene.network.alignmentOf(seg.id);
+    const runs = scene.result.structures.get(seg.id) ?? [];
+    for (let i = 0; i + 1 < runs.length; i++) {
+      if (runs[i].mode === runs[i + 1].mode) continue;
+      joints++;
+      const s = runs[i].s1;
+      const p = al.sampleAt(s).pos;
+      const inside = al.sampleAt(Math.max(0, s - 4)).pos;
+      const outside = al.sampleAt(Math.min(al.length, s + 4)).pos;
+      const lowest = Math.min(
+        scene.field.heightAt(inside.x, inside.z),
+        scene.field.heightAt(outside.x, outside.z),
+      );
+      const radius = cls.halfWidth + 2;
+      let lo = Infinity;
+      let hi = -Infinity;
+      for (let k = 0; k < pos.count; k++) {
+        const dx = pos.getX(k) - p.x;
+        const dz = pos.getZ(k) - p.z;
+        if (dx * dx + dz * dz > radius * radius) continue;
+        lo = Math.min(lo, pos.getY(k));
+        hi = Math.max(hi, pos.getY(k));
+      }
+      const label = `${runs[i].mode}->${runs[i + 1].mode} seg=${seg.id}`;
+      if (lo === Infinity) {
+        out.push({ amount: Infinity, where: p, what: `取り付き部に構造物が無い: ${label}` });
+        continue;
+      }
+      if (lo - lowest > 0.05) {
+        out.push({
+          amount: lo - lowest,
+          where: p,
+          what: `橋台・坑門が地形の段差を塞いでいない: ${label} 構造物の下端=${lo.toFixed(2)} 地形=${lowest.toFixed(2)}`,
+        });
+      }
+      if (p.y - 1.5 - hi > 0.05) {
+        out.push({
+          amount: p.y - 1.5 - hi,
+          where: p,
+          what: `構造物が桁下まで届いていない: ${label} 上端=${hi.toFixed(2)} 路面=${p.y.toFixed(2)}`,
+        });
+      }
+    }
+  }
+  return { violations: out, joints };
 }
 
 // =====================================================================
@@ -895,6 +1003,71 @@ function junctionNearBridgeScene() {
   });
 }
 
+/**
+ * 曲線だけで組んだ配置。これまでのシナリオは全て直線だったので、
+ * 曲率のある線形での断面の向き・隅丸め・踏切の扱いを別に見る。
+ */
+function curvedScene(grade = 0) {
+  return buildScene(flat(20), (net, field) => {
+    draw(net, field, 'rail_single', [
+      { x: -220, z: -150, y: 20 },
+      { x: -40, z: -60, y: 20 },
+      { x: 140, z: 60, y: 20 },
+    ]);
+    // 曲線の道路が曲線の線路を横切る (踏切)。踏切を平面で成立させるため
+    // 本線は水平にし、勾配は交差点から分かれる枝側に付ける。
+    draw(net, field, 'road_medium', [
+      { x: -150, z: 130, y: 20 },
+      { x: -60, z: 20, y: 20 },
+      { x: 40, z: -90, y: 20 },
+    ]);
+    // 曲線の道路の途中から枝を出して交差点にする。
+    const hit = net.findSegmentNear(new Vector3(-110, 0, 70), 30);
+    if (hit) {
+      const node = net.splitSegment(hit.segment, hit.s);
+      draw(net, field, 'road_small', [
+        { x: node.pos.x, z: node.pos.z, y: node.pos.y },
+        { x: node.pos.x + 90, z: node.pos.z + 60, y: node.pos.y + grade * 110 },
+        { x: node.pos.x + 200, z: node.pos.z + 90, y: node.pos.y + grade * 230 },
+      ]);
+    }
+  });
+}
+
+/** 起伏の激しい自然地形 (最大勾配 40% 程度) の上に置いた交差点と踏切。 */
+function roughTerrainScene() {
+  const rough = (x: number, z: number): number =>
+    30 +
+    9 * Math.sin(x / 55) +
+    7 * Math.cos(z / 40) +
+    4 * Math.sin((x + z) / 25);
+  return buildScene(rough, (net, field) => {
+    // 縦断は自然地形をならした高さ (demo.ts と同じ発想) にする。
+    const smooth = (x: number, z: number): number => {
+      let sum = 0;
+      let n = 0;
+      for (let dx = -30; dx <= 30; dx += 10) {
+        for (let dz = -30; dz <= 30; dz += 10) {
+          sum += field.baseHeightAt(x + dx, z + dz);
+          n++;
+        }
+      }
+      return sum / n;
+    };
+    const trunk: Waypoint[] = [];
+    for (let x = -240; x <= 240; x += 60) trunk.push({ x, z: 0, y: smooth(x, 0) });
+    draw(net, field, 'road_medium', trunk, { straight: true });
+
+    const hit = net.findSegmentNear(new Vector3(0, 0, 0), 30)!;
+    const node = net.splitSegment(hit.segment, hit.s);
+    const branch: Waypoint[] = [{ x: node.pos.x, z: 0, y: node.pos.y }];
+    for (let z = 60; z <= 240; z += 60) {
+      branch.push({ x: node.pos.x, z, y: node.pos.y + (smooth(node.pos.x, z) - node.pos.y) * 0.6 });
+    }
+    draw(net, field, 'road_small', branch, { straight: true });
+  });
+}
+
 /** デモ配置 (回帰の基準)。 */
 function demoScene(): Scene {
   const field = new Heightfield();
@@ -1015,6 +1188,17 @@ describe('交差点面とセグメント帯の継ぎ目 (高低差あり)', () =
       return [`継ぎ目 (踏切 z=${at})`, seamViolations(scene)] as [string, Violation[]];
     });
     expectAllClean(scenes);
+  });
+
+  it('曲線の線形どうしの交差点・踏切で継ぎ目が開かない', () => {
+    const scene = curvedScene(0.06);
+    expect(scene.world.crossings.some((c) => c.kind === 'level')).toBe(true);
+    expect(ringJunctionCount(scene)).toBeGreaterThan(0);
+    expectNoViolation('継ぎ目 (曲線)', seamViolations(scene));
+  });
+
+  it('起伏の激しい地形の上の交差点で継ぎ目が開かない', () => {
+    expectNoViolation('継ぎ目 (起伏地形)', seamViolations(roughTerrainScene()));
   });
 
   it('デモ配置で継ぎ目が開かない', () => {
@@ -1139,6 +1323,24 @@ describe('整地した地形が路面・線路より上に来ない', () => {
     expectAllClean(entries);
   });
 
+  it('曲線の線形で車道・レール・道床・交差点面が地形に埋まらない', () => {
+    const scene = curvedScene(0.06);
+    expectAllClean([
+      ['車道', roadBuriedViolations(scene)],
+      ['レール', railBuriedViolations(scene)],
+      ['道床', ballastBuriedViolations(scene)],
+      ['交差点面', junctionBuriedViolations(scene)],
+    ]);
+  });
+
+  it('起伏の激しい地形の上で車道・交差点面が地形に埋まらない', () => {
+    const scene = roughTerrainScene();
+    expectAllClean([
+      ['車道', roadBuriedViolations(scene)],
+      ['交差点面', junctionBuriedViolations(scene)],
+    ]);
+  });
+
   it('デモ配置で車道・レール・道床・交差点面が地形に埋まらない', () => {
     const scene = demoScene();
     expectAllClean([
@@ -1146,6 +1348,23 @@ describe('整地した地形が路面・線路より上に来ない', () => {
       ['レール', railBuriedViolations(scene)],
       ['道床', ballastBuriedViolations(scene)],
       ['交差点面', junctionBuriedViolations(scene)],
+    ]);
+  });
+});
+
+describe('橋・トンネルの取り付き部', () => {
+  it('デモ配置で、整地が切れる段差を橋台・坑門が塞いでいる', () => {
+    const scene = demoScene();
+    const { violations, joints } = structureJointViolations(scene);
+    // 判定が空振りしていないこと (地表と構造物の境目が実際にあること)。
+    expect(joints).toBeGreaterThanOrEqual(4);
+    expectNoViolation('取り付き部', violations);
+  });
+
+  it('起伏の激しい地形・崖ぎわの配置でも取り付き部が塞がっている', () => {
+    expectAllClean([
+      ['取り付き部 (崖ぎわ)', structureJointViolations(junctionNearBridgeScene()).violations],
+      ['取り付き部 (起伏地形)', structureJointViolations(roughTerrainScene()).violations],
     ]);
   });
 });
@@ -1203,6 +1422,17 @@ describe('路端と地形の間に穴が開かない', () => {
 
   it('勾配の違う本線と側線が並ぶ分岐器で路端に穴が開かない', () => {
     expectNoViolation('路端', skirtGapViolations(turnoutScene({ mainGrade: 0.03, yardGrade: 0.02 })));
+  });
+
+  it('曲線の線形・起伏の激しい地形で路端に穴が開かない', () => {
+    const curved = curvedScene(0.06);
+    const rough = roughTerrainScene();
+    expectAllClean([
+      ['路端 (曲線)', skirtGapViolations(curved)],
+      ['交差点外周 (曲線)', junctionSkirtGapViolations(curved)],
+      ['路端 (起伏地形)', skirtGapViolations(rough)],
+      ['交差点外周 (起伏地形)', junctionSkirtGapViolations(rough)],
+    ]);
   });
 
   it('デモ配置で路端・交差点外周に穴が開かない', () => {

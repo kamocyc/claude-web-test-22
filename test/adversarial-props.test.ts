@@ -96,9 +96,11 @@ function buildScene(
   name: string,
   build: (network: Network, field: Heightfield) => void,
   seed?: number,
+  terrain?: (f: Heightfield) => void,
 ): Scene {
   const field = new Heightfield();
   if (seed !== undefined) generateTerrain(field, { ...DEFAULT_TERRAIN, seed });
+  if (terrain) terrain(field);
   const network = new Network();
   build(network, field);
   const terrainMesh = new TerrainMesh(field, new MeshBasicMaterial());
@@ -208,6 +210,20 @@ function nearestOnPoly(x: number, z: number, poly: Poly): Nearest {
 function travelledHalfWidth(cls: NetworkClass): number {
   if (cls.kind === 'rail') return Math.max(...cls.tracks.map(Math.abs), 0) + 1.5;
   return cls.carriagewayHalfWidth;
+}
+
+/**
+ * 平面で重なっていても、高さが離れていれば干渉ではない。
+ *
+ * 立体交差では、桁の上の支柱と桁下の線形が XZ では重なる。足元の高さが
+ * 相手の路面から 2 m 以上離れていれば「相手の上に立っている」とは言えない
+ * ので、判定から外す。2 m は縁石・道床・橋の床版厚 (1.1 m) を飲み込み、
+ * かつ建築限界 (道路 4.5 m / 線路 5.7 m) よりは十分小さい値。
+ */
+const VERTICAL_GATE = 2.0;
+
+function separatedVertically(propY: number, surfaceY: number): boolean {
+  return Math.abs(propY - surfaceY) > VERTICAL_GATE;
 }
 
 function pointInRing(x: number, z: number, ring: Vector3[]): boolean {
@@ -340,6 +356,7 @@ function checkOnOtherTravelway(s: Scene): Violation[] {
       const limit = travelledHalfWidth(poly.cls);
       const near = nearestOnPoly(prop.position.x, prop.position.z, poly);
       if (near.dist >= limit) continue;
+      if (separatedVertically(prop.position.y, near.y)) continue;
       out.push({
         scene: s.name,
         rule: '他の線形の車道・軌道の上',
@@ -374,6 +391,7 @@ function checkOnOtherPavement(s: Scene): Violation[] {
       }
       const near = nearestOnPoly(prop.position.x, prop.position.z, poly);
       if (near.dist >= poly.cls.halfWidth) continue;
+      if (separatedVertically(prop.position.y, near.y)) continue;
       out.push({
         scene: s.name,
         rule: '他の線形の舗装の上',
@@ -406,6 +424,8 @@ function checkInsideJunction(s: Scene): Violation[] {
       const ring = junction.ring;
       if (ring.length < 3 || ring.some((p) => !p)) continue;
       if (!pointInRing(prop.position.x, prop.position.z, ring)) continue;
+      const ringY = ring.reduce((acc, p) => acc + p.y, 0) / ring.length;
+      if (separatedVertically(prop.position.y, ringY)) continue;
       out.push({
         scene: s.name,
         rule: '交差点面 (ring) の内側',
@@ -423,6 +443,7 @@ function checkInsideJunction(s: Scene): Violation[] {
     for (const prop of s.result.props) {
       const near = nearestOnPoly(prop.position.x, prop.position.z, poly);
       if (near.dist >= limit) continue;
+      if (separatedVertically(prop.position.y, near.y)) continue;
       out.push({
         scene: s.name,
         rule: '交差点の車道・軌道の上 (トリム区間)',
@@ -607,6 +628,42 @@ function checkFootHeight(s: Scene): Violation[] {
 }
 
 /**
+ * 追加の不変条件: 小物は自分の線形の路面の近くに立つ。
+ *
+ * 足元が「どこかの地面や路面に接している」だけでは足りない。信号機が
+ * トンネルの真上の丘の上や、桁の遥か下の谷底に立っていても、地面には
+ * 接しているので浮き沈みの検査は通ってしまう。自分の線形の断面高さから
+ * 大きく離れていないことを別に見る。
+ *
+ * 許容 3.0 m の根拠: 縁石 0.15 m、道床の法尻まで 0.87 m、盛土の路肩で
+ * 地形が路面より下がる分を足しても 1.5 m には収まる。倍の余裕を取っても
+ * 「別の高さに飛んでいる」ものだけが引っかかる。
+ */
+const OWN_SURFACE_TOLERANCE = 3.0;
+
+function checkFootNearOwnSurface(s: Scene): Violation[] {
+  const out: Violation[] = [];
+  for (const prop of s.result.props) {
+    if (prop.segment === undefined || !s.network.segments.has(prop.segment)) continue;
+    const poly = fullCenterline(s, prop.segment);
+    const near = nearestOnPoly(prop.position.x, prop.position.z, poly);
+    const surface = near.y + profileHeightAt(poly.cls, near.dist);
+    const delta = prop.position.y - surface;
+    if (Math.abs(delta) <= OWN_SURFACE_TOLERANCE) continue;
+    out.push({
+      scene: s.name,
+      rule: '自分の線形の路面から離れた高さに立っている',
+      kind: prop.kind,
+      amount: Math.abs(delta),
+      x: prop.position.x,
+      z: prop.position.z,
+      detail: `seg#${prop.segment} (${poly.cls.id}) の路面 ${surface.toFixed(2)} m に対して足元 ${prop.position.y.toFixed(2)} m (差 ${delta.toFixed(2)} m)`,
+    });
+  }
+  return out;
+}
+
+/**
  * 不変条件 6: 電線が張られる柱の組と、その弦の位置。
  *
  * `buildUtilityPoles` / `buildCatenary` は「弧長がピッチ 1 つ分だけ離れた、
@@ -668,6 +725,31 @@ interface Scenario {
   name: string;
   build: (n: Network, f: Heightfield) => void;
   seed?: number;
+  /** 線形を引く前に自然地形を作る (谷・丘を作って橋・トンネルを誘発する)。 */
+  terrain?: (f: Heightfield) => void;
+}
+
+/** `height(x, z)` で自然地形を作る。`work` も同じ内容に初期化する。 */
+function shapeTerrain(f: Heightfield, height: (x: number, z: number) => number): void {
+  for (let iz = 0; iz <= f.cells; iz++) {
+    for (let ix = 0; ix <= f.cells; ix++) {
+      f.base[f.index(ix, iz)] = height(f.worldX(ix), f.worldZ(iz));
+    }
+  }
+  f.resetWork();
+}
+
+/** なだらかな谷・丘を作る (幅 `width` で深さ/高さ `depth`)。 */
+function ridge(center: number, width: number, depth: number): (x: number) => number {
+  return (x: number) => {
+    const t = Math.min(1, Math.abs(x - center) / width);
+    return depth * (1 - smoothstep01(t));
+  };
+}
+
+function smoothstep01(t: number): number {
+  const x = t < 0 ? 0 : t > 1 ? 1 : t;
+  return x * x * (3 - 2 * x);
 }
 
 /** 2 本の線形を指定角度で交差させる。`span` を小さくすると交点の近くにノードができる。 */
@@ -788,6 +870,165 @@ const SCENARIOS: Scenario[] = [
     },
   },
   {
+    // 桁の上の支柱は occupancy.isFree を通さない。真下を別の線形が通る配置で
+    // 「通さなくてよい」ことを確かめる (高さが 14 m 離れているので干渉しない)。
+    name: '高架交差点の真下を線路が通る',
+    build: (n, f) => {
+      draw(n, f, 'road_medium', [
+        { x: -300, z: 0, y: 14 },
+        { x: 300, z: 0, y: 14 },
+      ], { straight: true });
+      draw(n, f, 'road_medium', [
+        { x: 0, z: -300, y: 14 },
+        { x: 0, z: 300, y: 14 },
+      ], { straight: true });
+      // 交差点の隅 (支柱の立つ辺り) を通るように、斜めに線路を通す。
+      draw(n, f, 'rail_double', [
+        { x: -300, z: -300 + 22 },
+        { x: 300, z: 300 + 22 },
+      ], { straight: true });
+    },
+  },
+  {
+    // 同じ高さの別の高架道路が、交差点のすぐ横を並走する (接続しない)。
+    // 支柱は相手の車道の上に出ないか。
+    name: '高架交差点のすぐ横を同じ高さの高架道路が並走',
+    build: (n, f) => {
+      draw(n, f, 'road_medium', [
+        { x: -300, z: 0, y: 14 },
+        { x: 300, z: 0, y: 14 },
+      ], { straight: true });
+      draw(n, f, 'road_medium', [
+        { x: 0, z: -300, y: 14 },
+        { x: 0, z: 300, y: 14 },
+      ], { straight: true });
+      // 北の枝の支柱は実測で (-8.3, 10.9)。そこを舗装で覆う位置
+      // (中心 -12 m、半幅 4.6 m → -7.4〜-16.6 m) に、交点を作らずに並走させる
+      // (ランプが交差点の脇に寄り添って取り付く、という配置)。
+      draw(n, f, 'road_small', [
+        { x: -12, z: 5, y: 14 },
+        { x: -12, z: 300, y: 14 },
+      ], { straight: true });
+    },
+  },
+  {
+    // 桁の上を線路が同じ高さで横切る (橋の上の踏切)。
+    name: '高架交差点の枝を同じ高さの線路が横切る',
+    build: (n, f) => {
+      draw(n, f, 'road_medium', [
+        { x: -300, z: 0, y: 14 },
+        { x: 300, z: 0, y: 14 },
+      ], { straight: true });
+      draw(n, f, 'road_medium', [
+        { x: 0, z: -300, y: 14 },
+        { x: 0, z: 300, y: 14 },
+      ], { straight: true });
+      draw(n, f, 'rail_double', [
+        { x: -300, z: 26, y: 14 },
+        { x: 300, z: 26, y: 14 },
+      ], { straight: true });
+    },
+  },
+  {
+    name: '高架交差点に別の高架道路が斜めに取り付く (6 叉路)',
+    build: (n, f) => {
+      draw(n, f, 'road_medium', [
+        { x: -300, z: 0, y: 14 },
+        { x: 300, z: 0, y: 14 },
+      ], { straight: true });
+      draw(n, f, 'road_medium', [
+        { x: 0, z: -300, y: 14 },
+        { x: 0, z: 300, y: 14 },
+      ], { straight: true });
+      for (const deg of [40, 220]) {
+        const a = (deg * Math.PI) / 180;
+        draw(n, f, 'road_small', [
+          { x: 0, z: 0, y: 14 },
+          { x: 250 * Math.cos(a), z: 250 * Math.sin(a), y: 14 },
+        ], { straight: true });
+      }
+    },
+  },
+  {
+    // 谷を跨ぐので、道路は 地表 → 橋 → 地表 になる。電柱は地表区間にだけ
+    // 建つので、橋台のきわで浮かないかを見る。
+    name: '谷を跨ぐ橋の前後 (電柱と橋台の境界)',
+    terrain: (f) => {
+      const valley = ridge(0, 90, -22);
+      shapeTerrain(f, (x) => valley(x));
+    },
+    build: (n, f) => {
+      draw(n, f, 'road_medium', [
+        { x: -300, z: 0, y: 0 },
+        { x: 300, z: 0, y: 0 },
+      ], { straight: true });
+    },
+  },
+  {
+    // 丘を貫くのでトンネルになる。坑口のきわの電柱と、トンネル区間に
+    // 小物が湧いていないかを見る。
+    name: '丘を貫くトンネルの前後',
+    terrain: (f) => {
+      const hill = ridge(0, 90, 26);
+      shapeTerrain(f, (x) => hill(x));
+    },
+    build: (n, f) => {
+      draw(n, f, 'road_medium', [
+        { x: -300, z: 0, y: 0 },
+        { x: 300, z: 0, y: 0 },
+      ], { straight: true });
+    },
+  },
+  {
+    // 丘の下 (トンネルの中) に交差点。信号の足元が丘の表面に飛ばないか。
+    name: 'トンネルの中の交差点',
+    terrain: (f) => {
+      const hill = ridge(0, 120, 26);
+      shapeTerrain(f, (x, z) => Math.min(hill(x), hill(z)) + 0);
+    },
+    build: (n, f) => {
+      draw(n, f, 'road_medium', [
+        { x: -300, z: 0, y: 0 },
+        { x: 300, z: 0, y: 0 },
+      ], { straight: true });
+      draw(n, f, 'road_medium', [
+        { x: 0, z: -300, y: 0 },
+        { x: 0, z: 300, y: 0 },
+      ], { straight: true });
+    },
+  },
+  {
+    name: '極端に短いセグメントの連なり (4 m 刻み)',
+    build: (n, f) => {
+      const pts: Waypoint[] = [];
+      for (let x = -120; x <= 120; x += 4) pts.push({ x, z: 0 });
+      draw(n, f, 'road_medium', pts, { straight: true });
+      draw(n, f, 'road_small', [{ x: 0, z: -120 }, { x: 0, z: 120 }], { straight: true });
+    },
+  },
+  {
+    name: '7 叉路',
+    build: (n, f) => {
+      draw(n, f, 'road_medium', [{ x: -250, z: 0 }, { x: 250, z: 0 }], { straight: true });
+      draw(n, f, 'road_medium', [{ x: 0, z: -250 }, { x: 0, z: 250 }], { straight: true });
+      for (const deg of [30, 70, 200]) {
+        const a = (deg * Math.PI) / 180;
+        draw(n, f, 'road_small', [
+          { x: 0, z: 0 },
+          { x: 220 * Math.cos(a), z: 220 * Math.sin(a) },
+        ], { straight: true });
+      }
+    },
+  },
+  {
+    name: '踏切が 2 箇所 (25 m 間隔) に並ぶ',
+    build: (n, f) => {
+      draw(n, f, 'rail_double', [{ x: 0, z: -300 }, { x: 0, z: 300 }], { straight: true });
+      draw(n, f, 'rail_double', [{ x: 25, z: -300 }, { x: 25, z: 300 }], { straight: true });
+      draw(n, f, 'road_medium', [{ x: -250, z: 0 }, { x: 250, z: 0 }], { straight: true });
+    },
+  },
+  {
     name: 'カーブと勾配',
     build: (n, f) => {
       draw(n, f, 'road_medium', [
@@ -828,7 +1069,7 @@ function built(): Built {
   const failed: { name: string; error: Error }[] = [];
   for (const scenario of SCENARIOS) {
     try {
-      scenes.push(buildScene(scenario.name, scenario.build, scenario.seed));
+      scenes.push(buildScene(scenario.name, scenario.build, scenario.seed, scenario.terrain));
     } catch (e) {
       failed.push({ name: scenario.name, error: e as Error });
     }
@@ -1130,6 +1371,11 @@ describe('小物の配置 (敵対的検証)', () => {
     expect(v.map(fmt), report(v)).toEqual([]);
   });
 
+  it('小物が自分の線形の路面の近くに立つ', () => {
+    const v = collect(checkFootNearOwnSurface);
+    expect(v.map(fmt), report(v)).toEqual([]);
+  });
+
   it('柱が飛ばされた区間には電線を張らない', () => {
     // 途中を塞いだ状態で直接組み立て、塞いだ帯の中に一切の形状 (= 電線) が
     // 出てこないことを見る。柱そのものは塞いだ帯には建たない。
@@ -1202,6 +1448,7 @@ describe('小物の配置 (敵対的検証)', () => {
         ...checkInsideJunction(s),
         ...checkOwnCarriageway(s),
         ...checkOwnLateral(s),
+        ...checkFootNearOwnSurface(s),
       );
     }
     const messages = [

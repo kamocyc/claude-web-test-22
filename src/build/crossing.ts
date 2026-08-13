@@ -72,9 +72,14 @@ export interface LevelCrossingBuild {
  */
 export interface LevelCrossingOptions {
   /** 遮断機を置いてよい場所か (線路や他の道路と重ならないか)。 */
-  canPlace?: (x: number, z: number) => boolean;
+  canPlace?: (x: number, z: number, y: number) => boolean;
   /** 足元の地面の高さ。 */
   groundY?: (x: number, z: number, surfaceY: number) => number;
+  /**
+   * その地点の構造形式。橋の上では床版の外に地面がないので、遮断機を
+   * 高欄の内側に寄せる。トンネルの中には立てない。
+   */
+  modeAt?: (sample: RoadSample) => 'ground' | 'bridge' | 'tunnel';
 }
 
 export function buildLevelCrossing(
@@ -102,7 +107,7 @@ export function buildLevelCrossing(
 
   const gates: GateSpec[] = [];
   const stopStations: { segment: SegmentId; s: number; forward: boolean }[] = [];
-  const gateOffset = roadClass.halfWidth + 0.5;
+  const modeAt = options.modeAt ?? (() => 'ground' as const);
   const boomLength = roadClass.carriagewayHalfWidth + 0.8;
 
   for (const forward of [true, false]) {
@@ -115,14 +120,20 @@ export function buildLevelCrossing(
       const distance = halfLength + GATE_STANDOFF + extra;
       const sample = roadPath.sampleAt(forward ? road.s - distance : road.s + distance);
       if (!sample) continue;
-      const x = sample.pos.x + sample.right.x * side * gateOffset;
-      const z = sample.pos.z + sample.right.z * side * gateOffset;
-      if (!canPlace(x, z)) continue;
-      placed = {
-        base: new Vector3(x, groundY(x, z, sample.pos.y + roadClass.curbHeight), z),
-        sample,
-        distance,
-      };
+
+      const mode = modeAt(sample);
+      if (mode === 'tunnel') continue;
+      const onBridge = mode === 'bridge';
+      // 橋の上では高欄の内側に寄せる。歩道の余地がなければ諦める。
+      if (onBridge && roadClass.halfWidth - 0.6 <= roadClass.carriagewayHalfWidth + 0.2) continue;
+      const offset = onBridge ? roadClass.halfWidth - 0.6 : roadClass.halfWidth + 0.5;
+
+      const x = sample.pos.x + sample.right.x * side * offset;
+      const z = sample.pos.z + sample.right.z * side * offset;
+      const surfaceY = sample.pos.y + roadClass.curbHeight;
+      const baseY = onBridge ? surfaceY : groundY(x, z, surfaceY);
+      if (!canPlace(x, z, baseY)) continue;
+      placed = { base: new Vector3(x, baseY, z), sample, distance };
       break;
     }
     if (!placed) continue;

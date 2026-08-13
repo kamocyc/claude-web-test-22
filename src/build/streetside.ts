@@ -33,7 +33,7 @@ const WIRE_OFFSETS = [-0.62, 0, 0.62];
 
 export interface UtilityPoleOptions {
   /** その地点に立ててよいか (他の線形・交差点と重ならないか)。 */
-  canPlace: (x: number, z: number) => boolean;
+  canPlace: (x: number, z: number, y: number) => boolean;
   /** 足元の地面の高さ。整地後の地形と路肩の高い方を返すこと。 */
   groundY: (x: number, z: number, surfaceY: number) => number;
   pitch?: number;
@@ -81,7 +81,11 @@ export function buildUtilityPoles(
     let free = 0;
     for (const s of stations) {
       const p = positionAt(samples, s, offset * candidate);
-      if (p && options.canPlace(p.pos.x, p.pos.z)) free++;
+      if (!p) continue;
+      // 足元の高さで判定する。路面の高さで問うと、隣の盛土の上に
+      // 乗ってしまう場所を「空いている」と誤って答えてしまう。
+      const ground = options.groundY(p.pos.x, p.pos.z, p.pos.y);
+      if (options.canPlace(p.pos.x, p.pos.z, ground)) free++;
     }
     if (free > bestFree) {
       bestFree = free;
@@ -98,12 +102,14 @@ export function buildUtilityPoles(
 
   for (const s of stations) {
     const placed = positionAt(samples, s, offset * side);
-    if (!placed || !options.canPlace(placed.pos.x, placed.pos.z)) {
+    const groundY = placed
+      ? options.groundY(placed.pos.x, placed.pos.z, placed.pos.y)
+      : 0;
+    if (!placed || !options.canPlace(placed.pos.x, placed.pos.z, groundY)) {
       previous = null;
       serial++;
       continue;
     }
-    const groundY = options.groundY(placed.pos.x, placed.pos.z, placed.pos.y);
     const base = new Vector3(placed.pos.x, groundY - 0.15, placed.pos.z);
     const across = placed.sample.right.clone().multiplyScalar(side).setY(0).normalize();
     const along = placed.sample.forward.clone().setY(0).normalize();

@@ -28,7 +28,21 @@ export interface OccupancyQuery {
   kinds?: NetworkKind[];
   /** 幅員に加える余裕 [m]。 */
   margin?: number;
+  /**
+   * 判定する高さ [m]。指定すると、これと離れた高さの線形は無視する。
+   * 立体交差では、桁の上の支柱が真下を通る線形の「上」に来るのが正常。
+   */
+  y?: number;
+  /** 同じ高さとみなす差 [m]。 */
+  verticalTolerance?: number;
 }
+
+/**
+ * 同じ高さとみなす既定の差 [m]。
+ * 縁石 (0.15)・道床の法尻 (0.87)・床版厚 (1.1) を飲み込み、建築限界
+ * (道路 4.5 / 線路 5.7) よりは十分小さい値。
+ */
+const DEFAULT_VERTICAL_TOLERANCE = 2.0;
 
 interface Span {
   segment: SegmentId;
@@ -38,12 +52,15 @@ interface Span {
   z0: number;
   x1: number;
   z1: number;
+  y0: number;
+  y1: number;
 }
 
 interface Ring {
   node: NodeId;
   kind: NetworkKind;
   points: { x: number; z: number }[];
+  y: number;
   minX: number;
   maxX: number;
   minZ: number;
@@ -83,6 +100,8 @@ export class Occupancy {
           z0: prev.z,
           x1: p.x,
           z1: p.z,
+          y0: prev.y,
+          y1: p.y,
         });
         prev = p;
       }
@@ -104,13 +123,18 @@ export class Occupancy {
     const margin = query.margin ?? 0;
     let best: Occupant | null = null;
 
+    const tolerance = query.verticalTolerance ?? DEFAULT_VERTICAL_TOLERANCE;
+    const differentLevel = (other: number): boolean =>
+      query.y !== undefined && Math.abs(query.y - other) > tolerance;
+
     for (const index of this.spanBuckets.get(key(x, z)) ?? []) {
       const span = this.spans[index];
       if (exceptSegments.has(span.segment)) continue;
       if (kinds && !kinds.includes(span.kind)) continue;
-      const d = distanceToSegment(x, z, span.x0, span.z0, span.x1, span.z1);
-      const gap = d - (span.halfWidth + margin);
+      const projection = projectOnSegment(x, z, span.x0, span.z0, span.x1, span.z1);
+      const gap = projection.distance - (span.halfWidth + margin);
       if (gap > 0) continue;
+      if (differentLevel(span.y0 + (span.y1 - span.y0) * projection.t)) continue;
       if (!best || gap < best.distance) {
         best = { kind: span.kind, segment: span.segment, distance: gap };
       }
@@ -120,6 +144,7 @@ export class Occupancy {
       const ring = this.rings[index];
       if (exceptNodes.has(ring.node)) continue;
       if (kinds && !kinds.includes(ring.kind)) continue;
+      if (differentLevel(ring.y)) continue;
       if (x < ring.minX - margin || x > ring.maxX + margin) continue;
       if (z < ring.minZ - margin || z > ring.maxZ + margin) continue;
       const inside = pointInRing(x, z, ring.points);
@@ -156,17 +181,20 @@ export class Occupancy {
     let maxX = -Infinity;
     let minZ = Infinity;
     let maxZ = -Infinity;
+    let sumY = 0;
     for (const p of points) {
       minX = Math.min(minX, p.x);
       maxX = Math.max(maxX, p.x);
       minZ = Math.min(minZ, p.z);
       maxZ = Math.max(maxZ, p.z);
+      sumY += p.y;
     }
     const index =
       this.rings.push({
         node,
         kind,
         points: points.map((p) => ({ x: p.x, z: p.z })),
+        y: sumY / points.length,
         minX,
         maxX,
         minZ,
@@ -207,14 +235,15 @@ function forEachBucket(
   }
 }
 
-function distanceToSegment(
+/** 線分上の最近点までの距離と、その位置 (0..1)。 */
+function projectOnSegment(
   px: number,
   pz: number,
   x0: number,
   z0: number,
   x1: number,
   z1: number,
-): number {
+): { distance: number; t: number } {
   const dx = x1 - x0;
   const dz = z1 - z0;
   const lengthSq = dx * dx + dz * dz;
@@ -223,7 +252,18 @@ function distanceToSegment(
     t = ((px - x0) * dx + (pz - z0) * dz) / lengthSq;
     t = t < 0 ? 0 : t > 1 ? 1 : t;
   }
-  return Math.hypot(px - (x0 + dx * t), pz - (z0 + dz * t));
+  return { distance: Math.hypot(px - (x0 + dx * t), pz - (z0 + dz * t)), t };
+}
+
+function distanceToSegment(
+  px: number,
+  pz: number,
+  x0: number,
+  z0: number,
+  x1: number,
+  z1: number,
+): number {
+  return projectOnSegment(px, pz, x0, z0, x1, z1).distance;
 }
 
 function pointInRing(x: number, z: number, ring: { x: number; z: number }[]): boolean {
