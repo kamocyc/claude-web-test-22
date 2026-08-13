@@ -770,9 +770,19 @@ export class WorldBuilder {
           // ある。1 マス分の高低差だけ余計に下げて逃げる。
           const grade = Math.abs(samples[i].grade + samples[i + 1].grade) / 2;
           const shift = grade * TERRAIN_CELL;
-          const scale = surfaceHeightScale(segmentBlends, samples[i].s);
-          const a = gradingSectionPoints(samples[i], section, shift, scale);
-          const b = gradingSectionPoints(samples[i + 1], section, shift, scale);
+          // 段差を潰す係数は点ごとに違う (踏切の前後で戻っていく)。
+          const a = gradingSectionPoints(
+            samples[i],
+            section,
+            shift,
+            surfaceHeightScale(segmentBlends, samples[i].s),
+          );
+          const b = gradingSectionPoints(
+            samples[i + 1],
+            section,
+            shift,
+            surfaceHeightScale(segmentBlends, samples[i + 1].s),
+          );
           // 踏切のまわりでは、点ごとに道路からの垂距で目標を持ち上げる。
           if (zones.length > 0) {
             liftForCrossings(a, samples[i].pos.y, zones, naturalDrop);
