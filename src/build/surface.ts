@@ -1,6 +1,6 @@
 import { Vector3 } from 'three';
 import type { AlignmentSample } from '../core/alignment';
-import { MeshBuilder, extrudeSkirt, fillPolygon } from '../core/meshbuilder';
+import { MeshBuilder, extrudeSkirt, extrudeSkirtTo, fillPolygon } from '../core/meshbuilder';
 import { GRADING_MARGIN, SURFACE_LIFT, SURFACE_SKIRT, TERRAIN_CELL } from '../core/units';
 import type { NetworkClass } from '../network/classes';
 
@@ -82,6 +82,24 @@ export interface RibbonOptions {
   skirt: boolean;
   /** 診断色に使う規格値。 */
   cls: NetworkClass;
+  /** 整地後の地形の高さ。垂れ壁を地面まで届かせるのに使う。 */
+  groundY?: GroundQuery;
+}
+
+/** 整地後の地形の高さを引く関数。 */
+export type GroundQuery = (x: number, z: number) => number;
+
+/** 垂れ壁を伸ばす上限 [m]。これを超える段差は橋・擁壁の領分。 */
+const MAX_SKIRT = 8;
+
+/**
+ * 垂れ壁の下端。地形まで届かせることで、勾配差の大きい交差点や
+ * 取り付き部でも路面の下に穴が開かない。
+ */
+function skirtBottom(x: number, y: number, z: number, ground?: GroundQuery): number {
+  const base = y - SURFACE_SKIRT;
+  if (!ground) return base;
+  return Math.max(y - MAX_SKIRT, Math.min(base, ground(x, z) - 0.2));
 }
 
 /**
@@ -137,8 +155,8 @@ export function buildRibbon(
   }
 
   if (options.skirt) {
-    buildEdgeSkirt(mb, samples, profile[0], -1);
-    buildEdgeSkirt(mb, samples, profile[profile.length - 1], 1);
+    buildEdgeSkirt(mb, samples, profile[0], -1, options.groundY);
+    buildEdgeSkirt(mb, samples, profile[profile.length - 1], 1, options.groundY);
   }
 }
 
@@ -148,6 +166,7 @@ function buildEdgeSkirt(
   samples: AlignmentSample[],
   edge: ProfilePoint,
   side: number,
+  ground?: GroundQuery,
 ): void {
   const top = new Vector3();
   const normal = new Vector3();
@@ -159,7 +178,7 @@ function buildEdgeSkirt(
     normal.set(sample.right.x * side, 0, sample.right.z * side).normalize();
     const t = mb.vertex(top, normal, 0, sample.s * 0.1, color);
     const b = mb.vertex(
-      new Vector3(top.x, top.y - SURFACE_SKIRT, top.z),
+      new Vector3(top.x, skirtBottom(top.x, top.y, top.z, ground), top.z),
       normal,
       1,
       sample.s * 0.1,
@@ -270,6 +289,7 @@ export function buildJunctionSurface(
   mb: MeshBuilder,
   rings: Vector3[][],
   cls: NetworkClass,
+  ground?: GroundQuery,
 ): void {
   if (rings.length === 0 || rings[0].length < 3) return;
   const profile = profileFor(cls);
@@ -280,7 +300,14 @@ export function buildJunctionSurface(
     const color = profile[Math.min(k, profile.length - 1)].color;
     buildRingBand(mb, lifted[k], lifted[k + 1], color);
   }
-  ringSkirt(mb, lifted[0], SKIRT_COLOR);
+  // 外周の垂れ壁は地面まで届かせる。勾配の違う枝が集まる交差点では、
+  // 隅で 2〜3 m の段差ができることがあり、固定長では隠しきれない。
+  extrudeSkirtTo(
+    mb,
+    lifted[0],
+    lifted[0].map((p) => skirtBottom(p.x, p.y, p.z, ground)),
+    SKIRT_COLOR,
+  );
 }
 
 const SKIRT_COLOR: RGB = [0.3, 0.28, 0.26];

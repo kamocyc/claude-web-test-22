@@ -87,14 +87,21 @@ const CORNER_MARGIN = 0.6;
  * 各ノードで、隣り合う枝どうしの路端線の交点を求め、そこまでセグメントを
  * 引っ込める (トリムする)。トリム位置の断面端点を繋ぐと交差点の面になる。
  */
-export function solveJunctions(network: Network): JunctionSolution {
+export function solveJunctions(
+  network: Network,
+  /**
+   * 描画高さの補正 (踏切に合わせた線路の持ち上げ)。交差点の断面にも
+   * 同じ補正を掛けないと、トリム位置が踏切の近くのとき帯と面がずれる。
+   */
+  heightOffset?: HeightOffset,
+): JunctionSolution {
   const junctions = new Map<NodeId, Junction>();
   const trims = new Map<SegmentId, SegmentTrim>();
   for (const id of network.segments.keys()) trims.set(id, { a: 0, b: 0 });
 
   for (const nodeId of network.nodes.keys()) {
     const branches = network.branchesAt(nodeId);
-    const junction = solveNode(network, nodeId, branches);
+    const junction = solveNode(network, nodeId, branches, heightOffset);
     junctions.set(nodeId, junction);
     for (const ap of junction.approaches) {
       const t = trims.get(ap.branch.segment);
@@ -123,17 +130,60 @@ export function solveJunctions(network: Network): JunctionSolution {
       const applied = ap.branch.atStart ? t.a : t.b;
       if (Math.abs(applied - ap.trim) > 1e-6) {
         ap.trim = applied;
-        updateApproachGeometry(network, ap);
+        updateApproachGeometry(network, ap, heightOffset);
       }
     }
     junction.rings = buildRings(junction);
     junction.ring = junction.rings[0] ?? [];
+    // 交差角が鋭すぎると枝の断面どうしが重なり、交差点面がねじれる。
+    // 形を破綻させずに解く一般的な方法がないので、警告して知らせる。
+    if (selfIntersects(junction.ring)) {
+      junction.warnings.push(
+        '交差角が鋭すぎて交差点の形状が乱れています。角度を広げるか、少し離して繋いでください。',
+      );
+    }
   }
 
   return { junctions, trims };
 }
 
-function solveNode(network: Network, nodeId: NodeId, branches: Branch[]): Junction {
+/** セグメント上の弧長に対する、描画高さの補正量 [m]。 */
+export type HeightOffset = (segment: SegmentId, s: number) => number;
+
+/** リングが自分自身と交差しているか (XZ 平面で見て)。 */
+export function selfIntersects(ring: Vector3[]): boolean {
+  const n = ring.length;
+  if (n < 4) return false;
+  for (let i = 0; i < n; i++) {
+    const a0 = ring[i];
+    const a1 = ring[(i + 1) % n];
+    for (let j = i + 2; j < n; j++) {
+      // 隣り合う辺は端点を共有するので飛ばす。
+      if (i === 0 && j === n - 1) continue;
+      if (segmentsCross(a0, a1, ring[j], ring[(j + 1) % n])) return true;
+    }
+  }
+  return false;
+}
+
+function segmentsCross(a0: Vector3, a1: Vector3, b0: Vector3, b1: Vector3): boolean {
+  const d1 = side(b0, b1, a0);
+  const d2 = side(b0, b1, a1);
+  const d3 = side(a0, a1, b0);
+  const d4 = side(a0, a1, b1);
+  return d1 * d2 < 0 && d3 * d4 < 0;
+}
+
+function side(a: Vector3, b: Vector3, p: Vector3): number {
+  return (b.x - a.x) * (p.z - a.z) - (b.z - a.z) * (p.x - a.x);
+}
+
+function solveNode(
+  network: Network,
+  nodeId: NodeId,
+  branches: Branch[],
+  heightOffset?: HeightOffset,
+): Junction {
   const warnings: string[] = [];
   const kinds = new Set<NetworkKind>(branches.map((b) => b.cls.kind));
   if (kinds.size > 1) {
@@ -186,7 +236,7 @@ function solveNode(network: Network, nodeId: NodeId, branches: Branch[]): Juncti
       warnings.push('交差点に対してセグメントが短すぎます。形状が乱れる場合があります。');
     }
     ap.trim = clamp(ap.trim, 0, maxTrim);
-    updateApproachGeometry(network, ap);
+    updateApproachGeometry(network, ap, heightOffset);
   }
 
   const signalized =
@@ -254,12 +304,22 @@ function borderIntersection(bi: Branch, bj: Branch): { ti: number; tj: number } 
   return { ti: Math.max(0, ti), tj: Math.max(0, tj) };
 }
 
-function updateApproachGeometry(network: Network, ap: Approach): void {
+function updateApproachGeometry(
+  network: Network,
+  ap: Approach,
+  heightOffset?: HeightOffset,
+): void {
   const al = network.alignmentOf(ap.branch.segment);
   const L = al.length;
-  const s = ap.branch.atStart ? ap.trim : L - ap.trim;
-  const sample = al.sampleAt(clamp(s, 0, L));
+  const s = clamp(ap.branch.atStart ? ap.trim : L - ap.trim, 0, L);
+  const raw = al.sampleAt(s);
   const cls = ap.branch.cls;
+  // 描画側と同じ高さで断面を作る。
+  const dy = heightOffset?.(ap.branch.segment, s) ?? 0;
+  const sample =
+    dy === 0
+      ? raw
+      : { ...raw, pos: new Vector3(raw.pos.x, raw.pos.y + dy, raw.pos.z) };
 
   // 外向き方向はトリム位置の接線で取り直す (曲線ではノードでの接線とずれるため)。
   const outward = ap.branch.atStart ? sample.forwardXZ.clone() : sample.forwardXZ.clone().negate();
@@ -329,17 +389,20 @@ function buildRings(junction: Junction): Vector3[][] {
       rings[k].push(sideOf(cur, k, 'prev'), sideOf(cur, k, 'next'));
     }
 
-    for (let k = 0; k < levels; k++) {
-      const a = sideOf(cur, k, 'next');
-      const b = sideOf(next, k, 'prev');
-      const corner = cornerControl(a, cur.dir, b, next.dir);
-      // 隅丸めの点数は全リングで揃える必要がある。外側リングで判定し、
-      // 内側でも同じ数だけ (退化していても) 点を積む。
-      const outerA = sideOf(cur, 0, 'next');
-      const outerB = sideOf(next, 0, 'prev');
-      if (!corner || outerA.distanceTo(outerB) <= 0.05) continue;
-      for (let t = 1; t <= 3; t++) {
-        rings[k].push(quadratic(a, corner, b, t / 4));
+    // 隅丸めを入れるかどうかは、外側のリングで一度だけ決める。
+    // レベルごとに判定すると点数が揃わず、帯が組めなくなる。
+    const outerA = sideOf(cur, 0, 'next');
+    const outerB = sideOf(next, 0, 'prev');
+    if (outerA.distanceTo(outerB) > 0.05) {
+      for (let k = 0; k < levels; k++) {
+        const a = sideOf(cur, k, 'next');
+        const b = sideOf(next, k, 'prev');
+        // 内側のリードでは路端線が交わらないことがある。その場合は
+        // 中点を制御点にして、点数だけ揃える。
+        const corner = cornerControl(a, cur.dir, b, next.dir) ?? a.clone().lerp(b, 0.5);
+        for (let t = 1; t <= 3; t++) {
+          rings[k].push(quadratic(a, corner, b, t / 4));
+        }
       }
     }
   }
@@ -356,14 +419,22 @@ function sideOf(ap: Approach, k: number, side: 'prev' | 'next'): Vector3 {
   return (side === 'prev' ? ap.section[index] : ap.section[P - 1 - index]).clone();
 }
 
-/** 2 枝の路端線 (同じ断面高さ) の交点。隅丸めの制御点になる。 */
+/**
+ * 2 枝の路端線 (同じ断面高さ) の交点。隅丸めの制御点になる。
+ *
+ * 交差角が浅いと路端線の交点は遥か彼方になる。そのまま制御点にすると
+ * 隅丸めが交差点の外へ大きく膨らみ、リングがねじれたり、面の下に地形の
+ * ない所ができたりする。2 点の間隔を目安に打ち切る。
+ */
 function cornerControl(p: Vector3, dp: Vector2, q: Vector3, dq: Vector2): Vector3 | null {
   const det = dp.x * dq.y - dp.y * dq.x;
   if (Math.abs(det) < 1e-6) return null;
   const rx = q.x - p.x;
   const rz = q.z - p.z;
   const t = (rx * dq.y - rz * dq.x) / det;
-  if (t < 0 || t > 200) return null;
+  if (t < 0) return null;
+  const limit = Math.max(2, p.distanceTo(q) * 1.2);
+  if (t > limit) return null;
   return new Vector3(p.x + dp.x * t, (p.y + q.y) / 2, p.z + dp.y * t);
 }
 
@@ -394,7 +465,10 @@ function dedupeRings(rings: Vector3[][]): Vector3[][] {
   ) {
     keep.pop();
   }
-  return rings.map((ring) => keep.map((i) => ring[i]));
+  // 念のため、点数の揃わないリングは落とす (帯が組めないため)。
+  return rings
+    .filter((ring) => ring.length === outer.length)
+    .map((ring) => keep.map((i) => ring[i]));
 }
 
 /**

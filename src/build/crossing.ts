@@ -217,13 +217,19 @@ function paintPanel(
 export function applyRailBlend(samples: AlignmentSample[], blends: RailBlend[]): AlignmentSample[] {
   if (blends.length === 0) return samples;
   return samples.map((sample) => {
-    let delta = 0;
-    for (const blend of blends) {
-      const t = Math.abs(sample.s - blend.s) / blend.halfLength;
-      if (t >= 1) continue;
-      delta += blend.deltaY * (1 - smoothstep(t));
-    }
+    const delta = railBlendDelta(blends, sample.s);
     if (delta === 0) return sample;
     return { ...sample, pos: new Vector3(sample.pos.x, sample.pos.y + delta, sample.pos.z) };
   });
+}
+
+/** ある弧長での補正量。交差点の断面など、サンプル列を持たない所で使う。 */
+export function railBlendDelta(blends: RailBlend[], s: number): number {
+  let delta = 0;
+  for (const blend of blends) {
+    const t = Math.abs(s - blend.s) / blend.halfLength;
+    if (t >= 1) continue;
+    delta += blend.deltaY * (1 - smoothstep(t));
+  }
+  return delta;
 }

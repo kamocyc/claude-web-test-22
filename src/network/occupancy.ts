@@ -62,22 +62,19 @@ export class Occupancy {
   constructor(
     network: Network,
     options: {
-      /** 交差点でトリムしたあとの描画範囲。省略時は線形の全長を使う。 */
-      ranges?: Map<SegmentId, { s0: number; s1: number }>;
       junctions?: Map<NodeId, Junction>;
     } = {},
   ) {
     for (const seg of network.segments.values()) {
       const cls = network.classOf(seg);
       const alignment = network.alignmentOf(seg.id);
-      const range = options.ranges?.get(seg.id);
-      const s0 = Math.max(0, range?.s0 ?? 0);
-      const s1 = Math.min(alignment.length, range?.s1 ?? alignment.length);
-      if (s1 - s0 < 1e-3) continue;
-      const steps = Math.max(1, Math.ceil((s1 - s0) / 4));
-      let prev = alignment.sampleAt(s0).pos;
+      // 描画された範囲だけでなく、交差点に飲み込まれたトリム区間も含める。
+      // 鋭角の交差点ではリングの形が乱れることがあり、リングの内外判定
+      // だけでは交差点の内側を取りこぼすため。
+      const steps = Math.max(1, Math.ceil(alignment.length / 4));
+      let prev = alignment.sampleAt(0).pos;
       for (let i = 1; i <= steps; i++) {
-        const p = alignment.sampleAt(s0 + ((s1 - s0) * i) / steps).pos;
+        const p = alignment.sampleAt((alignment.length * i) / steps).pos;
         this.addSpan({
           segment: seg.id,
           kind: cls.kind,

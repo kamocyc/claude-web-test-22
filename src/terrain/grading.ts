@@ -22,35 +22,103 @@ const INF = Infinity;
  * 橋・トンネル区間は `block()` で伝播を遮断する。これにより橋台やトンネル
  * 坑口で地形が垂直に切り立ち、その前後だけが法面として整地される。
  */
+/** 焼き込みの優先度。 */
+export interface StampOptions {
+  /**
+   * 舗装そのものの範囲か。路肩の余裕幅 (`false`) は、他の線形の舗装が
+   * 既に焼き込んだ格子点には手を出さない。平坦な道路の余裕幅が、隣の
+   * 急勾配な取り付きの盛土を掘り下げてしまうのを防ぐ。
+   */
+  core?: boolean;
+  /** 保護領域 (踏切の舗装の下) を無視して焼き込む。道路側だけが使う。 */
+  ignoreProtected?: boolean;
+  /**
+   * その帯が中心線からどれだけ離れているか [m]。
+   *
+   * 高さの違う舗装どうしが重なったとき、常に低い方を採ると高い方が宙に
+   * 浮く (平坦な幹線に 12% の枝が取り付く交差点など)。中心線がより近い
+   * 舗装を優先することで、「自分の真下の地面は自分が決める」ようにする。
+   */
+  distance?: number;
+}
+
+interface ProtectedDisc {
+  x: number;
+  z: number;
+  radius: number;
+}
+
 export class TerrainGrading {
   private readonly field: Heightfield;
   private readonly target: Float32Array;
   private readonly seeded: Uint8Array;
+  private readonly core: Uint8Array;
+  private readonly coreDistance: Float32Array;
   private readonly blocked: Uint8Array;
+  private readonly protectedDiscs: ProtectedDisc[] = [];
 
   constructor(field: Heightfield) {
     this.field = field;
     const n = field.stride * field.stride;
     this.target = new Float32Array(n);
     this.seeded = new Uint8Array(n);
+    this.core = new Uint8Array(n);
+    this.coreDistance = new Float32Array(n);
     this.blocked = new Uint8Array(n);
   }
 
   reset(): void {
     this.seeded.fill(0);
+    this.core.fill(0);
+    this.coreDistance.fill(0);
     this.blocked.fill(0);
+    this.protectedDiscs.length = 0;
+  }
+
+  /**
+   * 「ここは道路の舗装の下なので、他の線形は整地してはいけない」範囲。
+   * 踏切で、線路の断面 (道床の法尻) が道路の路面の下を掘るのを防ぐ。
+   */
+  protect(x: number, z: number, radius: number): void {
+    this.protectedDiscs.push({ x, z, radius });
   }
 
   /** 三角形の範囲の格子点に目標高さを焼き込む。重なった場合は低い方を採用する。 */
-  stampTriangle(a: Vector3, b: Vector3, c: Vector3): void {
-    this.rasterize(a, b, c, (i, y) => {
-      if (this.seeded[i]) this.target[i] = Math.min(this.target[i], y);
-      else {
+  stampTriangle(a: Vector3, b: Vector3, c: Vector3, options: StampOptions = {}): void {
+    const core = options.core ?? true;
+    const distance = options.distance ?? 0;
+    const respectProtected = !options.ignoreProtected && this.protectedDiscs.length > 0;
+    this.rasterize(a, b, c, (i, y, x, z) => {
+      if (respectProtected && this.isProtected(x, z)) return;
+      if (!core) {
+        // 余裕幅は、舗装が押さえている格子点には触らない。
+        if (this.core[i]) return;
+        this.target[i] = this.seeded[i] ? Math.min(this.target[i], y) : y;
+      } else if (this.core[i]) {
+        // 舗装どうしが重なったら、中心線が近い方が勝つ。同じくらいなら低い方。
+        if (distance < this.coreDistance[i] - 1e-6) {
+          this.target[i] = y;
+          this.coreDistance[i] = distance;
+        } else if (distance <= this.coreDistance[i] + 1e-6) {
+          this.target[i] = Math.min(this.target[i], y);
+        }
+      } else {
         this.target[i] = y;
-        this.seeded[i] = 1;
+        this.core[i] = 1;
+        this.coreDistance[i] = distance;
       }
+      this.seeded[i] = 1;
       this.blocked[i] = 0;
     });
+  }
+
+  private isProtected(x: number, z: number): boolean {
+    for (const disc of this.protectedDiscs) {
+      const dx = x - disc.x;
+      const dz = z - disc.z;
+      if (dx * dx + dz * dz <= disc.radius * disc.radius) return true;
+    }
+    return false;
   }
 
   /**
@@ -59,20 +127,20 @@ export class TerrainGrading {
    * 扇状の分割だと凹んだリングでは外側まで焼いてしまうので、描画と同じ
    * earcut で三角形分割する。交差点面の形と整地の形が必ず一致する。
    */
-  stampPolygon(ring: Vector3[]): void {
+  stampPolygon(ring: Vector3[], options: StampOptions = {}): void {
     if (ring.length < 3) return;
     const flat: number[] = [];
     for (const p of ring) flat.push(p.x, p.z);
     const tris = earcutXZ(flat);
     for (let i = 0; i + 2 < tris.length; i += 3) {
-      this.stampTriangle(ring[tris[i]], ring[tris[i + 1]], ring[tris[i + 2]]);
+      this.stampTriangle(ring[tris[i]], ring[tris[i + 1]], ring[tris[i + 2]], options);
     }
   }
 
   /** 4 点を 2 三角形として焼き込む。 */
-  stampQuad(a: Vector3, b: Vector3, c: Vector3, d: Vector3): void {
-    this.stampTriangle(a, b, c);
-    this.stampTriangle(a, c, d);
+  stampQuad(a: Vector3, b: Vector3, c: Vector3, d: Vector3, options: StampOptions = {}): void {
+    this.stampTriangle(a, b, c, options);
+    this.stampTriangle(a, c, d, options);
   }
 
   /** 整地の伝播を遮断する領域 (橋・トンネルの下) を指定する。 */
@@ -91,7 +159,7 @@ export class TerrainGrading {
     a: Vector3,
     b: Vector3,
     c: Vector3,
-    write: (index: number, y: number) => void,
+    write: (index: number, y: number, x: number, z: number) => void,
   ): void {
     const f = this.field;
     const ax = f.toGridX(a.x);
@@ -120,7 +188,12 @@ export class TerrainGrading {
         const w1 = ((cx - px) * (az - pz) - (ax - px) * (cz - pz)) / area;
         const w2 = 1 - w0 - w1;
         if (w0 < -eps || w1 < -eps || w2 < -eps) continue;
-        write(f.index(ix, iz), w0 * a.y + w1 * b.y + w2 * c.y);
+        write(
+          f.index(ix, iz),
+          w0 * a.y + w1 * b.y + w2 * c.y,
+          f.worldX(ix),
+          f.worldZ(iz),
+        );
       }
     }
   }

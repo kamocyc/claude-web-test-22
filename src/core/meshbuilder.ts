@@ -146,22 +146,40 @@ export function extrudeSkirt(
   color: readonly [number, number, number],
   closed = true,
 ): void {
+  extrudeSkirtTo(
+    mb,
+    ring,
+    ring.map((p) => p.y - depth),
+    color,
+    closed,
+  );
+}
+
+/** 頂点ごとに下端の高さを指定して押し出す。地面まで届かせたいときに使う。 */
+export function extrudeSkirtTo(
+  mb: MeshBuilder,
+  ring: Vector3[],
+  bottom: number[],
+  color: readonly [number, number, number],
+  closed = true,
+): void {
   const n = ring.length;
-  if (n < 2) return;
+  if (n < 2 || bottom.length < n) return;
   const outward = signedAreaXZ(ring) > 0 ? 1 : -1;
   const normal = new Vector3();
   const last = closed ? n : n - 1;
   for (let i = 0; i < last; i++) {
+    const j = (i + 1) % n;
     const a = ring[i];
-    const b = ring[(i + 1) % n];
+    const b = ring[j];
     normal.set((b.z - a.z) * outward, 0, -(b.x - a.x) * outward);
     if (normal.lengthSq() < 1e-12) continue;
     normal.normalize();
     const t = mb.vertexCount;
     mb.vertex(a, normal, 0, 0, color);
     mb.vertex(b, normal, 1, 0, color);
-    mb.vertex(new Vector3(b.x, b.y - depth, b.z), normal, 1, 1, color);
-    mb.vertex(new Vector3(a.x, a.y - depth, a.z), normal, 0, 1, color);
+    mb.vertex(new Vector3(b.x, bottom[j], b.z), normal, 1, 1, color);
+    mb.vertex(new Vector3(a.x, bottom[i], a.z), normal, 0, 1, color);
     mb.quad(t, t + 1, t + 2, t + 3);
   }
 }
