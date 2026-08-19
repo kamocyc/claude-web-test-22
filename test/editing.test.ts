@@ -7,6 +7,7 @@ import { getClass } from '../src/network/classes';
 import { anchorFromSegment, computePlacement, placeSegment } from '../src/network/editing';
 import { solveJunctions } from '../src/network/junction';
 import { Network, type NodeId } from '../src/network/network';
+import { parallelSpacing } from '../src/network/parallel';
 import { checkPlacement } from '../src/network/rules';
 
 /** 2 点を結ぶ直線の線形。 */
@@ -211,6 +212,122 @@ describe('敷設できるかどうかの判定', () => {
       end: { pos: end },
     });
     expect(check.blockers.join(' ')).toContain('交差点が近すぎます');
+  });
+});
+
+/**
+ * 中心線が交わらなくても、路面 (帯) は重なる。
+ *
+ * 中心線どうしの距離だけを見ていると、突き当たる形・すれ違う形で
+ * 「交差点でも踏切でもないのに舗装が重なる」配置が通ってしまう。
+ * 幅を持った帯として見て、重なりと桁下を判定する。
+ */
+describe('中心線が交わらない重なり', () => {
+  /** x 軸に沿う既存の道路を 1 本置いたネットワーク。 */
+  function withMainRoad(classId = 'road_medium', y = 0): Network {
+    const network = new Network();
+    addStraight(network, classId, new Vector3(-150, y, 0), new Vector3(150, y, 0));
+    return network;
+  }
+
+  function check(network: Network, classId: string, a: Vector3, b: Vector3): string[] {
+    return checkPlacement({
+      network,
+      cls: getClass(classId),
+      alignment: straight(a, b),
+      start: { pos: a },
+      end: { pos: b },
+    }).blockers;
+  }
+
+  it('舗装の中で行き止まる道路は置けない (交差点にならない突き当たり)', () => {
+    // 幹線道路の舗装は |z| <= 8.9 m。その中で終わる枝は、交差点にも
+    // ならないまま舗装が重なる。
+    const network = withMainRoad();
+    const blockers = check(
+      network,
+      'road_small',
+      new Vector3(40, 0, -100),
+      new Vector3(40, 0, -6),
+    );
+    expect(blockers.join(' ')).toContain('重なります');
+  });
+
+  it('舗装の外で行き止まるなら置ける', () => {
+    const network = withMainRoad();
+    const blockers = check(
+      network,
+      'road_small',
+      new Vector3(40, 0, -100),
+      new Vector3(40, 0, -10),
+    );
+    expect(blockers).toEqual([]);
+  });
+
+  it('中心線まで届く枝は交差点になるので置ける', () => {
+    const network = withMainRoad();
+    const blockers = check(
+      network,
+      'road_small',
+      new Vector3(40, 0, -100),
+      new Vector3(40, 0, 30),
+    );
+    expect(blockers).toEqual([]);
+  });
+
+  it('舗装の縁をかすめて跨ぐ高架は、桁下が足りなければ置けない', () => {
+    // 中心線は交わらない (道路の手前で終わる) が、桁は舗装の上を通る。
+    const network = withMainRoad();
+    const low = check(
+      network,
+      'road_small',
+      new Vector3(40, 5, -100),
+      new Vector3(40, 5, -6),
+    );
+    expect(low.join(' ')).toContain('建築限界');
+    // 桁下が取れていれば同じ形でも置ける。
+    const high = check(
+      network,
+      'road_small',
+      new Vector3(40, 6, -100),
+      new Vector3(40, 6, -6),
+    );
+    expect(high).toEqual([]);
+  });
+
+  it('少し高い所を並走する高架も、桁下が足りなければ置けない', () => {
+    // 平面では舗装が 1.5 m 重なり、高さは 3 m しか違わない。中心線が
+    // 交わらないので、以前は何も言えなかった。
+    const network = withMainRoad();
+    const blockers = check(
+      network,
+      'road_small',
+      new Vector3(-100, 3, 12),
+      new Vector3(100, 3, 12),
+    );
+    expect(blockers.join(' ')).toContain('建築限界');
+  });
+
+  it('平行スナップの間隔 (舗装の縁が触れ合う幅) は置ける', () => {
+    const cls = getClass('rail_single');
+    const network = new Network();
+    addStraight(network, 'rail_single', new Vector3(-150, 0, 0), new Vector3(150, 0, 0));
+    const gap = parallelSpacing(cls);
+    const blockers = check(
+      network,
+      'rail_single',
+      new Vector3(-120, 0, gap),
+      new Vector3(120, 0, gap),
+    );
+    expect(blockers).toEqual([]);
+    // 1 m 詰めれば重なる。
+    const tight = check(
+      network,
+      'rail_single',
+      new Vector3(-120, 0, gap - 1),
+      new Vector3(120, 0, gap - 1),
+    );
+    expect(tight.join(' ')).toContain('重な');
   });
 });
 

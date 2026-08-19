@@ -31,6 +31,12 @@ const MIN_CROSSING_ANGLE = 20 * DEG;
 const MAX_TRIM_RATIO = 0.45;
 /** 交差点 1 つが取り込める長さの上限 [m]。 */
 const MAX_TRIM = 40;
+/**
+ * 路面どうしが重なったとみなす深さ [m]。
+ *
+ * 平行スナップは舗装の縁が 0.2 m 空くように並べるので、そこは許す。
+ */
+const OVERLAP_TOLERANCE = 0.15;
 
 export interface PlacementCheck {
   /** 空なら敷設できる。 */
@@ -124,6 +130,16 @@ function polyline(alignment: Alignment, step = 3): Sample[] {
   return toPolyline(alignment, step);
 }
 
+/** 干渉を見る相手 (近くにある既存の線形)。 */
+interface Candidate {
+  cls: NetworkClass;
+  line: Sample[];
+  alignment: Alignment;
+  hits: ReturnType<typeof intersectPolylines>;
+  /** 中心線どうしの粗い当たり判定に使う距離 [m]。 */
+  reach: number;
+}
+
 /**
  * 既存の線形との干渉を見る。
  *
@@ -137,13 +153,21 @@ function checkOverlaps(ctx: PlacementContext, connected: Set<SegmentId>): string
   const bounds = boundsOf(mine);
   const out: string[] = [];
 
+  // まず近くの線形と交点を集める。同一平面で交わる所 (交差点・踏切になる
+  // 所) では路面が重なって当たり前なので、あとの重なり判定から外す「窓」を
+  // 先に作っておく。窓を相手 1 本ごとではなく全体で持つのは、交差点の中では
+  // **交わる相手に繋がっている別のセグメント**の路面とも重なるため。
+  const candidates: Candidate[] = [];
+  const windows: { s: number; reach: number }[] = [];
+  const myChords = chordsOf(mine, cls.halfWidth);
   for (const seg of network.segments.values()) {
     if (connected.has(seg.id)) continue;
     const other = network.classOf(seg);
-    const otherLine = polyline(network.alignmentOf(seg.id));
+    const alignment = network.alignmentOf(seg.id);
+    const line = polyline(alignment);
     const reach = cls.halfWidth + other.halfWidth;
     // 遠い線形は見るまでもない。
-    const otherBounds = boundsOf(otherLine);
+    const otherBounds = boundsOf(line);
     if (
       bounds.maxX + reach < otherBounds.minX ||
       otherBounds.maxX + reach < bounds.minX ||
@@ -152,18 +176,74 @@ function checkOverlaps(ctx: PlacementContext, connected: Set<SegmentId>): string
     ) {
       continue;
     }
+    const hits = intersectPolylines(mine, line);
+    candidates.push({ cls: other, line, alignment, hits, reach });
+
+    /** s (自分の弧長) のまわりを「交差点・踏切の中」として覚える。 */
+    const addWindow = (
+      s: number,
+      a: { dx: number; dz: number },
+      b: { dx: number; dz: number },
+    ): void => {
+      const sin = Math.abs(a.dx * b.dz - a.dz * b.dx);
+      const cos = Math.abs(a.dx * b.dx + a.dz * b.dz);
+      // 浅すぎる角度は交差点にならない (別の規則が止める)。ここで
+      // 窓を開けると、重なって並走しているだけの線形まで見逃す。
+      if (sin < Math.sin(MIN_CROSSING_ANGLE)) return;
+      windows.push({ s, reach: crossingTrim(cls, other, sin, cos) + CORNER_MARGIN });
+    };
+
+    for (const hit of hits) {
+      if (Math.abs(hit.yA - hit.yB) > LEVEL_CROSSING_TOLERANCE) continue;
+      addWindow(hit.sA, { dx: hit.dirA.x, dz: hit.dirA.y }, { dx: hit.dirB.x, dz: hit.dirB.y });
+    }
+
+    // 交点がちょうど端に来る所 (線が節で分かれていて、その節の上で交わる)
+    // では、交点が隣のセグメントの側にだけ立つ。節の先に線が続いている
+    // なら、そこも交差点・踏切の中として扱う。
+    for (const atStart of [true, false]) {
+      const anchor = atStart ? ctx.start : ctx.end;
+      if (anchor.node === undefined) continue;
+      // 端が行き止まりなら、そこに交差点はない。
+      const beyond = network
+        .branchesAt(anchor.node)
+        .filter((branch) => branch.segment !== ctx.ignore);
+      if (beyond.length === 0) continue;
+      const p = atStart ? mine[0] : mine[mine.length - 1];
+      const dir = endDirection(mine, atStart);
+      const near = nearestOn(line, p.x, p.z);
+      if (!dir || !near) continue;
+      if (near.distance > TOUCH || Math.abs(p.y - near.y) > LEVEL_CROSSING_TOLERANCE) continue;
+      addWindow(p.s, dir, near);
+    }
+    for (const atStart of [true, false]) {
+      const node = atStart ? seg.a : seg.b;
+      if (network.branchesAt(node).length < 2) continue;
+      const p = atStart ? line[0] : line[line.length - 1];
+      const dir = endDirection(line, atStart);
+      const near = nearestOn(mine, p.x, p.z);
+      if (!dir || !near) continue;
+      if (near.distance > TOUCH || Math.abs(p.y - near.y) > LEVEL_CROSSING_TOLERANCE) continue;
+      addWindow(near.s, near, dir);
+    }
+  }
+
+  for (const candidate of candidates) {
+    const other = candidate.cls;
+    const otherLine = candidate.line;
+    const otherAlignment = candidate.alignment;
+    const otherLength = otherAlignment.length;
+    const hits = candidate.hits;
+    const reach = candidate.reach;
 
     let shallow = false;
     let tooClose = 0;
     let worstClearance = Infinity;
     let worstCrossing = 0;
     let lowerKindOfWorst: 'road' | 'rail' = other.kind;
-    const otherAlignment = network.alignmentOf(seg.id);
-    const otherLength = otherAlignment.length;
 
     // 交点での高さで判定する。横にずれた点どうしを比べると、勾配のある
     // 道路では実際より低い / 高い桁下を読んでしまう。
-    const hits = intersectPolylines(mine, otherLine);
     for (const hit of hits) {
       const dy = hit.yA - hit.yB;
       const sin = Math.abs(hit.dirA.x * hit.dirB.y - hit.dirA.y * hit.dirB.x);
@@ -212,15 +292,37 @@ function checkOverlaps(ctx: PlacementContext, connected: Set<SegmentId>): string
       }
     }
 
-    // 交わらないのに近接が続くのは並走。
+    // 中心線が交わらなくても、**幅の分だけ**重なることはある (突き当たり・
+    // すれ違い・並走)。ここは路面を長方形の帯として見て、重なった所を
+    // 拾う。同じ高さで重なれば置けないし、上下に分かれていても、重なって
+    // いる所には桁下が要る。
+    const otherChords = chordsOf(otherLine, other.halfWidth);
     let overlapLength = 0;
-    if (hits.length === 0) {
-      for (let i = 1; i < mine.length; i++) {
-        const a = mine[i];
-        const near = nearestOn(otherLine, a.x, a.z);
-        if (!near || near.distance > reach) continue;
-        if (Math.abs(a.y - near.y) > LEVEL_CROSSING_TOLERANCE) continue;
-        overlapLength += Math.hypot(a.x - mine[i - 1].x, a.z - mine[i - 1].z);
+    let overlapDepth = 0;
+    for (const chord of myChords) {
+      let depth = 0;
+      for (const b of otherChords) {
+        if (Math.abs(chord.cx - b.cx) > chord.reach + b.reach) continue;
+        if (Math.abs(chord.cz - b.cz) > chord.reach + b.reach) continue;
+        depth = Math.max(depth, rectOverlap(chord, b));
+      }
+      if (depth <= OVERLAP_TOLERANCE) continue;
+      // 交差点・踏切の中は、路面が重なるのも高さが動くのも当たり前。
+      if (windows.some((w) => Math.abs(w.s - chord.s) <= w.reach + chord.halfLength)) continue;
+      const near = nearestOn(otherLine, chord.cx, chord.cz);
+      if (!near) continue;
+      const dy = chord.cy - near.y;
+      if (Math.abs(dy) <= LEVEL_CROSSING_TOLERANCE) {
+        overlapDepth = Math.max(overlapDepth, depth);
+        overlapLength += chord.length;
+        continue;
+      }
+      const lowerKind = dy > 0 ? other.kind : cls.kind;
+      const required = lowerKind === 'rail' ? CLEARANCE_OVER_RAIL : CLEARANCE_OVER_ROAD;
+      const clearance = Math.abs(dy) - DECK_THICKNESS;
+      if (clearance < required && clearance < worstClearance) {
+        worstClearance = clearance;
+        lowerKindOfWorst = lowerKind;
       }
     }
 
@@ -238,8 +340,13 @@ function checkOverlaps(ctx: PlacementContext, connected: Set<SegmentId>): string
           `すり付けが要ります (交差角を大きくするか、道路の勾配を緩めてください)。`,
       );
     }
-    if (!shallow && overlapLength > reach * 2.5) {
-      out.push('既存の線形と重なって並走しています。');
+    if (!shallow && overlapDepth > 0) {
+      out.push(
+        overlapLength > reach * 2.5
+          ? '既存の線形と重なって並走しています。'
+          : `既存の線形と路面が重なります (あと ${Math.max(0.5, overlapDepth).toFixed(1)} m 離すか、` +
+            '中心線どうしを交わらせて交差点にしてください)。',
+      );
     }
     if (Number.isFinite(worstClearance)) {
       const required =
@@ -288,29 +395,135 @@ function boundsOf(line: Sample[]): { minX: number; maxX: number; minZ: number; m
   return { minX, maxX, minZ, maxZ };
 }
 
-function nearestOn(
-  line: Sample[],
-  x: number,
-  z: number,
-): { distance: number; y: number } | null {
-  let best: { distance: number; y: number } | null = null;
+/**
+ * 中心線の 1 区間を、幅を持った長方形として見たもの。
+ *
+ * 帯は円ではないので、中心線どうしの距離だけで重なりを測ると、突き当たる
+ * 形 (T 字) の端で実際より近いと判定してしまう。長方形として扱えば、
+ * 並走・突き当たり・斜めのすれ違いを同じ式で見られる。
+ */
+interface Chord {
+  cx: number;
+  cz: number;
+  cy: number;
+  /** 単位方向。 */
+  dx: number;
+  dz: number;
+  halfLength: number;
+  /** 半幅 (舗装・道床の縁まで)。 */
+  half: number;
+  /** 粗い当たり判定用の外接半径 [m]。 */
+  reach: number;
+  /** 中央の弧長 [m]。 */
+  s: number;
+  length: number;
+}
+
+function chordOf(a: Sample, b: Sample, half: number): Chord | null {
+  const dx = b.x - a.x;
+  const dz = b.z - a.z;
+  const length = Math.hypot(dx, dz);
+  if (length < 1e-6) return null;
+  return {
+    cx: (a.x + b.x) / 2,
+    cz: (a.z + b.z) / 2,
+    cy: (a.y + b.y) / 2,
+    dx: dx / length,
+    dz: dz / length,
+    halfLength: length / 2,
+    half,
+    reach: length / 2 + half,
+    s: (a.s + b.s) / 2,
+    length,
+  };
+}
+
+function chordsOf(line: Sample[], half: number): Chord[] {
+  const out: Chord[] = [];
+  for (let i = 0; i + 1 < line.length; i++) {
+    const chord = chordOf(line[i], line[i + 1], half);
+    if (chord) out.push(chord);
+  }
+  return out;
+}
+
+/**
+ * 幅を持った 2 区間 (長方形) の重なりの深さ [m]。0 なら離れている。
+ *
+ * 分離軸で見る。どれか 1 つの軸で離れていれば重なっておらず、どの軸でも
+ * 重なっていれば、いちばん浅い重なりが「あと何 m 離せばよいか」になる。
+ */
+function rectOverlap(a: Chord, b: Chord): number {
+  const axes: [number, number][] = [
+    [a.dx, a.dz],
+    [-a.dz, a.dx],
+    [b.dx, b.dz],
+    [-b.dz, b.dx],
+  ];
+  const ex = b.cx - a.cx;
+  const ez = b.cz - a.cz;
+  let depth = Infinity;
+  for (const [ux, uz] of axes) {
+    const ra =
+      a.halfLength * Math.abs(a.dx * ux + a.dz * uz) + a.half * Math.abs(-a.dz * ux + a.dx * uz);
+    const rb =
+      b.halfLength * Math.abs(b.dx * ux + b.dz * uz) + b.half * Math.abs(-b.dz * ux + b.dx * uz);
+    const gap = ra + rb - Math.abs(ex * ux + ez * uz);
+    if (gap <= 0) return 0;
+    if (gap < depth) depth = gap;
+  }
+  return depth;
+}
+
+/** 線形上のいちばん近い点。 */
+interface Near {
+  distance: number;
+  y: number;
+  /** その点の弧長 [m]。 */
+  s: number;
+  /** その点での単位方向。 */
+  dx: number;
+  dz: number;
+}
+
+function nearestOn(line: Sample[], x: number, z: number): Near | null {
+  let best: Near | null = null;
   for (let i = 0; i + 1 < line.length; i++) {
     const a = line[i];
     const b = line[i + 1];
     const dx = b.x - a.x;
     const dz = b.z - a.z;
     const lengthSq = dx * dx + dz * dz;
-    let t = 0;
-    if (lengthSq > 1e-9) {
-      t = ((x - a.x) * dx + (z - a.z) * dz) / lengthSq;
-      t = t < 0 ? 0 : t > 1 ? 1 : t;
-    }
+    if (lengthSq < 1e-12) continue;
+    let t = ((x - a.x) * dx + (z - a.z) * dz) / lengthSq;
+    t = t < 0 ? 0 : t > 1 ? 1 : t;
     const distance = Math.hypot(x - (a.x + dx * t), z - (a.z + dz * t));
-    if (!best || distance < best.distance) {
-      best = { distance, y: a.y + (b.y - a.y) * t };
-    }
+    if (best && distance >= best.distance) continue;
+    const length = Math.sqrt(lengthSq);
+    best = {
+      distance,
+      y: a.y + (b.y - a.y) * t,
+      s: a.s + (b.s - a.s) * t,
+      dx: dx / length,
+      dz: dz / length,
+    };
   }
   return best;
+}
+
+/** 端点が相手の中心線に乗っているとみなす距離 [m]。 */
+const TOUCH = 0.5;
+
+/** 線形の端での単位方向 (始点は前向き、終点も前向き)。 */
+function endDirection(line: Sample[], atStart: boolean): { dx: number; dz: number } | null {
+  const a = atStart ? line[0] : line[line.length - 2];
+  const b = atStart ? line[1] : line[line.length - 1];
+  if (!a || !b) return null;
+  const dx = b.x - a.x;
+  const dz = b.z - a.z;
+  const length = Math.hypot(dx, dz);
+  if (length < 1e-9) return null;
+  return { dx: dx / length, dz: dz / length };
 }
 
 /**
