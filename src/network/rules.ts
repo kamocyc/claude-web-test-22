@@ -663,8 +663,13 @@ function trimAt(network: Network, node: NodeId, segment: SegmentId): number {
   return requiredTrims(branches)[index];
 }
 
-/** その交差点の面が広がっている範囲 [m] (端点・継ぎ目なら 0)。 */
-function junctionReach(network: Network, node: NodeId): number {
+/**
+ * その交差点の面が広がっている範囲 [m] (端点・継ぎ目なら 0)。
+ *
+ * 敷設ツールも同じ値を見る (面の中を指したらその交差点に繋ぐ)。判定と
+ * 操作が同じ範囲を見るので、「指せるのに置けない」所ができない。
+ */
+export function junctionReach(network: Network, node: NodeId): number {
   const branches = network.branchesAt(node);
   if (branches.length < 2) return 0;
   const trims = requiredTrims(branches);

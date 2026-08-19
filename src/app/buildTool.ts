@@ -14,7 +14,7 @@ import {
   type PlaceResult,
   type PlacementPreview,
 } from '../network/editing';
-import type { Network, SegmentId } from '../network/network';
+import type { NetNode, Network, NodeId, SegmentId } from '../network/network';
 import {
   findParallelReference,
   parallelAlignment,
@@ -22,9 +22,10 @@ import {
   stationOf,
   type ParallelReference,
 } from '../network/parallel';
-import { checkPlacement } from '../network/rules';
+import { checkPlacement, junctionReach } from '../network/rules';
 import { evaluateAlignment, type SegmentDiagnostics } from '../network/validation';
 import { createPreviewMaterial, setPreviewBlocked } from '../render/materials';
+import { SnapView, type SnapKind, type SnapMarker } from '../render/snapView';
 import type { Heightfield } from '../terrain/heightfield';
 
 export type ToolMode = 'build' | 'bulldoze' | 'inspect';
@@ -47,7 +48,9 @@ export interface ToolStatus {
   radius: number;
   grade: number;
   diagnostics: SegmentDiagnostics | null;
-  snap: 'none' | 'node' | 'segment' | 'parallel';
+  snap: SnapKind;
+  /** いま吸い付いている点 (表示用)。始点側と終点側で最大 2 つ。 */
+  markers: readonly SnapMarker[];
   hoverSegment: SegmentId | null;
   cost: number;
   /** 平行スナップが有効か。 */
@@ -56,6 +59,13 @@ export interface ToolStatus {
   parallelTo: SegmentId | null;
   /** 空でなければ敷設できない。理由をそのまま表示する。 */
   blockers: string[];
+}
+
+/** カーソルの行き先 (吸い付いた点と、その目印)。 */
+interface Target {
+  anchor: Anchor;
+  snap: SnapKind;
+  marker: SnapMarker | null;
 }
 
 const ELEVATION_STEP = 3;
@@ -77,13 +87,17 @@ export class BuildTool {
   parallelSnap = true;
 
   readonly previewGroup = new Group();
+  private readonly snapView = new SnapView();
   private readonly previewMesh: Mesh;
   private readonly previewMaterial: MeshStandardMaterial;
   private anchor: Anchor | null = null;
   private cursor: Vector3 | null = null;
   private preview: PlacementPreview | null = null;
   private endAnchor: Anchor | null = null;
-  private snapKind: 'none' | 'node' | 'segment' | 'parallel' = 'none';
+  private snapKind: SnapKind = 'none';
+  /** 引き始めた点の目印 (確定済み)。 */
+  private anchorMarker: SnapMarker | null = null;
+  private markers: SnapMarker[] = [];
   private hoverSegment: SegmentId | null = null;
   private lastDiagnostics: SegmentDiagnostics | null = null;
   private blockers: string[] = [];
@@ -101,7 +115,7 @@ export class BuildTool {
     this.previewMaterial = createPreviewMaterial();
     this.previewMesh = new Mesh(new MeshBuilder().build(), this.previewMaterial);
     this.previewMesh.frustumCulled = false;
-    this.previewGroup.add(this.previewMesh);
+    this.previewGroup.add(this.previewMesh, this.snapView.group);
   }
 
   get cls(): NetworkClass {
@@ -138,6 +152,8 @@ export class BuildTool {
     this.blockers = [];
     this.parallel = null;
     this.parallelAlignmentPreview = null;
+    this.anchorMarker = null;
+    this.showMarkers([]);
     this.updatePreviewMesh();
   }
 
@@ -149,6 +165,7 @@ export class BuildTool {
 
     if (!cursor) {
       this.preview = null;
+      this.showMarkers(this.anchorMarker ? [this.anchorMarker] : []);
       this.updatePreviewMesh();
       return;
     }
@@ -157,6 +174,7 @@ export class BuildTool {
       const hit = this.network.findSegmentNear(cursor, 12);
       this.hoverSegment = hit?.segment ?? null;
       this.preview = null;
+      this.showMarkers([]);
       this.updatePreviewMesh();
       return;
     }
@@ -167,7 +185,7 @@ export class BuildTool {
   private modifiers: CursorModifiers = { straight: false, noSnap: false };
 
   /** 現在のカーソル位置から、接続先を含めた到達点を決める。 */
-  private resolveTarget(): { anchor: Anchor; snap: 'none' | 'node' | 'segment' | 'parallel' } {
+  private resolveTarget(): Target {
     const cursor = this.cursor!;
     const cls = this.cls;
     const free = new Vector3(
@@ -176,19 +194,19 @@ export class BuildTool {
       cursor.z,
     );
 
-    if (this.modifiers.noSnap) return { anchor: { pos: free }, snap: 'none' };
+    if (this.modifiers.noSnap) return { anchor: { pos: free }, snap: 'none', marker: null };
 
     // 候補を集めて、カーソルからいちばん近い所へ寄せる。ノードの近くでは
     // ノードに、路肩の外では平行の位置に付く、という素直な決まりになる。
-    const candidates: { anchor: Anchor; snap: 'node' | 'segment' | 'parallel'; distance: number }[] =
-      [];
+    const candidates: (Target & { snap: SnapMarker['kind']; distance: number })[] = [];
 
     const nodeSnapRadius = Math.max(8, cls.halfWidth * 1.4);
     const node = this.network.findNodeNear(cursor, nodeSnapRadius);
-    if (node) {
+    if (node && this.canJoin(node)) {
       candidates.push({
         anchor: anchorFromNode(this.network, node, cls),
         snap: 'node',
+        marker: this.nodeMarker(node),
         distance: Math.hypot(node.pos.x - cursor.x, node.pos.z - cursor.z),
       });
     }
@@ -198,12 +216,39 @@ export class BuildTool {
       const other = this.network.classOf(this.network.getSegment(onSegment.segment));
       // 種別が違う場合は交差 (踏切・立体交差) にしたいのでスナップしない。
       if (other.kind === cls.kind) {
-        candidates.push({
-          anchor: anchorFromSegment(this.network, onSegment.segment, onSegment.s),
-          snap: 'segment',
-          distance: Math.hypot(onSegment.pos.x - cursor.x, onSegment.pos.z - cursor.z),
-        });
+        // 交差点の面の中では、既存の線形を分割せずにその交差点へ繋ぐ。
+        // 面の中で分割しても交差点の形が保てず (必ず「交差点が近すぎます」
+        // になる)、T 字を十字にすることができない。
+        const junction = this.junctionAt(onSegment.segment, onSegment.s);
+        const distance = Math.hypot(onSegment.pos.x - cursor.x, onSegment.pos.z - cursor.z);
+        candidates.push(
+          junction
+            ? {
+                anchor: anchorFromNode(this.network, junction, cls),
+                snap: 'node',
+                marker: this.nodeMarker(junction),
+                distance,
+              }
+            : {
+                anchor: anchorFromSegment(this.network, onSegment.segment, onSegment.s),
+                snap: 'segment',
+                marker: this.segmentMarker(onSegment, other),
+                distance,
+              },
+        );
       }
+    }
+
+    // 枝の上でなくても、交差点の面の中を指していればその交差点に繋ぐ
+    // (面の隅を指したときや、面が広い大通りの交差点のため)。
+    const inside = this.junctionUnder(cursor);
+    if (inside) {
+      candidates.push({
+        anchor: anchorFromNode(this.network, inside.node, cls),
+        snap: 'node',
+        marker: this.nodeMarker(inside.node),
+        distance: inside.distance,
+      });
     }
 
     // 既存の線形の隣なら、その線形に平行な位置へ寄せる。
@@ -212,12 +257,102 @@ export class BuildTool {
       candidates.push({
         anchor: { pos: parallel.pos.clone() },
         snap: 'parallel',
+        marker: this.parallelMarker(parallel, parallel.pos),
         distance: Math.hypot(parallel.pos.x - cursor.x, parallel.pos.z - cursor.z),
       });
     }
 
     const best = candidates.sort((a, b) => a.distance - b.distance)[0];
-    return best ? { anchor: best.anchor, snap: best.snap } : { anchor: { pos: free }, snap: 'none' };
+    if (!best) return { anchor: { pos: free }, snap: 'none', marker: null };
+    return { anchor: best.anchor, snap: best.snap, marker: best.marker };
+  }
+
+  // ---------------------------------------------------------- 目印
+
+  /** 交差点・端点に繋ぐ目印。輪の大きさは交差点の面の広がりに合わせる。 */
+  private nodeMarker(node: NetNode): SnapMarker {
+    return {
+      kind: 'node',
+      pos: node.pos.clone(),
+      radius: Math.max(junctionReach(this.network, node.id), this.cls.halfWidth * 0.8),
+    };
+  }
+
+  /** 既存の線形の途中に取り付く目印。分割する位置に横棒を引く。 */
+  private segmentMarker(
+    hit: { pos: Vector3; dir: Vector2 },
+    other: NetworkClass,
+  ): SnapMarker {
+    return {
+      kind: 'segment',
+      pos: hit.pos.clone(),
+      radius: Math.max(1.8, this.cls.halfWidth * 0.4),
+      bar: new Vector2(-hit.dir.y, hit.dir.x).multiplyScalar(other.halfWidth + 0.8),
+    };
+  }
+
+  /** 平行に敷く目印。基準の線形をなぞり、間隔を渡り線で示す。 */
+  private parallelMarker(reference: ParallelReference, at: Vector3): SnapMarker {
+    const alignment = this.network.alignmentOf(reference.segment);
+    const guide: Vector3[] = [];
+    const steps = Math.max(2, Math.ceil(alignment.length / 4));
+    for (let i = 0; i <= steps; i++) {
+      guide.push(alignment.sampleAt((alignment.length * i) / steps).pos.clone());
+    }
+    const s = clamp(stationOf(alignment, at.x, at.z), 0, alignment.length);
+    return {
+      kind: 'parallel',
+      pos: at.clone(),
+      radius: Math.max(1.8, this.cls.halfWidth * 0.4),
+      guide,
+      tie: [alignment.sampleAt(s).pos.clone(), at.clone()],
+    };
+  }
+
+  /** 目印を描き直す。引き始めた点は常に出す。 */
+  private showMarkers(markers: readonly (SnapMarker | null)[]): void {
+    this.markers = markers.filter((m): m is SnapMarker => m !== null);
+    this.snapView.update(this.markers);
+  }
+
+  /** その種別を繋いでよいノードか (線路のノードに道路は繋がない)。 */
+  private canJoin(node: NetNode): boolean {
+    const branches = this.network.branchesAt(node.id);
+    return branches.length === 0 || branches.some((b) => b.cls.kind === this.cls.kind);
+  }
+
+  /**
+   * 既存の線形の `s` 地点が交差点の面の中なら、その交差点のノード。
+   *
+   * 面の広がりは敷設の判定と同じ `junctionReach` で測る。指せる所と
+   * 置ける所が同じ範囲になるので、「指せるのに置けない」所ができない。
+   */
+  private junctionAt(segment: SegmentId, s: number): NetNode | null {
+    const seg = this.network.getSegment(segment);
+    const length = this.network.alignmentOf(segment).length;
+    const ends: [NodeId, number][] = [
+      [seg.a, s],
+      [seg.b, length - s],
+    ];
+    for (const [id, from] of ends) {
+      const node = this.network.nodes.get(id);
+      if (!node || !this.canJoin(node)) continue;
+      if (from <= junctionReach(this.network, id)) return node;
+    }
+    return null;
+  }
+
+  /** カーソルが交差点の面の中にあれば、その交差点のノード。 */
+  private junctionUnder(cursor: Vector3): { node: NetNode; distance: number } | null {
+    let best: { node: NetNode; distance: number } | null = null;
+    for (const node of this.network.nodes.values()) {
+      const distance = Math.hypot(node.pos.x - cursor.x, node.pos.z - cursor.z);
+      if (distance > 60 || (best && distance >= best.distance)) continue;
+      if (!this.canJoin(node)) continue;
+      if (distance > junctionReach(this.network, node.id)) continue;
+      best = { node, distance };
+    }
+    return best;
   }
 
   /** 平行に敷ける基準の線形を探す (無効化されていれば null)。 */
@@ -235,6 +370,7 @@ export class BuildTool {
       this.preview = null;
       this.endAnchor = null;
       this.parallelAlignmentPreview = null;
+      this.showMarkers([target.marker]);
       this.updatePreviewMesh();
       return;
     }
@@ -256,6 +392,9 @@ export class BuildTool {
       straight: this.modifiers.straight,
       cls: this.cls,
     });
+    // (角度スナップで位置をずらすのは、どこにも吸い付いていないときだけ
+    //  なので、そのときは target.marker が無い。)
+    this.showMarkers([this.anchorMarker, target.marker]);
     this.updatePreviewMesh();
   }
 
@@ -297,6 +436,7 @@ export class BuildTool {
       this.preview = null;
       this.endAnchor = null;
       this.parallelAlignmentPreview = null;
+      this.showMarkers([this.anchorMarker]);
       return true;
     }
 
@@ -308,6 +448,12 @@ export class BuildTool {
       ? { pos: node.pos.clone(), node: node.id }
       : { pos: this.preview.end.clone() };
     this.snapKind = 'parallel';
+    // 何に平行なのか・どこまで来ているのかを目印で出す。
+    this.showMarkers([
+      this.anchorMarker,
+      this.parallelMarker(this.parallel ?? reference, this.preview.end),
+      node && this.canJoin(node) ? this.nodeMarker(node) : null,
+    ]);
     return true;
   }
 
@@ -381,6 +527,7 @@ export class BuildTool {
     const target = this.resolveTarget();
     if (!this.anchor) {
       this.anchor = target.anchor;
+      this.anchorMarker = target.marker ? { ...target.marker, fixed: true } : null;
       // 始点が既存の線形の隣なら、そこから平行に敷き始める。既に敷いた
       // 平行線の端 (ノード) から続ける場合も同じ。
       this.parallel = this.findParallel(target.anchor.pos);
@@ -398,7 +545,10 @@ export class BuildTool {
 
     // 終点を始点にして続けて引けるようにする。接線は敷設後の線形から
     // 取り直す (折れをなめらかにした分だけ、プレビューとずれるため)。
-    this.anchor = this.continuation(result, preview);
+    this.anchor = this.continuation(result);
+    const endNode = this.network.nodes.get(result.endNode);
+    this.anchorMarker =
+      this.anchor && endNode ? { ...this.nodeMarker(endNode), fixed: true } : null;
     // 平行に敷いていたなら、基準の線形を取り直す。既存の線形の端まで
     // 来ていれば、そのまま隣のセグメントへ引き継がれる。
     this.parallel =
@@ -411,16 +561,20 @@ export class BuildTool {
     this.onChanged();
   }
 
-  /** 続けて引くためのアンカー。敷いた線形から接線と勾配を引き継ぐ。 */
-  private continuation(result: PlaceResult, preview: PlacementPreview): Anchor | null {
+  /**
+   * 続けて引くためのアンカー。
+   *
+   * 行き止まりで終わったなら、その線形から接線と勾配を引き継いで滑らかに
+   * 続ける。**交差点に取り付いて終わったなら引き継がない**。そこから引く
+   * のは「続き」ではなく新しい枝なので、向きは自由に決められる方がよい
+   * (一度やめて交差点を指し直したときと同じアンカーになる)。どちらも
+   * `anchorFromNode` の判断そのままなので、続けても・やめても同じ形に
+   * 引ける。
+   */
+  private continuation(result: PlaceResult): Anchor | null {
     const end = this.network.nodes.get(result.endNode);
     if (!end) return null;
-    const inherited = anchorFromNode(this.network, end, this.cls);
-    return {
-      ...inherited,
-      tangent: inherited.tangent ?? preview.endTangent.clone(),
-      grade: inherited.grade ?? preview.endGrade,
-    };
+    return anchorFromNode(this.network, end, this.cls);
   }
 
   status(): ToolStatus {
@@ -436,6 +590,7 @@ export class BuildTool {
       grade: preview ? preview.grade : 0,
       diagnostics: this.lastDiagnostics,
       snap: this.snapKind,
+      markers: this.markers,
       hoverSegment: this.hoverSegment,
       cost: length * this.cls.costPerMeter,
       blockers: this.blockers,

@@ -208,9 +208,9 @@ export class Ui {
     rows.push([
       'スナップ',
       status.snap === 'node'
-        ? 'ノード'
+        ? '交差点・端点に接続'
         : status.snap === 'segment'
-          ? '既存線形'
+          ? '既存線形に取り付き'
           : status.snap === 'parallel'
             ? '平行'
             : 'なし',
