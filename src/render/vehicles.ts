@@ -2,6 +2,7 @@ import {
   BoxGeometry,
   Color,
   Group,
+  Matrix4,
   Mesh,
   MeshStandardMaterial,
   Object3D,
@@ -20,6 +21,9 @@ import type { Vehicle } from '../sim/traffic';
 
 const BODY = new BoxGeometry(1, 1, 1);
 const FORWARD = new Vector3(0, 0, 1);
+const UP = new Vector3(0, 1, 0);
+/** 姿勢を組み立てるための使い回しの行列。 */
+const BASIS = new Matrix4();
 
 const glass = new MeshStandardMaterial({ color: 0x1b2228, roughness: 0.25, metalness: 0.4 });
 const tyre = new MeshStandardMaterial({ color: 0x15171a, roughness: 0.9 });
@@ -136,9 +140,29 @@ function place(
   }
 }
 
-/** 位置と進行方向から姿勢を決める。勾配のある所では前後に傾ける。 */
+/**
+ * 進行方向から車体の姿勢を作る。勾配のある所では前後に傾く。
+ *
+ * 「+Z から進行方向への最短回転」で作ってはいけない。ほぼ -Z へ進むとき
+ * (向きが真後ろ) は回転軸が定まらず、勾配のわずかな上下成分だけで軸が X 側
+ * へ倒れて、車体が**上下反転**することがある。上向きを固定した基底から
+ * 作れば、どの向き・どの勾配でも屋根が上を向く。
+ */
+export function bodyQuaternion(dir: Vector3, target = new Quaternion()): Quaternion {
+  const forward = dir.lengthSq() < 1e-8 ? FORWARD.clone() : dir.clone().normalize();
+  const right = new Vector3().crossVectors(UP, forward);
+  if (right.lengthSq() < 1e-10) {
+    // 真上・真下を向いている (ふつうの勾配では起きない)。
+    right.crossVectors(FORWARD, forward);
+    if (right.lengthSq() < 1e-10) right.set(1, 0, 0);
+  }
+  right.normalize();
+  const up = new Vector3().crossVectors(forward, right).normalize();
+  return target.setFromRotationMatrix(BASIS.makeBasis(right, up, forward));
+}
+
+/** 位置と進行方向から姿勢を決める。 */
 function orient(object: Object3D, pos: Vector3, dir: Vector3): void {
   object.position.copy(pos);
-  const forward = dir.lengthSq() < 1e-8 ? FORWARD : dir.clone().normalize();
-  object.quaternion.copy(new Quaternion().setFromUnitVectors(FORWARD, forward));
+  bodyQuaternion(dir, object.quaternion);
 }
