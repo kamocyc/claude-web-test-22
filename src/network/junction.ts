@@ -184,6 +184,13 @@ export function solveJunctions(
     if (built.curved && selfIntersects(built.rings[0] ?? [])) {
       built = buildRings(junction, false);
     }
+    // 浅いダイヤモンドクロッシングでは、4本の細長い枝の路端交点が
+    // 方位角順の途中で折り返し、外周だけが蝶ネクタイ状になることがある。
+    // 同じ断面番号を保ったまま外周の凸包順へ揃えると、線路の口を残しつつ
+    // シーサス中央の道床を一枚の乱れない面にできる。
+    if (junction.kind === 'railCrossing' && selfIntersects(built.rings[0] ?? [])) {
+      built = convexifyRings(built);
+    }
     junction.rings = built.rings;
     junction.ring = built.rings[0] ?? [];
     junction.openEdge = built.openEdge;
@@ -197,6 +204,71 @@ export function solveJunctions(
   }
 
   return { junctions, trims };
+}
+
+function convexifyRings(built: {
+  rings: Vector3[][];
+  openEdge: boolean[];
+  curved: boolean;
+}): { rings: Vector3[][]; openEdge: boolean[]; curved: boolean } {
+  const outer = built.rings[0] ?? [];
+  if (outer.length < 4) return built;
+  const indices = convexHullIndices(outer);
+  if (indices.length < 3) return built;
+  const n = outer.length;
+  const openEdge = indices.map((a, i) => {
+    const b = indices[(i + 1) % indices.length];
+    if ((a + 1) % n === b) return built.openEdge[a] ?? false;
+    if ((b + 1) % n === a) return built.openEdge[b] ?? false;
+    return false;
+  });
+  return {
+    rings: built.rings.map((ring) => indices.map((index) => ring[index].clone())),
+    openEdge,
+    curved: false,
+  };
+}
+
+/** XZ 平面の凸包。返すのは元配列の添字 (反時計回り)。 */
+function convexHullIndices(points: Vector3[]): number[] {
+  const sorted = points
+    .map((point, index) => ({ point, index }))
+    .sort((a, b) => a.point.x - b.point.x || a.point.z - b.point.z);
+  const unique = sorted.filter(
+    (item, index) =>
+      index === 0 ||
+      Math.hypot(
+        item.point.x - sorted[index - 1].point.x,
+        item.point.z - sorted[index - 1].point.z,
+      ) > 1e-5,
+  );
+  if (unique.length <= 2) return unique.map((item) => item.index);
+  const turn = (a: Vector3, b: Vector3, c: Vector3): number =>
+    (b.x - a.x) * (c.z - a.z) - (b.z - a.z) * (c.x - a.x);
+  const lower: typeof unique = [];
+  for (const item of unique) {
+    while (
+      lower.length >= 2 &&
+      turn(lower[lower.length - 2].point, lower[lower.length - 1].point, item.point) <= 0
+    ) {
+      lower.pop();
+    }
+    lower.push(item);
+  }
+  const upper: typeof unique = [];
+  for (let i = unique.length - 1; i >= 0; i--) {
+    const item = unique[i];
+    while (
+      upper.length >= 2 &&
+      turn(upper[upper.length - 2].point, upper[upper.length - 1].point, item.point) <= 0
+    ) {
+      upper.pop();
+    }
+    upper.push(item);
+  }
+  lower.pop();
+  upper.pop();
+  return [...lower, ...upper].map((item) => item.index);
 }
 
 /** セグメント上の弧長に対する、描画高さの補正 (中心線の上下と横断勾配)。 */
@@ -254,8 +326,9 @@ function solveNode(
   const n = branches.length;
   for (let i = 0; i < n; i++) {
     for (let j = i + 1; j < n; j++) {
-      // ほぼ同じ向きに出ている枝どうしは重なってしまう。
-      if (branches[i].dir.dot(branches[j].dir) > 0.999) {
+      // 道路でほぼ同じ向きに出る枝は重複。一方、線路はクリック位置を接点に
+      // した接線分岐が正しい形なので、同方向から徐々に離れる2枝を許す。
+      if (kinds.has('road') && branches[i].dir.dot(branches[j].dir) > 0.999) {
         warnings.push('同じ向きに重なった線形があります。どちらかの向きを変えてください。');
       }
     }
@@ -302,7 +375,10 @@ function solveNode(
   const needsMargin = kind === 'intersection' || kind === 'railSwitch' || kind === 'railCrossing';
   for (const ap of approaches) {
     const L = network.alignmentOf(ap.branch.segment).length;
-    const maxTrim = Math.min(L * 0.45, 40);
+    // シーサス中央の浅いダイヤモンドは、隣の接線分岐までの短い区間の
+    // 大部分がクロッシングそのものになる。両端の合計は後段で按分するので、
+    // railCrossing だけは片端45%の一般上限より広く使ってよい。
+    const maxTrim = Math.min(L * (kind === 'railCrossing' ? 0.8 : 0.45), 40);
     if (needsMargin && ap.trim > 1e-3) ap.trim += CORNER_MARGIN;
     if (ap.trim > maxTrim) {
       ap.trim = maxTrim;
@@ -492,7 +568,10 @@ function buildRings(
    * 道路自身の路端がそのまま続く所で、丸めるとその分だけ舗装が欠ける。
    * 路端線の交点をそのまま角に使えば、両側の帯と隙間なく繋がる。
    */
-  const sharpCorner = junction.kind === 'joint' || junction.kind === 'railSwitch';
+  const sharpCorner =
+    junction.kind === 'joint' ||
+    junction.kind === 'railSwitch' ||
+    junction.kind === 'railCrossing';
   let curved = false;
 
   for (let i = 0; i < n; i++) {

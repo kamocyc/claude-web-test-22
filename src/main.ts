@@ -164,6 +164,10 @@ window.addEventListener('keydown', (event) => {
     case 'B':
       setMode('build');
       break;
+    case 'c':
+    case 'C':
+      setMode('scissors');
+      break;
     case 'x':
     case 'X':
       setMode('bulldoze');

@@ -4,7 +4,12 @@ import { Alignment } from '../src/core/alignment';
 import { curveFromTangents } from '../src/core/curve';
 import { VerticalProfile } from '../src/core/profile';
 import { getClass } from '../src/network/classes';
-import { anchorFromSegment, computePlacement, placeSegment } from '../src/network/editing';
+import {
+  anchorFromNode,
+  anchorFromSegment,
+  computePlacement,
+  placeSegment,
+} from '../src/network/editing';
 import { solveJunctions } from '../src/network/junction';
 import { Network, type NodeId } from '../src/network/network';
 import { checkPlacement } from '../src/network/rules';
@@ -215,6 +220,36 @@ describe('敷設できるかどうかの判定', () => {
 });
 
 describe('既存の線形への取り付き', () => {
+  it('線路途中のクリック位置を接点にして、指した側へ接線分岐する', () => {
+    const network = new Network();
+    addStraight(network, 'rail_yard', new Vector3(-120, 0, 0), new Vector3(120, 0, 0));
+    const [segment] = [...network.segments.keys()];
+    const alignment = network.alignmentOf(segment);
+    const anchor = anchorFromSegment(network, segment, alignment.length / 2);
+
+    for (const side of [-1, 1]) {
+      const preview = computePlacement(anchor, new Vector3(side * 90, 0, 25), {
+        straight: false,
+        cls: getClass('rail_yard'),
+      });
+      const tangent = preview.horizontal.tangentAt(0);
+      expect(tangent.x * side).toBeGreaterThan(0.999);
+      expect(Math.abs(tangent.y)).toBeLessThan(1e-6);
+    }
+  });
+
+  it('既存線路の端点へ、プレビューの時点から接線を揃えて接続する', () => {
+    const network = new Network();
+    addStraight(network, 'rail_yard', new Vector3(-120, 0, 0), new Vector3(0, 0, 0));
+    const node = network.findNodeNear(new Vector3(0, 0, 0), 0.5)!;
+    const end = anchorFromNode(network, node, getClass('rail_yard'));
+    const start = { pos: new Vector3(90, 0, 35) };
+    const preview = computePlacement(start, end, { straight: false, cls: getClass('rail_yard') });
+    const tangent = preview.horizontal.tangentAt(preview.horizontal.length);
+    expect(tangent.x).toBeLessThan(-0.999);
+    expect(Math.abs(tangent.y)).toBeLessThan(1e-6);
+  });
+
   /** 既存の道路の端に、角度 `deg` で新しい道路を繋ぐ。 */
   function joinAt(deg: number, classId = 'road_medium') {
     const network = new Network();
