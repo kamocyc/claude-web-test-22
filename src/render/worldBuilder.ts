@@ -65,6 +65,7 @@ import { buildConnectivity, type Connectivity } from '../network/connectivity';
 import { Occupancy } from '../network/occupancy';
 import {
   classify,
+  clearStructureAtJunction,
   computeStructureProfile,
   forceRunMode,
   modeAt,
@@ -314,6 +315,24 @@ export class WorldBuilder {
         range: ranges.get(id)!,
       }));
       unifyParallelRuns(members).forEach((runs, i) => structures.set(group.members[i], runs));
+    }
+
+    // 交差点の口に坑門・橋台が食い込まないよう、地形の上で地表になる分は
+    // 地表に戻す。トンネルの中に交差点がある配置は敷設規則が止めるので、
+    // ここで戻せない配置は残らない。
+    for (const seg of network.segments.values()) {
+      const runs = structures.get(seg.id);
+      const range = ranges.get(seg.id);
+      if (!runs || !range) continue;
+      const ends = {
+        start: (junctions.get(seg.a)?.rings.length ?? 0) > 0,
+        end: (junctions.get(seg.b)?.rings.length ?? 0) > 0,
+      };
+      if (!ends.start && !ends.end) continue;
+      structures.set(
+        seg.id,
+        clearStructureAtJunction(network.alignmentOf(seg.id), this.field, runs, range, ends),
+      );
     }
 
     // 立体交差の上側は、盛土になる高さでも橋にする。そうしないと下をくぐる

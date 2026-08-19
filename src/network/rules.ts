@@ -14,6 +14,8 @@ import { intersectPolylines, toPolyline, type PolylinePoint } from './crossings'
 import type { Anchor } from './editing';
 import { CORNER_MARGIN, requiredTrims, type BranchLike } from './junction';
 import type { Branch, Network, NodeId, SegmentId } from './network';
+import { classify } from './structure';
+import type { Heightfield } from '../terrain/heightfield';
 
 /**
  * 敷設してよいかの判定。
@@ -43,6 +45,11 @@ export interface PlacementContext {
   end: Anchor;
   /** 判定から外すセグメント (既存の線形を引き直すときの自分自身)。 */
   ignore?: SegmentId;
+  /**
+   * 自然地形。渡すと「トンネルの中の交差点」を止められる。
+   * 省略した場合はその判定を行わない。
+   */
+  field?: Heightfield;
 }
 
 /**
@@ -88,6 +95,7 @@ export function checkPlacement(ctx: PlacementContext): PlacementCheck {
 
   blockers.push(...checkOverlaps(ctx, connected));
   blockers.push(...checkJunctionSpacing(ctx));
+  blockers.push(...checkTunnelJunctions(ctx, connected));
 
   return { blockers: dedupe(blockers) };
 }
@@ -463,6 +471,110 @@ function crossingTrim(
   cos: number,
 ): number {
   return (other.halfWidth + own.halfWidth * cos) / Math.max(0.05, sin) + CORNER_MARGIN;
+}
+
+/** 坑門が交差点の外に立つために要る余裕 [m] (柱の奥行き + 隅の丸め)。 */
+const PORTAL_STANDOFF = 3;
+
+/**
+ * トンネルの中・坑口にかかる交差点を止める。
+ *
+ * トンネルの中に交差点があると、四方の口に坑門が立って車がぶつかり、
+ * 交差点そのものも山の中に埋まる。地形と線形の高さで決まることなので、
+ * 「掘ってから直す」ことができない。置く前に止める。
+ *
+ * 判定は交差点になる点 (既存ノード・取り付き・同一平面の交差) のまわりで、
+ * **交差点が食べる長さ + 坑門の余裕**の範囲を線形に沿って歩き、そこが
+ * トンネルの区間に入るかどうかを見る。地形を横に見ないのは、山腹を
+ * 走っているだけの道路を巻き込まないため。
+ */
+function checkTunnelJunctions(ctx: PlacementContext, connected: Set<SegmentId>): string[] {
+  const field = ctx.field;
+  if (!field) return [];
+  const { network, cls, alignment } = ctx;
+  const out: string[] = [];
+
+  /** 線形の s0 から前後 `reach` の範囲に、トンネルの区間があるか。 */
+  const tunnelNear = (line: Alignment, s0: number, reach: number): boolean => {
+    for (let d = 0; d <= reach; d += 2) {
+      for (const s of d === 0 ? [s0] : [s0 - d, s0 + d]) {
+        if (s < 0 || s > line.length) continue;
+        const p = line.sampleAt(s).pos;
+        if (classify(p.y, field.baseHeightAt(p.x, p.z)) === 'tunnel') return true;
+      }
+    }
+    return false;
+  };
+
+  const blocked = (): void => {
+    out.push('トンネルの中には交差点を作れません (坑口から離してください)。');
+  };
+
+  // 1. 既存の線形と同じ高さで交わる所 (新しくできる交差点)。
+  const mine = polyline(alignment);
+  for (const seg of network.segments.values()) {
+    if (connected.has(seg.id)) continue;
+    const other = network.classOf(seg);
+    if (other.kind !== cls.kind) continue;
+    const otherAlignment = network.alignmentOf(seg.id);
+    for (const hit of intersectPolylines(mine, polyline(otherAlignment))) {
+      if (Math.abs(hit.yA - hit.yB) > LEVEL_CROSSING_TOLERANCE) continue;
+      const sin = Math.abs(hit.dirA.x * hit.dirB.y - hit.dirA.y * hit.dirB.x);
+      const cos = Math.abs(hit.dirA.x * hit.dirB.x + hit.dirA.y * hit.dirB.y);
+      if (
+        tunnelNear(alignment, hit.sA, crossingTrim(cls, other, sin, cos) + PORTAL_STANDOFF) ||
+        tunnelNear(otherAlignment, hit.sB, crossingTrim(other, cls, sin, cos) + PORTAL_STANDOFF)
+      ) {
+        blocked();
+        return dedupe(out);
+      }
+    }
+  }
+
+  // 2. 端点が既存のノード・既存の線形の途中に取り付く所。
+  const ends: [Anchor, number][] = [
+    [ctx.start, 0],
+    [ctx.end, alignment.length],
+  ];
+  for (const [anchor, s] of ends) {
+    const neighbours: { line: Alignment; s: number; cls: NetworkClass }[] = [];
+    if (anchor.node !== undefined) {
+      for (const branch of network.branchesAt(anchor.node)) {
+        if (branch.segment === ctx.ignore) continue;
+        const seg = network.segments.get(branch.segment);
+        if (!seg) continue;
+        const line = network.alignmentOf(branch.segment);
+        neighbours.push({
+          line,
+          s: branch.atStart ? 0 : line.length,
+          cls: network.classOf(seg),
+        });
+      }
+    } else if (anchor.split) {
+      const seg = network.segments.get(anchor.split.segment);
+      if (seg) {
+        const line = network.alignmentOf(anchor.split.segment);
+        neighbours.push({
+          line,
+          s: clamp(anchor.split.s, 0, line.length),
+          cls: network.classOf(seg),
+        });
+      }
+    }
+    // 交差点にならない端 (行き止まり) は見ない。
+    if (neighbours.length === 0) continue;
+    for (const neighbour of neighbours) {
+      // 直角に取り付く場合のトリム。斜めの取り付きはこれより長くなるが、
+      // 足りない分は「止めない側」に外れるので誤検知にならない。
+      const reach = cls.halfWidth + neighbour.cls.halfWidth + CORNER_MARGIN + PORTAL_STANDOFF;
+      if (tunnelNear(alignment, s, reach) || tunnelNear(neighbour.line, neighbour.s, reach)) {
+        blocked();
+        return dedupe(out);
+      }
+    }
+  }
+
+  return out;
 }
 
 function dedupe(list: string[]): string[] {

@@ -167,6 +167,17 @@ export class Traffic {
       }
     }
 
+    // 「入ると決めた」進路は、誰が先に判断するかに関わらず押さえておく。
+    // 決めた車が横取りされると、止まりきれない所で止まる羽目になる。
+    for (const vehicle of this.vehicles) {
+      if (vehicle.commit === undefined) continue;
+      const lane = this.graph.lanes[vehicle.commit];
+      if (!lane) continue;
+      occupied.add(lane.id);
+      const target = lane.next[0];
+      if (target !== undefined) tailIn.set(target, 0);
+    }
+
     const space: JunctionSpace = { occupied, tailIn };
     for (const vehicle of this.vehicles) {
       this.advance(vehicle, step, space);
@@ -219,20 +230,40 @@ export class Traffic {
           // 同じ枠を 2 台が同時に取ってしまわないよう、判断した順に確定する。
           occupied.add(lane.id);
           if (target !== undefined) tailIn.set(target, 0);
-          // 停止線を越えていれば、もう引き返さない。
-          if (line <= 0) vehicle.commit = lane.id;
+          // もう止まりきれない所まで来たら、そこから先は引き返さない。
+          // (引き返せば、横断歩道や交差点の中で止まることになる。)
+          if (!this.canStopBefore(line, vehicle.speed)) vehicle.commit = lane.id;
         };
 
+        // 停止線の手前で止まりきれるか。止まれない所で「やっぱり止まる」と
+        // 決めると、横断歩道や交差点の中で止まることになる。
+        const canStop = this.canStopBefore(line, vehicle.speed);
+        // 進路の取り合いは、止まれる距離のうちに見ておく。ぎりぎりで
+        // 気付いても間に合わない。
+        const decideAt = ENTRY_CHECK + this.brakingDistance(vehicle.speed);
+        const signal =
+          lane.phase === undefined ? 0 : signalStateAt(this.time, lane.phase);
+
+        // 進路の取り合い。合流先に空きが無い / 交わる進路に誰かいる。
+        const busy = free < room || lane.conflicts.some((c) => occupied.has(c));
+
         if (vehicle.commit === lane.id) {
-          reserve();
-        } else if (lane.phase !== undefined && signalStateAt(this.time, lane.phase) !== 0) {
+          // 決めたあとでも、まだ止まれるうちに赤や取り合いに気付いたら
+          // 取り消す。止まれないなら、決めたとおり渡り切る。
+          if (canStop && (signal !== 0 || busy)) {
+            stopIn = Math.min(stopIn, line);
+            vehicle.commit = undefined;
+          } else {
+            reserve();
+          }
+        } else if (signal !== 0) {
+          // 黄で止まりきれず、進路も空いているなら渡り切る (ジレンマゾーン)。
+          // 止まれるなら止まるし、進路が空いていなければ精一杯止まる。
+          if (signal === 1 && !canStop && !busy) reserve();
+          else stopIn = Math.min(stopIn, line);
+        } else if (entry < decideAt && busy) {
           stopIn = Math.min(stopIn, line);
-        } else if (
-          entry < ENTRY_CHECK &&
-          (free < room || lane.conflicts.some((c) => occupied.has(c)))
-        ) {
-          stopIn = Math.min(stopIn, line);
-        } else if (entry < ENTRY_CHECK) {
+        } else if (entry < decideAt) {
           reserve();
         }
       }
@@ -263,6 +294,29 @@ export class Traffic {
     vehicle.speed = Math.max(0, v + clamp(accel, -MAX_BRAKE, ACCEL) * dt);
     vehicle.head += vehicle.speed * dt;
     this.trimRoute(vehicle);
+  }
+
+  /**
+   * その速度から停止線までに止まりきるのに要る距離 [m]。
+   *
+   * 減速度 `DECEL` で止まる距離に、判断と車間の余裕を足したもの。
+   * これより手前で「止まる」と決めても間に合わないので、進路の取り合いは
+   * この距離のうちに決める。速いほど長くなるが、上限を切って、交差点を
+   * 何十秒も押さえたままにしない。
+   */
+  private brakingDistance(speed: number): number {
+    return Math.min(60, (speed * speed) / (2 * DECEL) + MIN_GAP);
+  }
+
+  /**
+   * その速度で、`distance` [m] 先の停止線までに止まりきれるか。
+   *
+   * ほとんど止まっている車はいつでも止まれる (停止線の上で待っている車が
+   * 「もう止まれない」と判断して動き出さないように)。
+   */
+  private canStopBefore(distance: number, speed: number): boolean {
+    if (speed < 1.5) return distance > -0.5;
+    return distance >= this.brakingDistance(speed);
   }
 
   /** 前を走る車両との車間 [m] と、その速度。いなければ無限大。 */
