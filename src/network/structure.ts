@@ -36,17 +36,41 @@ export function computeStructureProfile(
   const count = Math.max(2, Math.ceil((s1 - s0) / step) + 1);
   const stations: number[] = [];
   const modes: StructureMode[] = [];
+  /** 路面と自然地形の高低差 (正 = 路面が上)。 */
+  const rise: number[] = [];
   for (let i = 0; i < count; i++) {
     const s = s0 + ((s1 - s0) * i) / (count - 1);
     const p = alignment.sampleAt(s).pos;
+    const terrain = field.baseHeightAt(p.x, p.z);
     stations.push(s);
-    modes.push(classify(p.y, field.baseHeightAt(p.x, p.z)));
+    modes.push(classify(p.y, terrain));
+    rise.push(p.y - terrain);
   }
 
-  let runs = encodeRuns(stations, modes);
-  runs = mergeShortRuns(runs);
-  return runs;
+  /**
+   * 短くても地表に戻してはいけない区間か。
+   *
+   * 高低差が大きい所を地表にすると、盛土・切土で処理するしかなくなる。
+   * 路端の垂れ壁は 8 m しか下りないし、隣に別の線形があると法面を作る
+   * 場所も無いので、路面の下に穴が開く。深い所は短くても橋・トンネルの
+   * ままにする。
+   */
+  const strong = (run: StructureRun): boolean => {
+    if (run.mode === 'ground') return false;
+    let extreme = 0;
+    for (let i = 0; i < stations.length; i++) {
+      if (stations[i] < run.s0 - 1e-6 || stations[i] > run.s1 + 1e-6) continue;
+      extreme = Math.max(extreme, run.mode === 'bridge' ? rise[i] : -rise[i]);
+    }
+    const limit = run.mode === 'bridge' ? BRIDGE_THRESHOLD : TUNNEL_THRESHOLD;
+    return extreme > limit + DEEP_MARGIN;
+  };
+
+  return mergeShortRuns(encodeRuns(stations, modes), MIN_STRUCTURE_RUN, strong);
 }
+
+/** 短い区間でも構造物のままにする高低差の余裕 [m]。 */
+const DEEP_MARGIN = 2;
 
 /** 平行に並んだ線形 1 本ぶんの、区間を揃えるための情報。 */
 export interface ParallelRuns {
@@ -170,7 +194,12 @@ function encodeRuns(stations: number[], modes: StructureMode[]): StructureRun[] 
  * 短すぎる区間を隣に吸収する。数メートルだけの橋やトンネルが
  * 大量にできるのを防ぎ、構造物の見た目を落ち着かせる。
  */
-export function mergeShortRuns(input: StructureRun[], minLength = MIN_STRUCTURE_RUN): StructureRun[] {
+export function mergeShortRuns(
+  input: StructureRun[],
+  minLength = MIN_STRUCTURE_RUN,
+  /** true を返した区間は、短くても吸収しない。 */
+  keep?: (run: StructureRun) => boolean,
+): StructureRun[] {
   let runs = input.map((r) => ({ ...r }));
   for (let guard = 0; guard < 64; guard++) {
     if (runs.length <= 1) break;
@@ -178,7 +207,7 @@ export function mergeShortRuns(input: StructureRun[], minLength = MIN_STRUCTURE_
     let worstLen = minLength;
     for (let i = 0; i < runs.length; i++) {
       const len = runs[i].s1 - runs[i].s0;
-      if (len < worstLen) {
+      if (len < worstLen && !keep?.(runs[i])) {
         worstLen = len;
         worst = i;
       }
@@ -196,6 +225,52 @@ export function mergeShortRuns(input: StructureRun[], minLength = MIN_STRUCTURE_
     runs = coalesce(runs);
   }
   return runs;
+}
+
+/**
+ * 交差点の口に坑門・橋台が食い込まないようにする。
+ *
+ * 短い区間の吸収 (`mergeShortRuns`) は、交差点の手前に残った数十 m の
+ * 地表区間をトンネル・橋に飲み込むことがある。飲み込まれた区間の端は
+ * 交差点の口そのものなので、そこに坑門を建てると柱が交差点の中に立ち、
+ * 曲がってきた車が壁にぶつかる。
+ *
+ * そこで、交差点に接する端から内側へ「地形の上では地表」の区間が続く
+ * 限り、その分を地表に戻す。戻せる分が無い (本当にトンネルの中に交差点が
+ * ある) 配置は敷設規則の側で止める。
+ */
+export function clearStructureAtJunction(
+  alignment: Alignment,
+  field: Heightfield,
+  runs: StructureRun[],
+  range: { s0: number; s1: number },
+  ends: { start: boolean; end: boolean },
+  reach = MIN_STRUCTURE_RUN,
+  step = 1,
+): StructureRun[] {
+  let out = runs;
+  /** 端から内側へ、地表のまま進める距離。 */
+  const groundRun = (from: number, direction: 1 | -1): number => {
+    let distance = 0;
+    for (let d = 0; d <= reach; d += step) {
+      const s = from + direction * d;
+      if (s < range.s0 - 1e-6 || s > range.s1 + 1e-6) break;
+      const p = alignment.sampleAt(s).pos;
+      if (classify(p.y, field.baseHeightAt(p.x, p.z)) !== 'ground') break;
+      distance = d;
+    }
+    return distance;
+  };
+
+  if (ends.start && modeAt(out, range.s0) !== 'ground') {
+    const length = groundRun(range.s0, 1);
+    if (length > 0.5) out = forceRunMode(out, range.s0, range.s0 + length, 'ground');
+  }
+  if (ends.end && modeAt(out, range.s1) !== 'ground') {
+    const length = groundRun(range.s1, -1);
+    if (length > 0.5) out = forceRunMode(out, range.s1 - length, range.s1, 'ground');
+  }
+  return out;
 }
 
 /**

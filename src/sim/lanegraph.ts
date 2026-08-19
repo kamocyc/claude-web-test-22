@@ -175,8 +175,15 @@ export function buildLaneGraph(
 
   for (const seg of network.segments.values()) {
     const cls = network.classOf(seg);
-    const range = ranges.get(seg.id);
-    if (!range || range.s1 - range.s0 < 1) continue;
+    const drawn = ranges.get(seg.id);
+    if (!drawn || drawn.s1 - drawn.s0 < 1) continue;
+    // 行き止まりでは、転回できるぶんだけ車線を手前で終える。舗装の端まで
+    // 車線を延ばすと、転回の弧が路面からはみ出して草の上を回ることになる。
+    const inset = deadEndInset(cls);
+    const room = (drawn.s1 - drawn.s0) * 0.25;
+    const back = (node: NodeId): number =>
+      junctions.get(node)?.kind === 'end' ? Math.min(inset, room) : 0;
+    const range = { s0: drawn.s0 + back(seg.a), s1: drawn.s1 - back(seg.b) };
     const alignment = network.alignmentOf(seg.id);
     for (const lane of lanesOf(cls, seg.id)) {
       const created = add({
@@ -201,19 +208,62 @@ export function buildLaneGraph(
   const laneId = (lane: Lane): number | undefined =>
     bySegment.get(`${lane.segment}:${lane.index}`);
 
-  /** 交差点面の高さを引く関数 (いちばん内側のリング = 車道面)。 */
+  /**
+   * 進路が潜ってはいけない床の高さを引く関数。
+   *
+   * 交差点では面 (いちばん内側のリング = 車道面)、行き止まりでは転回する
+   * 相手の路面そのもの。勾配のある道路の行き止まりでは、転回の弧が
+   * 前へ膨らむぶんだけ路面が上がるので、これがないと車が舗装に潜る。
+   */
   const floors = new Map<NodeId, (x: number, z: number) => number | null>();
   const floorOf = (junction: Junction): ((x: number, z: number) => number | null) => {
     const found = floors.get(junction.node);
     if (found) return found;
     const ring = junction.rings[junction.rings.length - 1] ?? [];
-    const sampler = polygonHeightSampler(ring);
+    const sampler = ring.length >= 3 ? polygonHeightSampler(ring) : deadEndFloor(junction);
     const lifted = (x: number, z: number): number | null => {
       const y = sampler(x, z);
       return y === null ? null : y + SURFACE_LIFT;
     };
     floors.set(junction.node, lifted);
     return lifted;
+  };
+
+  /** 行き止まりの路面 (端から手前 8 m ぶん) を引く関数。 */
+  const deadEndFloor = (junction: Junction): ((x: number, z: number) => number | null) => {
+    const approach = junction.approaches[0];
+    const drawn = approach ? ranges.get(approach.branch.segment) : undefined;
+    if (!approach || !drawn) return () => null;
+    const alignment = network.alignmentOf(approach.branch.segment);
+    const from = approach.branch.atStart ? drawn.s0 : Math.max(drawn.s0, drawn.s1 - 8);
+    const to = approach.branch.atStart ? Math.min(drawn.s1, drawn.s0 + 8) : drawn.s1;
+    const points: { x: number; z: number; y: number; rx: number; rz: number; roll: number }[] = [];
+    for (let s = from; s <= to; s += 0.5) {
+      const sample = alignment.sampleAt(s);
+      const blend = options.surface?.(approach.branch.segment, s, sample.pos.y);
+      points.push({
+        x: sample.pos.x,
+        z: sample.pos.z,
+        y: sample.pos.y + (blend?.dy ?? 0),
+        rx: sample.right.x,
+        rz: sample.right.z,
+        roll: blend?.roll ?? 0,
+      });
+    }
+    return (x: number, z: number): number | null => {
+      let best: (typeof points)[number] | null = null;
+      let bestDistance = 36;
+      for (const p of points) {
+        const d = (p.x - x) ** 2 + (p.z - z) ** 2;
+        if (d < bestDistance) {
+          bestDistance = d;
+          best = p;
+        }
+      }
+      if (!best) return null;
+      const lateral = (x - best.x) * best.rx + (z - best.z) * best.rz;
+      return best.y + lateral * best.roll;
+    };
   };
 
   /** 車線どうしを交差点の中で繋ぐ。 */
@@ -277,8 +327,34 @@ type Connect = (
   stopLine?: number,
 ) => void;
 
-/** 転回で膨らませる制御点の長さ [m]。 */
-const UTURN_HANDLE = 7;
+/**
+ * 転回の制御点の長さ (両端の間隔に対する比)。
+ *
+ * 3 次ベジエで半円を近似する値 (4/3 × 半径 = 2/3 × 直径)。これより
+ * 長くすると弧が前へ膨らみ、行き止まりの舗装から飛び出してしまう。
+ */
+const UTURN_TENSION = 2 / 3;
+
+/**
+ * 行き止まりで転回するために、車線を手前で終える長さ [m]。
+ *
+ * 転回の弧は、内側どうしの車線の間隔を直径とする半円になるので、
+ * 車線の端から半径のぶんだけ前に膨らむ。そのぶんを引いておく。
+ */
+function deadEndInset(cls: NetworkClass): number {
+  if (cls.kind !== 'road' || cls.oneWay || cls.lanes.length < 2) return 0;
+  const span = Math.min(
+    ...cls.lanes
+      .filter((l) => l.direction > 0)
+      .map((l) =>
+        Math.min(
+          ...cls.lanes.filter((o) => o.direction < 0).map((o) => Math.abs(l.offset - o.offset)),
+        ),
+      ),
+  );
+  if (!Number.isFinite(span)) return 0;
+  return span / 2 + 0.6;
+}
 
 /**
  * 行き止まりでの転回。
@@ -299,8 +375,7 @@ function connectDeadEnd(junction: Junction, connect: Connect): void {
     .filter((l) => !isEntry(l, atStart))
     .sort((a, b) => outwardOffset(b, atStart) - outwardOffset(a, atStart))[0];
   if (!entry || !exit) return;
-  const span = Math.max(1, Math.abs(entry.offset - exit.offset));
-  connect(junction, entry, exit, undefined, 4, UTURN_HANDLE / span);
+  connect(junction, entry, exit, undefined, 4, UTURN_TENSION);
 }
 
 /** 道路の交差点。進行方向別通行区分に従って進路を張る。 */

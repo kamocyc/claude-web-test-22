@@ -380,6 +380,7 @@ export class BuildTool {
         alignment,
         start: this.anchor,
         end: this.endAnchor ?? { pos: preview.end },
+        field: this.field,
       }).blockers;
       buildRibbon(mb, alignment.sample(2), profileFor(cls), { skirt: false, cls });
     } else if (this.mode !== 'scissors') {
