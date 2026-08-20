@@ -68,6 +68,14 @@ export interface NetworkClass {
    * 十数 m の緩和区間を入れても意味がないので入れない。
    */
   easement: boolean;
+  /**
+   * 規格最大カント [m] (曲線の外側のレールをどれだけ高くするか)。
+   *
+   * 規格最小半径の曲線でこの値になり、緩やかな曲線では半径に反比例して
+   * 小さくなる。曲率から導くので、緩和曲線の区間でそのまま立ち上がる。
+   * 道路は 0 (片勾配は付けない)。
+   */
+  maxCant: number;
   /** 交差点の隅角部の丸め半径 [m]。 */
   cornerRadius: number;
   /** 設計速度 [km/h]。HUD 表示と規格の目安。 */
@@ -134,6 +142,7 @@ function road(opts: {
     maxGrade: opts.maxGrade,
     minVerticalRadius: opts.minVerticalRadius ?? Infinity,
     easement: false,
+    maxCant: 0,
     cornerRadius: opts.cornerRadius,
     designSpeed: opts.designSpeed,
     signalCapable: opts.signalCapable,
@@ -156,6 +165,7 @@ function rail(opts: {
   maxGrade: number;
   minVerticalRadius?: number;
   easement?: boolean;
+  maxCant?: number;
   designSpeed: number;
   costPerMeter: number;
 }): NetworkClass {
@@ -175,6 +185,7 @@ function rail(opts: {
     maxGrade: opts.maxGrade,
     minVerticalRadius: opts.minVerticalRadius ?? Infinity,
     easement: opts.easement ?? true,
+    maxCant: opts.maxCant ?? 0.1,
     cornerRadius: 0,
     designSpeed: opts.designSpeed,
     signalCapable: false,
@@ -288,6 +299,7 @@ export const NETWORK_CLASSES: NetworkClass[] = [
     minRadius: 50,
     maxGrade: 0.03,
     minVerticalRadius: 250,
+    maxCant: 0.05,
     designSpeed: 40,
     costPerMeter: 90,
   }),

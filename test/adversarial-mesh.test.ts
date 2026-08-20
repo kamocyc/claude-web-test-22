@@ -129,10 +129,15 @@ function blendsOf(scene: Scene): Map<SegmentId, SurfaceBlend[]> {
   return scene.result.blends;
 }
 
-/** 描画に使われるサンプル (踏切のまわりでは道路が上下・傾斜する)。 */
-function drawnSampleAt(scene: Scene, segment: SegmentId, s: number, blends = blendsOf(scene)) {
+/**
+ * 描画に使われるサンプル。
+ * 踏切のまわりでは道路が上下・傾斜し、線路の曲線ではカントが付く。
+ */
+function drawnSampleAt(scene: Scene, segment: SegmentId, s: number) {
   const raw = scene.network.alignmentOf(segment).sampleAt(s);
-  return applySurfaceBlend([raw], blends.get(segment) ?? [])[0];
+  const blended = applySurfaceBlend([raw], blendsOf(scene).get(segment) ?? [])[0];
+  const cant = scene.world.cantAt(segment, s);
+  return cant === 0 ? blended : { ...blended, roll: (blended.roll ?? 0) + cant };
 }
 
 /** セグメント帯の端 (トリム位置) の横断面をワールド展開する。 */
@@ -379,12 +384,11 @@ function seamViolations(scene: Scene, tolerance = 0.01): Violation[] {
 function railBuriedViolations(scene: Scene, tolerance = 0.05): Violation[] {
   const out: Violation[] = [];
   const roads = roadPolylines(scene);
-  const blends = blendsOf(scene);
   for (const seg of scene.network.segments.values()) {
     const cls = scene.network.classOf(seg);
     if (cls.kind !== 'rail') continue;
     for (const s of groundStations(scene, seg.id, 1.5)) {
-      const sample = drawnSampleAt(scene, seg.id, s, blends);
+      const sample = drawnSampleAt(scene, seg.id, s);
       const railTop = sample.pos.y + SURFACE_LIFT;
       for (const offset of cls.tracks) {
         for (const d of [-0.72, 0, 0.72]) {
@@ -418,13 +422,12 @@ function railBuriedViolations(scene: Scene, tolerance = 0.05): Violation[] {
 function ballastBuriedViolations(scene: Scene, tolerance = 0.05): Violation[] {
   const out: Violation[] = [];
   const roads = roadPolylines(scene);
-  const blends = blendsOf(scene);
   for (const seg of scene.network.segments.values()) {
     const cls = scene.network.classOf(seg);
     if (cls.kind !== 'rail') continue;
     const top = Math.max(...cls.tracks.map(Math.abs)) + 1.7;
     for (const s of groundStations(scene, seg.id, 1.5)) {
-      const sample = drawnSampleAt(scene, seg.id, s, blends);
+      const sample = drawnSampleAt(scene, seg.id, s);
       const ballastTop = sample.pos.y - RAIL_TOP_TO_BALLAST + SURFACE_LIFT;
       for (const offset of [-top + 0.2, 0, top - 0.2]) {
         const x = sample.pos.x + sample.right.x * offset;
@@ -452,10 +455,9 @@ function roadBuriedViolations(scene: Scene, tolerance = 0.05): Violation[] {
     const cls = scene.network.classOf(seg);
     if (cls.kind !== 'road') continue;
     const cw = cls.carriagewayHalfWidth;
-    const blends = blendsOf(scene);
     for (const s of groundStations(scene, seg.id, 2)) {
       // 踏切のまわりでは路面が線路に合わせて上下・傾斜する。
-      const sample = drawnSampleAt(scene, seg.id, s, blends);
+      const sample = drawnSampleAt(scene, seg.id, s);
       for (const offset of [-cw + 0.2, 0, cw - 0.2]) {
         const surfaceY = sample.pos.y + SURFACE_LIFT + offset * (sample.roll ?? 0);
         const x = sample.pos.x + sample.right.x * offset;
@@ -650,7 +652,7 @@ function skirtGapViolations(scene: Scene, tolerance = 0.05): Violation[] {
     // 帯の頂点がどの弧長に置かれるかは実装 (サンプル間隔) 次第なので、
     // 細かく歩いて「メッシュの頂点がある所」だけを評価する。
     for (const s of groundStations(scene, seg.id, 0.5)) {
-      const sample = drawnSampleAt(scene, seg.id, s, blends);
+      const sample = drawnSampleAt(scene, seg.id, s);
       // 踏切の上では縁石・歩道の段差が潰れる。描画と同じ係数を掛ける。
       const scale = surfaceHeightScale(blends.get(seg.id) ?? [], s);
       for (const side of [-1, 1]) {
@@ -728,7 +730,7 @@ function harnessDriftViolations(scene: Scene, tolerance = 0.03): Violation[] {
     const cls = scene.network.classOf(seg);
     const edge = profileFor(cls)[0];
     for (const s of groundStations(scene, seg.id, 1)) {
-      const sample = drawnSampleAt(scene, seg.id, s, blends);
+      const sample = drawnSampleAt(scene, seg.id, s);
       // 踏切の上では縁石・歩道の段差が潰れる。描画と同じ係数を掛ける。
       const scale = surfaceHeightScale(blends.get(seg.id) ?? [], s);
       for (const side of [-1, 1]) {
@@ -896,31 +898,26 @@ interface Mouth {
 }
 
 /** 枝のトリム位置における、いちばん内側の面 (車道面・道床天端) の高さ。 */
-function mouthLevel(
-  scene: Scene,
-  ap: Junction['approaches'][number],
-  blends: ReturnType<typeof blendsOf>,
-): number {
+function mouthLevel(scene: Scene, ap: Junction['approaches'][number]): number {
   const profile = profileFor(ap.branch.cls);
   const levels = Math.max(1, profile.length >> 1);
   const range = scene.result.ranges.get(ap.branch.segment)!;
   const s = ap.branch.atStart ? range.s0 : range.s1;
-  const sample = drawnSampleAt(scene, ap.branch.segment, s, blends);
+  const sample = drawnSampleAt(scene, ap.branch.segment, s);
   return sample.pos.y + profile[Math.min(levels - 1, profile.length - 1)].height + SURFACE_LIFT;
 }
 
 function junctionMouths(scene: Scene): Mouth[] {
   const out: Mouth[] = [];
-  const blends = blendsOf(scene);
   for (const [id, junction] of scene.world.junctions) {
     if (junction.rings.length === 0) continue;
     const inner = junction.rings[junction.rings.length - 1];
     if (inner.length < 3) continue;
-    const levels = junction.approaches.map((ap) => mouthLevel(scene, ap, blends));
+    const levels = junction.approaches.map((ap) => mouthLevel(scene, ap));
     for (const ap of junction.approaches) {
       const range = scene.result.ranges.get(ap.branch.segment)!;
       const s = ap.branch.atStart ? range.s0 : range.s1;
-      const sample = drawnSampleAt(scene, ap.branch.segment, s, blends);
+      const sample = drawnSampleAt(scene, ap.branch.segment, s);
       out.push({
         levels,
         origin: sample.pos.clone(),

@@ -223,16 +223,20 @@ export function computeCrossingBlend(
   crossing: Crossing,
   railAlignment: Alignment,
   roadAlignment: Alignment,
+  /** 線路のカント (横断勾配)。踏切では 0 に戻してあるが、念のため見る。 */
+  railRoll = 0,
 ): SurfaceBlend & { segment: SegmentId } {
   const road = crossing.road!;
   const rail = crossing.rail!;
   const railSample = railAlignment.sampleAt(rail.s);
   const roadSample = roadAlignment.sampleAt(road.s);
 
-  // 線路の面の勾配ベクトル (水平 1 m あたりの上がり)。
-  const gradient = new Vector2(railSample.forwardXZ.x, railSample.forwardXZ.y).multiplyScalar(
-    railSample.grade,
-  );
+  // レール頭頂面の勾配ベクトル (水平 1 m あたりの上がり)。縦断勾配だけで
+  // なく**横断勾配 (カント) も足す**。線路方向の傾きしか見ないと、カントが
+  // 付いている所で舗装が片方のレールに潜り、もう片方から浮く。
+  const gradient = new Vector2(railSample.forwardXZ.x, railSample.forwardXZ.y)
+    .multiplyScalar(railSample.grade)
+    .addScaledVector(new Vector2(railSample.right.x, railSample.right.z), railRoll);
   const forward = roadSample.forwardXZ;
   const right = new Vector2(roadSample.right.x, roadSample.right.z);
 

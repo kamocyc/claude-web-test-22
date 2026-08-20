@@ -78,8 +78,14 @@ export function seamViolations(scene: Scene, tolerance = 0.01): Violation[] {
     if (sections.length !== 2) continue;
     const [a, b] = sections;
     if (a.length !== b.length) continue;
+    // 断面の並び順は、2 本の向きが揃っているか逆かで変わる。カントが付くと
+    // 断面は左右対称でなくなるので、どちら向きに突き合わせるかを世界座標で
+    // 決める (添字をそのまま使うと、縁石の段差ぶんずれて見える)。
+    const xz = (p: Vector3, q: Vector3): number => Math.hypot(p.x - q.x, p.z - q.z);
+    const flipped = xz(a[0], b[0]) > xz(a[0], b[b.length - 1]);
     for (let i = 0; i < a.length; i++) {
-      const dy = Math.abs(a[i].y - b[b.length - 1 - i].y);
+      const mate = flipped ? b[b.length - 1 - i] : b[i];
+      const dy = Math.abs(a[i].y - mate.y);
       if (dy > tolerance) push(out, scene, dy, a[i], `帯どうしの段差: node=${id}`);
     }
   }

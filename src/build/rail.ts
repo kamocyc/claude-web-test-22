@@ -69,11 +69,13 @@ function buildRail(mb: MeshBuilder, samples: AlignmentSample[], offset: number):
 
   for (const sample of samples) {
     const row: number[] = [];
+    // カント (横断勾配) が付いていれば、レールもそのぶん上下する。
+    const roll = sample.roll ?? 0;
     for (let k = 0; k < section.length; k++) {
       const [o, h, color] = section[k];
       p.set(
         sample.pos.x + sample.right.x * (offset + o),
-        sample.pos.y + h + SURFACE_LIFT,
+        sample.pos.y + h + SURFACE_LIFT + (offset + o) * roll,
         sample.pos.z + sample.right.z * (offset + o),
       );
       // 上 2 点は上向き、下 2 点は外向きの法線にしておくと陰影が出る。
@@ -101,17 +103,25 @@ function buildSleepers(mb: MeshBuilder, samples: AlignmentSample[], trackOffsets
     const s = samples[0].s + i * SLEEPER_PITCH;
     const sample = interpolateSample(samples, s);
     if (!sample) continue;
+    // カントが付いていれば、まくらぎも軌道面と一緒に傾く。
+    const roll = sample.roll ?? 0;
+    const tilted =
+      roll === 0
+        ? sample.right
+        : new Vector3(sample.right.x, roll, sample.right.z).normalize();
+    const normal =
+      roll === 0 ? up : new Vector3().crossVectors(sample.forward, tilted).normalize().negate();
     for (const offset of trackOffsets) {
       center.set(
         sample.pos.x + sample.right.x * offset,
-        sample.pos.y + SLEEPER_TOP - SLEEPER_HALF_THICK + SURFACE_LIFT,
+        sample.pos.y + SLEEPER_TOP - SLEEPER_HALF_THICK + SURFACE_LIFT + offset * roll,
         sample.pos.z + sample.right.z * offset,
       );
       addBox(
         mb,
         center,
-        sample.right,
-        up,
+        tilted,
+        normal,
         sample.forward,
         { x: SLEEPER_HALF_LENGTH, y: SLEEPER_HALF_THICK, z: SLEEPER_HALF_WIDTH },
         SLEEPER_COLOR,
@@ -147,6 +157,7 @@ export function interpolateSample(
     right: a.right.clone().lerp(b.right, t).normalize(),
     curvature: a.curvature + (b.curvature - a.curvature) * t,
     grade: a.grade + (b.grade - a.grade) * t,
+    roll: (a.roll ?? 0) + ((b.roll ?? 0) - (a.roll ?? 0)) * t,
   };
 }
 

@@ -211,7 +211,10 @@ export function expectAllClean(
 /** 描画に使われるサンプル (踏切のまわりでは道路が上下・傾斜する)。 */
 export function drawnSampleAt(scene: Scene, segment: SegmentId, s: number) {
   const raw = scene.network.alignmentOf(segment).sampleAt(s);
-  return applySurfaceBlend([raw], scene.result.blends.get(segment) ?? [])[0];
+  const blended = applySurfaceBlend([raw], scene.result.blends.get(segment) ?? [])[0];
+  // 線路のカントも描画に効いている。
+  const cant = scene.world.cantAt(segment, s);
+  return cant === 0 ? blended : { ...blended, roll: (blended.roll ?? 0) + cant };
 }
 
 /**

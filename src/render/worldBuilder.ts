@@ -1,5 +1,5 @@
 import { Group, Mesh, Vector3, type Vector2 } from 'three';
-import type { Alignment } from '../core/alignment';
+import type { Alignment, AlignmentSample } from '../core/alignment';
 import { MeshBuilder, signedAreaXZ } from '../core/meshbuilder';
 import { perp } from '../core/curve';
 import { DECK_THICKNESS, PROP_MAX_RISE, TERRAIN_CELL, lerp, smoothstep } from '../core/units';
@@ -25,6 +25,7 @@ import {
   type SurfacePath,
 } from '../build/markings';
 import { buildCatenary, buildTrack, buildTrackConnection } from '../build/rail';
+import { computeCant, type CantProfile } from '../build/cant';
 import {
   buildPowerLine,
   planUtilityPoles,
@@ -226,6 +227,7 @@ export class WorldBuilder {
   private occupancy!: Occupancy;
   /** 直近の rebuild で使った、踏切に合わせた高さ補正。 */
   private blends = new Map<SegmentId, SurfaceBlend[]>();
+  private cant = new Map<SegmentId, CantProfile>();
 
   /**
    * 面の塗り方。`connectivity` にすると、行き来できる系統ごとに色を変える。
@@ -282,18 +284,29 @@ export class WorldBuilder {
     const crossings = findCrossings(network);
     this.crossings = crossings;
 
+    // 線路のカント。曲率から導くので、緩和曲線でそのまま立ち上がる。
+    // 交差点の面と踏切の手前では 0 に戻る (面がねじれないように)。
+    // 踏切の目標面がカントを見るので、踏切の補正より先に用意する。
+    this.cant = computeCant(network, crossings);
+
     // 踏切に合わせた道路側の高さ補正をセグメントごとにまとめる。
     // 交差点の断面もこの高さで作る必要があるので、交差点を解く前に用意する。
     const blends = this.collectCrossingBlends(crossings);
     this.blends = blends;
-    const blendAt = (segment: SegmentId, s: number) => ({
-      ...surfaceBlendAt(
+    // 帯・交差点の取り付き断面・標示・当たり判定が、みな同じ点を通るように
+    // 「描画に使う高さの補正」をここ 1 か所から配る。
+    const blendAt = (segment: SegmentId, s: number) => {
+      const blend = surfaceBlendAt(
         blends.get(segment) ?? [],
         s,
         network.alignmentOf(segment).sampleAt(s).pos.y,
-      ),
-      heightScale: surfaceHeightScale(blends.get(segment) ?? [], s),
-    });
+      );
+      return {
+        dy: blend.dy,
+        roll: blend.roll + this.cantAt(segment, s),
+        heightScale: surfaceHeightScale(blends.get(segment) ?? [], s),
+      };
+    };
 
     const { junctions, trims } = solveJunctions(network, blendAt);
     this.junctions = junctions;
@@ -762,6 +775,7 @@ export class WorldBuilder {
         crossing,
         network.alignmentOf(crossing.rail.segment),
         network.alignmentOf(crossing.road.segment),
+        this.cantAt(crossing.rail.segment, crossing.rail.s),
       );
       add(blend.segment, blend);
 
@@ -803,6 +817,24 @@ export class WorldBuilder {
     }
     for (const { segment, blend } of spills) add(segment, blend);
     return blends;
+  }
+
+  /** サンプル列にカントを乗せる (踏切の補正の上に重ねる)。 */
+  private withCant(samples: AlignmentSample[], segment: SegmentId): AlignmentSample[] {
+    const profile = this.cant.get(segment);
+    if (!profile) return samples;
+    return samples.map((sample) => {
+      const roll = profile(sample.s);
+      return roll === 0 ? sample : { ...sample, roll: (sample.roll ?? 0) + roll };
+    });
+  }
+
+  /**
+   * その弧長で描画に使ったカント (横断勾配)。線路以外・交差点の面の中では 0。
+   * 検査コードが「実際に描かれた面」を再現するのにも使う。
+   */
+  cantAt(segment: SegmentId, s: number): number {
+    return this.cant.get(segment)?.(s) ?? 0;
   }
 
   /** 描画に使った高さ (踏切の補正込み) で線形をたどる経路。標示用。 */
@@ -1064,7 +1096,7 @@ export class WorldBuilder {
     for (const run of runs) {
       const raw = alignmentSamplesInRange(alignment, run.s0, run.s1, 2.5);
       if (raw.length < 2) continue;
-      const samples = applySurfaceBlend(raw, blends);
+      const samples = this.withCant(applySurfaceBlend(raw, blends), segment);
 
       buildRibbon(surface, samples, profile, {
         skirt: run.mode === 'ground',
@@ -1105,7 +1137,10 @@ export class WorldBuilder {
       const first = runs[0];
       const last = runs[runs.length - 1];
       if (first && last) {
-        const samples = alignmentSamplesInRange(alignment, first.s0, last.s1, 1.5);
+        const samples = this.withCant(
+          alignmentSamplesInRange(alignment, first.s0, last.s1, 1.5),
+          segment,
+        );
         buildTrack(structure, samples, cls.tracks.length ? cls.tracks : [0]);
       }
     }
