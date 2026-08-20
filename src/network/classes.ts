@@ -60,6 +60,14 @@ export interface NetworkClass {
    * 標準の縦断 (終点勾配 = 平均勾配) では `|Δ勾配| ≤ L / (4·この値)`。
    */
   minVerticalRadius: number;
+  /**
+   * 緩和曲線 (クロソイド) を入れるか。
+   *
+   * 線路だけ有効。直線からいきなり円曲線に入らず、曲率を弧長に比例して
+   * 立ち上げる区間を挟む。道路は最小半径が 12〜45 m と小さく、30 m の区間に
+   * 十数 m の緩和区間を入れても意味がないので入れない。
+   */
+  easement: boolean;
   /** 交差点の隅角部の丸め半径 [m]。 */
   cornerRadius: number;
   /** 設計速度 [km/h]。HUD 表示と規格の目安。 */
@@ -125,6 +133,7 @@ function road(opts: {
     minRadius: opts.minRadius,
     maxGrade: opts.maxGrade,
     minVerticalRadius: opts.minVerticalRadius ?? Infinity,
+    easement: false,
     cornerRadius: opts.cornerRadius,
     designSpeed: opts.designSpeed,
     signalCapable: opts.signalCapable,
@@ -146,6 +155,7 @@ function rail(opts: {
   minRadius: number;
   maxGrade: number;
   minVerticalRadius?: number;
+  easement?: boolean;
   designSpeed: number;
   costPerMeter: number;
 }): NetworkClass {
@@ -164,6 +174,7 @@ function rail(opts: {
     minRadius: opts.minRadius,
     maxGrade: opts.maxGrade,
     minVerticalRadius: opts.minVerticalRadius ?? Infinity,
+    easement: opts.easement ?? true,
     cornerRadius: 0,
     designSpeed: opts.designSpeed,
     signalCapable: false,

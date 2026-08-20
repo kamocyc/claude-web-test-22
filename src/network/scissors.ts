@@ -224,6 +224,7 @@ function connection(
     radius: horizontal.extremeCurvature(64).minRadius,
     grade: alignment.vertical.maxGrade(32),
     endTangent: horizontal.tangentAt(horizontal.length),
+    endCurvature: horizontal.curvatureAt(horizontal.length),
   };
   return { start, end, alignment, preview };
 }

@@ -140,6 +140,7 @@ export function previewFromAlignment(alignment: Alignment): PlacementPreview {
     radius: horizontal.extremeCurvature(48).minRadius,
     grade: alignment.vertical.maxGrade(32),
     endTangent: horizontal.tangentAt(length),
+    endCurvature: horizontal.curvatureAt(length),
   };
 }
 

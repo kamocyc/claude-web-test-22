@@ -114,7 +114,9 @@ export function buildDemoNetwork(network: Network, field: Heightfield): void {
   }
 
   // 線路を跨ぐ道路。桁下を確保しているので立体交差になる。
-  const overpassZ = 250;
+  // 側線の終端 (z = branchNode.z + 180 ≒ 245) から離しておく。9 m の
+  // 盛土の裾がかかると、側線の道床が盛土に埋まる。
+  const overpassZ = 270;
   const railUnder = network.findSegmentNear(new Vector3(railX, 0, overpassZ), 30);
   const overpassY = (railUnder ? railUnder.pos.y : railY) + 9;
   draw(

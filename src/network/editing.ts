@@ -6,6 +6,7 @@ import {
   reversedCurve,
   type XZ,
 } from '../core/curve';
+import { easementFromTangent } from '../core/easement';
 import { VerticalProfile } from '../core/profile';
 import { DEG, clamp } from '../core/units';
 import type { NetworkClass } from './classes';
@@ -28,6 +29,11 @@ export interface Anchor {
   bidirectional?: boolean;
   /** 接続先から引き継ぐ縦断勾配。 */
   grade?: number;
+  /**
+   * 接続先から引き継ぐ曲率 [1/m] (`tangent` の向きに進んだときの値)。
+   * これを繋いでいくと、緩和曲線で曲率が連続する線形になる。
+   */
+  curvature?: number;
 }
 
 /** 建設プレビューの計算結果。 */
@@ -40,6 +46,8 @@ export interface PlacementPreview {
   radius: number;
   grade: number;
   endTangent: Vector2;
+  /** 終端の曲率 [1/m] (`endTangent` の向き)。次の区間へ引き継ぐ。 */
+  endCurvature: number;
 }
 
 /**
@@ -81,6 +89,15 @@ export function computePlacement(
   let endTangent: Vector2;
   let radius = Infinity;
 
+  // 緩和曲線を使う種別 (線路) では、曲率が跳ばないよう接続元の曲率も
+  // 引き継ぐ。`straight` は接線も曲率も無視して素直に直線を引く。
+  const cls = options.cls;
+  const easing = !options.straight && (cls?.easement ?? false);
+  const easementOptions = {
+    minRadius: cls?.minRadius ?? 1,
+    designSpeed: cls?.designSpeed ?? 60,
+  };
+
   if (options.straight || (!startDirection && !endDirection)) {
     horizontal = HorizontalCurve.straight(a, b);
     endTangent = b.clone().sub(a);
@@ -91,17 +108,37 @@ export function computePlacement(
     endTangent = horizontal.tangentAt(horizontal.length);
     radius = horizontal.extremeCurvature(48).minRadius;
   } else if (startDirection) {
-    const arc = arcFromTangent(a, startDirection, b);
-    horizontal = arc.curve;
-    endTangent = arc.endTangent;
-    radius = arc.radius;
+    if (easing) {
+      const eased = easementFromTangent(a, startDirection, b, {
+        ...easementOptions,
+        startCurvature: (anchor.curvature ?? 0) * startSign,
+      });
+      horizontal = eased.curve;
+      endTangent = eased.endTangent as Vector2;
+      radius = horizontal.extremeCurvature(48).minRadius;
+    } else {
+      const arc = arcFromTangent(a, startDirection, b);
+      horizontal = arc.curve;
+      endTangent = arc.endTangent;
+      radius = arc.radius;
+    }
   } else {
-    // 終点から逆向きに円弧を解いて反転すれば、始点が自由でも終点では
-    // 既存線形へ接する。端点へ繋ぐ場合も確定後に形が変わらない。
-    const arc = arcFromTangent(b, endOutward!, a);
-    horizontal = reversedCurve(arc.curve);
+    // 終点から逆向きに解いて反転すれば、始点が自由でも終点では既存線形へ
+    // 接する。端点へ繋ぐ場合も確定後に形が変わらない。
+    if (easing) {
+      // 終点から外向きに辿るので、引き継ぐ曲率も外向きの符号にする。
+      const eased = easementFromTangent(b, endOutward!, a, {
+        ...easementOptions,
+        startCurvature: (destination.curvature ?? 0) * endSign,
+      });
+      horizontal = reversedCurve(eased.curve);
+      radius = horizontal.extremeCurvature(48).minRadius;
+    } else {
+      const arc = arcFromTangent(b, endOutward!, a);
+      horizontal = reversedCurve(arc.curve);
+      radius = arc.radius;
+    }
     endTangent = horizontal.tangentAt(horizontal.length);
-    radius = arc.radius;
   }
 
   const length = Math.max(horizontal.length, 1e-3);
@@ -129,6 +166,7 @@ export function computePlacement(
     radius,
     grade: profileMaxGrade(startGrade, endGrade, average, length),
     endTangent,
+    endCurvature: horizontal.curvatureAt(horizontal.length),
   };
 }
 
@@ -453,9 +491,13 @@ export function anchorFromNode(network: Network, node: NetNode, cls: NetworkClas
   if (branches.length === 0) return anchor;
 
   const same = branches.find((b) => b.cls.kind === cls.kind) ?? branches[0];
+  // 勾配は枝が何本あっても引き継ぐ (繋ぎ目に段差ができないように)。
+  anchor.grade = -same.grade;
   if (branches.length === 1) {
     anchor.tangent = same.dir.clone().negate();
-    anchor.grade = -same.grade;
+    // 接線を引き継ぐときだけ、曲率も引き継ぐ (向きが自由な分岐では、
+    // 曲率だけ引き継いでも意味が無い)。
+    anchor.curvature = -same.curvature;
   }
   return anchor;
 }
@@ -475,6 +517,7 @@ export function anchorFromSegment(network: Network, segment: SegmentId, s: numbe
     split: { segment, s },
     tangent: sample.forwardXZ.clone(),
     grade: sample.grade,
+    curvature: sample.curvature,
     bidirectional: true,
   };
 }

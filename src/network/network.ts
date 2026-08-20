@@ -57,6 +57,8 @@ export interface Branch {
   cls: NetworkClass;
   /** ノードから外向きに測った縦断勾配。 */
   grade: number;
+  /** ノードから外向きに測った曲率 [1/m] (右カーブが正)。 */
+  curvature: number;
 }
 
 /**
@@ -226,12 +228,17 @@ export class Network {
       const t = atStart ? al.horizontal.tangentAt(0) : al.horizontal.tangentAt(al.length);
       const dir = atStart ? t.clone() : t.clone().negate();
       const grade = atStart ? seg.gradeA : -seg.gradeB;
+      // 外向きに辿ると弧長の向きが逆になるので、曲率の符号も反転する。
+      const curvature = atStart
+        ? al.horizontal.curvatureAt(0)
+        : -al.horizontal.curvatureAt(al.length);
       out.push({
         segment: segId,
         atStart,
         dir,
         angle: Math.atan2(dir.y, dir.x),
         cls: this.classOf(seg),
+        curvature,
         grade,
       });
     }

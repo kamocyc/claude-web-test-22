@@ -73,6 +73,7 @@ export function draw(
       node: endNode.id,
       tangent: preview.endTangent.clone(),
       grade: preview.endGrade,
+      curvature: preview.endCurvature,
     };
   }
   return results;
@@ -158,6 +159,7 @@ export function drawParallel(
       pos: preview.end.clone(),
       tangent: preview.endTangent.clone(),
       grade: preview.endGrade,
+      curvature: preview.endCurvature,
     };
   }
   return spans;
@@ -186,6 +188,7 @@ function placeTracks(
       horizontal,
       end: endPos,
       endTangent: horizontal.tangentAt(horizontal.length),
+      endCurvature: horizontal.curvatureAt(horizontal.length),
     });
     // 逆向きの線は、敷いてから向きだけ入れ替える (形は変わらない)。
     if (track.reversed) network.reverseSegment(result.segment);
