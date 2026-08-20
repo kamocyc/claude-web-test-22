@@ -2,6 +2,9 @@ import type { Alignment } from '../core/alignment';
 import { clamp } from '../core/units';
 import type { NetworkClass } from './classes';
 
+/** 縦曲線を見はじめる区間長 [m]。 */
+const MIN_VERTICAL_SPAN = 5;
+
 export interface SegmentDiagnostics {
   length: number;
   /** 区間内の最小曲線半径 [m]。 */
@@ -23,7 +26,10 @@ export interface SegmentDiagnostics {
 export function evaluateAlignment(alignment: Alignment, cls: NetworkClass): SegmentDiagnostics {
   const { minRadius } = alignment.horizontal.extremeCurvature(48);
   const maxGrade = alignment.vertical.maxGrade(32);
-  const minVerticalRadius = alignment.vertical.minVerticalRadius();
+  // 極端に短い区間で縦曲線を論じても意味がない (1 クリックした直後の
+  // プレビューは長さ 0 で、端点勾配だけが残るため半径が 0 と出てしまう)。
+  const minVerticalRadius =
+    alignment.length < MIN_VERTICAL_SPAN ? Infinity : alignment.vertical.minVerticalRadius();
   const radiusRisk = minRadius > 1e6 ? 0 : cls.minRadius / Math.max(minRadius, 1e-3);
   const gradeRisk = maxGrade / cls.maxGrade;
   const verticalRisk =
