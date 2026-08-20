@@ -1,5 +1,11 @@
 import { Vector2, Vector3 } from 'three';
-import { HorizontalCurve, arcFromTangent, curveFromTangents, type XZ } from '../core/curve';
+import {
+  HorizontalCurve,
+  arcFromTangent,
+  curveFromTangents,
+  reversedCurve,
+  type XZ,
+} from '../core/curve';
 import { DEG, clamp } from '../core/units';
 import type { NetworkClass } from './classes';
 import type { Network, NetNode, NodeId, SegmentId } from './network';
@@ -92,7 +98,7 @@ export function computePlacement(
     // 終点から逆向きに円弧を解いて反転すれば、始点が自由でも終点では
     // 既存線形へ接する。端点へ繋ぐ場合も確定後に形が変わらない。
     const arc = arcFromTangent(b, endOutward!, a);
-    horizontal = new HorizontalCurve(arc.curve.p1, arc.curve.c1, arc.curve.c0, arc.curve.p0);
+    horizontal = reversedCurve(arc.curve);
     endTangent = horizontal.tangentAt(horizontal.length);
     radius = arc.radius;
   }
@@ -206,6 +212,9 @@ export function smoothJoint(network: Network, node: NodeId): boolean {
   if (branches.length !== 2) return false;
   const [b0, b1] = branches;
   if (b0.cls.kind !== b1.cls.kind) return false;
+  // 緩和曲線を含む線形は端の制御点だけを振ると中の曲率が壊れるので触らない
+  // (曲率は敷設時に接続元から引き継いでいるので、そもそも折れていない)。
+  if (branches.some((b) => (network.getSegment(b.segment).via?.length ?? 0) > 0)) return false;
 
   const deflection = Math.PI - Math.acos(clamp(b0.dir.dot(b1.dir), -1, 1));
   if (deflection < MIN_SMOOTHED_DEFLECTION || deflection > MAX_SMOOTHED_DEFLECTION) return false;
@@ -291,6 +300,7 @@ export function placeSegment(
     b: endNode.id,
     ctrlA: preview.horizontal.c0,
     ctrlB: preview.horizontal.c1,
+    via: preview.horizontal.via,
     gradeA: preview.startGrade,
     gradeB: preview.endGrade,
   });

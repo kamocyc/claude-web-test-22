@@ -32,6 +32,13 @@ export interface NetSegment {
   ctrlA: Vector2;
   /** b 側のベジエ制御点 (ワールド XZ)。 */
   ctrlB: Vector2;
+  /**
+   * `ctrlA` と `ctrlB` の間に入る制御点・節点 (ワールド XZ)。
+   *
+   * 緩和曲線のように 1 本の 3 次ベジエでは表せない線形は、連結ベジエに
+   * なる。その中間の点をここに持つ。普通の線形では空 (省略)。
+   */
+  via?: Vector2[];
   /** a 端の縦断勾配 dy/ds。 */
   gradeA: number;
   /** b 端の縦断勾配 dy/ds。 */
@@ -100,6 +107,7 @@ export class Network {
     b: NodeId;
     ctrlA: Vector2;
     ctrlB: Vector2;
+    via?: Vector2[];
     gradeA: number;
     gradeB: number;
   }): NetSegment {
@@ -113,6 +121,7 @@ export class Network {
       gradeA: params.gradeA,
       gradeB: params.gradeB,
     };
+    if (params.via && params.via.length > 0) seg.via = params.via.map((p) => p.clone());
     this.segments.set(seg.id, seg);
     this.getNode(seg.a).segments.push(seg.id);
     this.getNode(seg.b).segments.push(seg.id);
@@ -126,11 +135,12 @@ export class Network {
    */
   updateSegment(
     id: SegmentId,
-    patch: Partial<Pick<NetSegment, 'ctrlA' | 'ctrlB' | 'gradeA' | 'gradeB'>>,
+    patch: Partial<Pick<NetSegment, 'ctrlA' | 'ctrlB' | 'via' | 'gradeA' | 'gradeB'>>,
   ): void {
     const seg = this.getSegment(id);
     if (patch.ctrlA) seg.ctrlA = patch.ctrlA.clone();
     if (patch.ctrlB) seg.ctrlB = patch.ctrlB.clone();
+    if (patch.via) seg.via = patch.via.length > 0 ? patch.via.map((p) => p.clone()) : undefined;
     if (patch.gradeA !== undefined) seg.gradeA = patch.gradeA;
     if (patch.gradeB !== undefined) seg.gradeB = patch.gradeB;
     this.touch();
@@ -149,6 +159,7 @@ export class Network {
     const ctrlA = seg.ctrlA;
     seg.ctrlA = seg.ctrlB;
     seg.ctrlB = ctrlA;
+    if (seg.via) seg.via = [...seg.via].reverse();
     // 弧長の向きが逆になるので、端点の勾配は入れ替えたうえで符号を反転する。
     const gradeA = seg.gradeA;
     seg.gradeA = -seg.gradeB;
@@ -188,12 +199,13 @@ export class Network {
     const seg = this.getSegment(id);
     const a = this.getNode(seg.a);
     const b = this.getNode(seg.b);
-    const h = new HorizontalCurve(
+    const h = new HorizontalCurve([
       new Vector2(a.pos.x, a.pos.z),
       seg.ctrlA,
+      ...(seg.via ?? []),
       seg.ctrlB,
       new Vector2(b.pos.x, b.pos.z),
-    );
+    ]);
     const v = new VerticalProfile(a.pos.y, b.pos.y, seg.gradeA, seg.gradeB, h.length);
     const al = new Alignment(h, v);
     this.alignmentCache.set(id, al);
@@ -256,6 +268,7 @@ export class Network {
       b: node.id,
       ctrlA: first.horizontal.c0,
       ctrlB: first.horizontal.c1,
+      via: first.horizontal.via,
       gradeA: first.vertical.m0,
       gradeB: first.vertical.m1,
     });
@@ -265,6 +278,7 @@ export class Network {
       b: keepB.id,
       ctrlA: second.horizontal.c0,
       ctrlB: second.horizontal.c1,
+      via: second.horizontal.via,
       gradeA: second.vertical.m0,
       gradeB: second.vertical.m1,
     });
@@ -385,6 +399,15 @@ export class Network {
       if (!seg) continue;
       if (seg.a === id) seg.ctrlA.add(delta);
       if (seg.b === id) seg.ctrlB.add(delta);
+      // 中間の点は両端からの距離に応じて動かす。片端だけを動かしたときに
+      // 緩和曲線が引き伸ばされるだけで済み、途中で折れない。
+      if (seg.via) {
+        const n = seg.via.length + 1;
+        seg.via.forEach((p, i) => {
+          const w = seg.a === id ? 1 - (i + 1) / n : (i + 1) / n;
+          p.addScaledVector(delta, w);
+        });
+      }
     }
     this.touch();
   }

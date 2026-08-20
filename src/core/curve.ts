@@ -51,39 +51,85 @@ export function bezierSecondDerivative(p0: XZ, c0: XZ, c1: XZ, p1: XZ, t: number
   );
 }
 
-const LUT_SEGMENTS = 128;
+/** 弧長テーブルの刻み数 (ピース 1 つあたり)。 */
+const LUT_PER_PIECE = 128;
 
 /**
- * XZ 平面上の 3 次ベジエ曲線。弧長パラメータ (s) で評価できるように
+ * XZ 平面上の連結 3 次ベジエ曲線。弧長パラメータ (s) で評価できるように
  * 生成時に弧長テーブルを作る。
+ *
+ * 制御点は `points` に `3n+1` 個並べる (n = ピース数)。ピース `i` の制御点は
+ * `points[3i] … points[3i+3]` で、隣り合うピースは節点を共有する。緩和曲線
+ * (クロソイド) のように 1 本の 3 次ベジエでは表せない線形を、セグメントを
+ * 分けずに 1 本の線形として扱うためにこの形にしている。
+ *
+ * ほとんどの線形はピース 1 つ (ただの 3 次ベジエ) なので、4 点を渡す
+ * 従来どおりの作り方も残してある。
  */
 export class HorizontalCurve {
-  readonly p0: XZ;
-  readonly c0: XZ;
-  readonly c1: XZ;
-  readonly p1: XZ;
-  /** 弧長テーブル。`arc[i]` は `t = i / LUT_SEGMENTS` までの弧長。 */
+  /** 制御点列 (長さ `3n+1`)。 */
+  readonly points: readonly XZ[];
+  /**
+   * 弧長テーブル。`arc[i]` は媒介変数 `T = i / LUT_PER_PIECE` までの弧長。
+   * `T` はピース番号を整数部に持つ通し媒介変数 (0 … ピース数)。
+   */
   private readonly arc: Float64Array;
   readonly length: number;
 
-  constructor(p0: XZ, c0: XZ, c1: XZ, p1: XZ) {
-    this.p0 = p0.clone();
-    this.c0 = c0.clone();
-    this.c1 = c1.clone();
-    this.p1 = p1.clone();
+  constructor(p0: XZ, c0: XZ, c1: XZ, p1: XZ);
+  constructor(points: readonly XZ[]);
+  constructor(a: XZ | readonly XZ[], c0?: XZ, c1?: XZ, p1?: XZ) {
+    const src = Array.isArray(a) ? (a as readonly XZ[]) : [a as XZ, c0!, c1!, p1!];
+    if (src.length < 4 || (src.length - 1) % 3 !== 0) {
+      throw new Error(`HorizontalCurve: 制御点は 3n+1 個必要 (${src.length} 個)`);
+    }
+    this.points = src.map((p) => p.clone());
 
-    const arc = new Float64Array(LUT_SEGMENTS + 1);
-    const prev = new Vector2().copy(p0);
+    const pieces = (src.length - 1) / 3;
+    const steps = pieces * LUT_PER_PIECE;
+    const arc = new Float64Array(steps + 1);
+    const prev = new Vector2().copy(this.points[0]);
     const cur = new Vector2();
     let total = 0;
-    for (let i = 1; i <= LUT_SEGMENTS; i++) {
-      bezierPoint(p0, c0, c1, p1, i / LUT_SEGMENTS, cur);
+    for (let i = 1; i <= steps; i++) {
+      this.pointAtT((i / steps) * pieces, cur);
       total += cur.distanceTo(prev);
       arc[i] = total;
       prev.copy(cur);
     }
     this.arc = arc;
     this.length = total;
+  }
+
+  /** ピース数。 */
+  get pieceCount(): number {
+    return (this.points.length - 1) / 3;
+  }
+
+  get p0(): XZ {
+    return this.points[0];
+  }
+
+  /** 始点側の端の制御点。 */
+  get c0(): XZ {
+    return this.points[1];
+  }
+
+  /** 終点側の端の制御点。 */
+  get c1(): XZ {
+    return this.points[this.points.length - 2];
+  }
+
+  get p1(): XZ {
+    return this.points[this.points.length - 1];
+  }
+
+  /**
+   * `c0` と `c1` の間にある点 (節点と中間の制御点)。ピース 1 つなら空。
+   * `NetSegment.via` に入れて保存する形そのもの。
+   */
+  get via(): XZ[] {
+    return this.points.slice(2, this.points.length - 2).map((p) => p.clone());
   }
 
   /** 直線区間として 2 点から生成する。 */
@@ -93,12 +139,16 @@ export class HorizontalCurve {
     return new HorizontalCurve(a, c0, c1, b);
   }
 
-  /** 弧長 s [m] に対応するベジエ媒介変数 t を返す。 */
+  /**
+   * 弧長 s [m] に対応する媒介変数 t (0…1) を返す。
+   * ピース内の媒介変数ではなく、曲線全体を 0…1 で見た値。
+   */
   tAtDistance(s: number): number {
     const target = clamp(s, 0, this.length);
     const arc = this.arc;
+    const steps = arc.length - 1;
     let lo = 0;
-    let hi = LUT_SEGMENTS;
+    let hi = steps;
     while (lo + 1 < hi) {
       const mid = (lo + hi) >> 1;
       if (arc[mid] <= target) lo = mid;
@@ -106,21 +156,36 @@ export class HorizontalCurve {
     }
     const span = arc[hi] - arc[lo];
     const frac = span > 1e-9 ? (target - arc[lo]) / span : 0;
-    return (lo + frac) / LUT_SEGMENTS;
+    return (lo + frac) / steps;
+  }
+
+  /** 通し媒介変数 `T` (0 … ピース数) をピース番号とピース内の t に分ける。 */
+  private locate(T: number): { i: number; t: number } {
+    const n = this.pieceCount;
+    let i = Math.floor(T);
+    if (i >= n) i = n - 1;
+    if (i < 0) i = 0;
+    return { i, t: clamp(T - i, 0, 1) };
   }
 
   pointAt(s: number, out = new Vector2()): XZ {
-    return bezierPoint(this.p0, this.c0, this.c1, this.p1, this.tAtDistance(s), out);
+    return this.pointAtT(this.tAtDistance(s) * this.pieceCount, out);
   }
 
-  pointAtT(t: number, out = new Vector2()): XZ {
-    return bezierPoint(this.p0, this.c0, this.c1, this.p1, t, out);
+  /** 通し媒介変数 `T` (0 … ピース数) で評価する。 */
+  pointAtT(T: number, out = new Vector2()): XZ {
+    const { i, t } = this.locate(T);
+    const k = i * 3;
+    const p = this.points;
+    return bezierPoint(p[k], p[k + 1], p[k + 2], p[k + 3], t, out);
   }
 
   /** 弧長 s における単位接線ベクトル。 */
   tangentAt(s: number, out = new Vector2()): XZ {
-    const t = this.tAtDistance(s);
-    bezierDerivative(this.p0, this.c0, this.c1, this.p1, t, out);
+    const { i, t } = this.locate(this.tAtDistance(s) * this.pieceCount);
+    const k = i * 3;
+    const p = this.points;
+    bezierDerivative(p[k], p[k + 1], p[k + 2], p[k + 3], t, out);
     const len = out.length();
     if (len < 1e-9) {
       // 制御点が退化している場合は端点同士の方向で代用する。
@@ -136,21 +201,42 @@ export class HorizontalCurve {
    * 符号は曲率中心のある側で、`perp` (進行方向の右手) 側なら正 = 右カーブ。
    */
   curvatureAt(s: number): number {
-    const t = this.tAtDistance(s);
-    const d = bezierDerivative(this.p0, this.c0, this.c1, this.p1, t, _d1);
-    const dd = bezierSecondDerivative(this.p0, this.c0, this.c1, this.p1, t, _d2);
+    const { i, t } = this.locate(this.tAtDistance(s) * this.pieceCount);
+    return this.curvatureAtPiece(i, t);
+  }
+
+  /** ピース `i` の媒介変数 `t` における曲率。ピース境界の片側を見るのに使う。 */
+  private curvatureAtPiece(i: number, t: number): number {
+    const k = i * 3;
+    const p = this.points;
+    const d = bezierDerivative(p[k], p[k + 1], p[k + 2], p[k + 3], t, _d1);
+    const dd = bezierSecondDerivative(p[k], p[k + 1], p[k + 2], p[k + 3], t, _d2);
     const cross = d.x * dd.y - d.y * dd.x;
     const speed = d.length();
     if (speed < 1e-6) return 0;
     return cross / (speed * speed * speed);
   }
 
-  /** 曲率の最大絶対値と、それに対応する最小曲率半径。 */
+  /**
+   * 曲率の最大絶対値と、それに対応する最小曲率半径。
+   *
+   * 弧長で等間隔に見るほか、**ピースの境目を両側から**必ず見る。連結ベジエ
+   * では曲率のピークが境目に来るので、等間隔のサンプルだけだと見落とす。
+   */
   extremeCurvature(samples = 32): { maxCurvature: number; minRadius: number } {
     let maxK = 0;
     for (let i = 0; i <= samples; i++) {
       const k = Math.abs(this.curvatureAt((i / samples) * this.length));
       if (k > maxK) maxK = k;
+    }
+    const n = this.pieceCount;
+    if (n > 1) {
+      for (let i = 0; i < n; i++) {
+        const a = Math.abs(this.curvatureAtPiece(i, 0));
+        const b = Math.abs(this.curvatureAtPiece(i, 1));
+        if (a > maxK) maxK = a;
+        if (b > maxK) maxK = b;
+      }
     }
     return { maxCurvature: maxK, minRadius: maxK < 1e-6 ? Infinity : 1 / maxK };
   }
@@ -245,4 +331,9 @@ export function curveFromTangents(a: XZ, ta: XZ, b: XZ, tb: XZ, tension = 1 / 3)
   const c0 = a.clone().addScaledVector(ta.clone().normalize(), handle);
   const c1 = b.clone().addScaledVector(tb.clone().normalize(), -handle);
   return new HorizontalCurve(a, c0, c1, b);
+}
+
+/** 制御点列を逆順にした曲線 (向きが反転する)。 */
+export function reversedCurve(curve: HorizontalCurve): HorizontalCurve {
+  return new HorizontalCurve([...curve.points].reverse());
 }

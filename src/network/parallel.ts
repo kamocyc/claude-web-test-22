@@ -1,6 +1,13 @@
 import { Vector2, Vector3 } from 'three';
 import { Alignment } from '../core/alignment';
-import { HorizontalCurve, perp } from '../core/curve';
+import {
+  bezierDerivative,
+  bezierSecondDerivative,
+  HorizontalCurve,
+  perp,
+  reversedCurve,
+  type XZ,
+} from '../core/curve';
 import { VerticalProfile } from '../core/profile';
 import { clamp } from '../core/units';
 import type { NetworkClass, NetworkKind } from './classes';
@@ -41,25 +48,43 @@ export function parallelSpacing(cls: NetworkClass, other: NetworkClass = cls): n
  */
 export function offsetCurve(curve: HorizontalCurve, offset: number): HorizontalCurve {
   if (Math.abs(offset) < 1e-6) return curve;
-  const length = curve.length;
-  const t0 = curve.tangentAt(0);
-  const t1 = curve.tangentAt(length);
-  const p0 = curve.pointAt(0).add(perp(t0).multiplyScalar(offset));
-  const p1 = curve.pointAt(length).add(perp(t1).multiplyScalar(offset));
+  const n = curve.pieceCount;
   const shrink = (k: number): number => clamp(1 - offset * k, 0.05, 4);
-  const h0 = curve.c0.distanceTo(curve.p0) * shrink(curve.curvatureAt(0));
-  const h1 = curve.c1.distanceTo(curve.p1) * shrink(curve.curvatureAt(length));
-  return new HorizontalCurve(
-    p0,
-    p0.clone().addScaledVector(t0, h0),
-    p1.clone().addScaledVector(t1, -h1),
-    p1,
-  );
+  // ピースごとにずらす。緩和曲線のように曲率が変わる線形でも、ピースの
+  // 端を共有したままずれるので、繋ぎ目が開かない。
+  const points: XZ[] = [];
+  for (let i = 0; i < n; i++) {
+    const k = i * 3;
+    const a = curve.points[k];
+    const ca = curve.points[k + 1];
+    const cb = curve.points[k + 2];
+    const b = curve.points[k + 3];
+    const ta = new Vector2().subVectors(ca, a).normalize();
+    const tb = new Vector2().subVectors(b, cb).normalize();
+    const oa = a.clone().add(perp(ta).multiplyScalar(offset));
+    const ob = b.clone().add(perp(tb).multiplyScalar(offset));
+    const ha = ca.distanceTo(a) * shrink(pieceCurvature(curve, i, 0));
+    const hb = cb.distanceTo(b) * shrink(pieceCurvature(curve, i, 1));
+    if (i === 0) points.push(oa);
+    points.push(oa.clone().addScaledVector(ta, ha), ob.clone().addScaledVector(tb, -hb), ob);
+  }
+  return new HorizontalCurve(points);
+}
+
+/** ピース `i` の端 (t = 0 または 1) における曲率。 */
+function pieceCurvature(curve: HorizontalCurve, i: number, t: 0 | 1): number {
+  const k = i * 3;
+  const p = curve.points;
+  const d = bezierDerivative(p[k], p[k + 1], p[k + 2], p[k + 3], t);
+  const dd = bezierSecondDerivative(p[k], p[k + 1], p[k + 2], p[k + 3], t);
+  const speed = d.length();
+  if (speed < 1e-6) return 0;
+  return (d.x * dd.y - d.y * dd.x) / (speed * speed * speed);
 }
 
 /** 平面線形の向きを反転する (形は変わらない)。 */
 export function reverseCurve(curve: HorizontalCurve): HorizontalCurve {
-  return new HorizontalCurve(curve.p1, curve.c1, curve.c0, curve.p0);
+  return reversedCurve(curve);
 }
 
 /**
@@ -144,14 +169,14 @@ export interface ParallelSnapOptions {
 }
 
 /**
- * 3 次ベジエは制御点の凸包の中に収まるので、制御点の外接矩形との距離が
+ * 連結 3 次ベジエは制御点の凸包の中に収まるので、制御点の外接矩形との距離が
  * `radius` を超えていれば、その線形は確実にそれより遠い。スナップの
  * 判定は毎フレーム全セグメントに対して走るので、まずここで落とす。
  */
 function farFrom(alignment: Alignment, x: number, z: number, radius: number): boolean {
   const h = alignment.horizontal;
-  const xs = [h.p0.x, h.c0.x, h.c1.x, h.p1.x];
-  const zs = [h.p0.y, h.c0.y, h.c1.y, h.p1.y];
+  const xs = h.points.map((p) => p.x);
+  const zs = h.points.map((p) => p.y);
   const dx = Math.max(Math.min(...xs) - x, 0, x - Math.max(...xs));
   const dz = Math.max(Math.min(...zs) - z, 0, z - Math.max(...zs));
   return dx * dx + dz * dz > radius * radius;
