@@ -28,9 +28,15 @@ const world = new WorldBuilder(network, field, terrainMesh);
 viewport.scene.add(world.group);
 
 let dirty = true;
-const tool = new BuildTool(network, field, () => {
-  dirty = true;
-});
+// 確認モードでカント・構造形式を読めるよう、描画側を渡す。
+const tool = new BuildTool(
+  network,
+  field,
+  () => {
+    dirty = true;
+  },
+  world,
+);
 viewport.scene.add(tool.previewGroup);
 
 const ui = new Ui(uiRoot, {

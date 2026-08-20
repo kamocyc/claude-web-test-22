@@ -9,6 +9,7 @@ import {
 } from '../core/meshbuilder';
 import { GRADING_MARGIN, SURFACE_LIFT, SURFACE_SKIRT, TERRAIN_CELL } from '../core/units';
 import type { NetworkClass } from '../network/classes';
+import { pointRisk } from '../network/validation';
 
 export type RGB = readonly [number, number, number];
 
@@ -165,9 +166,8 @@ export function buildRibbon(
   const normal = new Vector3();
 
   for (const sample of samples) {
-    const gradeRisk = Math.abs(sample.grade) / cls.maxGrade;
-    const radius = Math.abs(sample.curvature) > 1e-6 ? 1 / Math.abs(sample.curvature) : Infinity;
-    const curveRisk = radius > 1e6 ? 0 : cls.minRadius / radius;
+    // 頂点ごとの規格比 (診断色のもと)。HUD の数値と同じ式を使う。
+    const { gradeRisk, curveRisk } = pointRisk(sample.curvature, sample.grade, cls);
     const scale = options.heightScale?.(sample.s) ?? 1;
     const row: number[] = [];
     for (let k = 0; k < profile.length; k++) {

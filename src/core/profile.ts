@@ -67,22 +67,24 @@ export class VerticalProfile {
     return d2 / (L * L);
   }
 
+  /** 弧長 s における縦曲線の半径 [m]。真っ直ぐなら `Infinity`。 */
+  verticalRadiusAt(s: number): number {
+    const g = this.gradeAt(s);
+    const k = Math.abs(this.secondDerivativeAt(s)) / Math.pow(1 + g * g, 1.5);
+    return k < 1e-9 ? Infinity : 1 / k;
+  }
+
   /**
    * 区間内で一番きつい縦曲線の半径 [m]。真っ直ぐなら `Infinity`。
    *
+   * 2 階微分は弧長について線形なので、極値は必ず両端にあります。
    * 端点勾配を `m1 = 平均勾配`, `m0 = 平均勾配 + d` にした標準の形では
    * `L / (4|d|)` になる。敷設時のクランプはその式を直接使っている。
    */
   minVerticalRadius(): number {
     const L = this.length;
     if (L <= 1e-6) return Infinity;
-    let worst = 0;
-    for (const s of [0, L]) {
-      const g = this.gradeAt(s);
-      const k = Math.abs(this.secondDerivativeAt(s)) / Math.pow(1 + g * g, 1.5);
-      if (k > worst) worst = k;
-    }
-    return worst < 1e-9 ? Infinity : 1 / worst;
+    return Math.min(this.verticalRadiusAt(0), this.verticalRadiusAt(L));
   }
 
   /** 区間内の最大勾配 (絶対値)。 */

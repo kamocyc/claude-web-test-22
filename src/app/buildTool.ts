@@ -29,8 +29,15 @@ import {
   type ScissorsPlan,
 } from '../network/scissors';
 import { evaluateAlignment, type SegmentDiagnostics } from '../network/validation';
-import { createPreviewMaterial, setPreviewBlocked } from '../render/materials';
+import { createPreviewMaterial, riskTint, setPreviewBlocked } from '../render/materials';
 import { SnapView, type SnapKind, type SnapMarker } from '../render/snapView';
+import {
+  inspectPoint,
+  sampleProfile,
+  type InspectProfile,
+  type PointInspection,
+  type SurfaceContext,
+} from './inspect';
 import type { Heightfield } from '../terrain/heightfield';
 
 export type ToolMode = 'build' | 'scissors' | 'bulldoze' | 'inspect';
@@ -57,6 +64,8 @@ export interface ToolStatus {
   /** いま吸い付いている点 (表示用)。始点側と終点側で最大 2 つ。 */
   markers: readonly SnapMarker[];
   hoverSegment: SegmentId | null;
+  /** 確認モードでカーソル下にある点 (無ければ null)。 */
+  inspect: PointInspection | null;
   cost: number;
   /** 平行スナップが有効か。 */
   parallelSnap: boolean;
@@ -124,11 +133,21 @@ export class BuildTool {
   private parallelAlignmentPreview: Alignment | null = null;
   /** シーサスクロッシングの一括施工プレビュー。 */
   private scissorsPlan: ScissorsPlan | null = null;
+  /** 確認モードで読み取った、カーソル下の 1 点。 */
+  private inspection: PointInspection | null = null;
+  /** グラフ用のサンプル列。同じ線形を指している間は作り直さない。 */
+  private inspectProfile: { segment: SegmentId; version: number; profile: InspectProfile } | null =
+    null;
 
   constructor(
     private readonly network: Network,
     private readonly field: Heightfield,
     private readonly onChanged: () => void,
+    /**
+     * 描画側だけが知っている情報 (カント・構造形式) の問い合わせ先。
+     * 確認モードの読み取りに使う。無くても動く。
+     */
+    private readonly surface: SurfaceContext | null = null,
   ) {
     this.previewGroup.name = 'preview';
     this.previewMaterial = createPreviewMaterial();
@@ -180,6 +199,8 @@ export class BuildTool {
     this.anchorMarker = null;
     this.showMarkers([]);
     this.scissorsPlan = null;
+    this.inspection = null;
+    this.inspectProfile = null;
     this.updatePreviewMesh();
   }
 
@@ -188,6 +209,7 @@ export class BuildTool {
     this.cursor = cursor;
     this.modifiers = modifiers;
     this.hoverSegment = null;
+    this.inspection = null;
 
     if (!cursor) {
       this.preview = null;
@@ -207,8 +229,21 @@ export class BuildTool {
         tolerance: SNAP_HEIGHT,
       });
       this.hoverSegment = hit?.segment ?? null;
+      // このモードではスナップしないので、敷設モードの表示を残さない。
+      this.snapKind = 'none';
       this.preview = null;
-      this.showMarkers([]);
+      if (this.mode === 'inspect' && hit) {
+        this.inspection = inspectPoint(
+          this.network,
+          hit.segment,
+          hit.s,
+          this.surface,
+          this.profileOf(hit.segment),
+        );
+        this.showMarkers([this.inspectMarker(hit, this.inspection)]);
+      } else {
+        this.showMarkers([]);
+      }
       this.updatePreviewMesh();
       return;
     }
@@ -347,6 +382,43 @@ export class BuildTool {
       radius: Math.max(1.8, this.cls.halfWidth * 0.4),
       bar: new Vector2(-hit.dir.y, hit.dir.x).multiplyScalar(other.halfWidth + 0.8),
     };
+  }
+
+  /**
+   * 確認モードの目印。
+   *
+   * どの点を読んでいるのかを示す輪と、断面を横切る棒。さらに線形の向き
+   * (始点 → 終点) へ短い棒を出す。左右・勾配の符号はこの向きが基準なので、
+   * 数値だけでは何に対しての「右」なのかが分からない。
+   */
+  private inspectMarker(
+    hit: { pos: Vector3; dir: Vector2 },
+    inspection: PointInspection,
+  ): SnapMarker {
+    const cls = getClass(inspection.classId);
+    const forward = new Vector3(hit.dir.x, 0, hit.dir.y);
+    return {
+      kind: 'inspect',
+      pos: hit.pos.clone(),
+      radius: Math.max(1.8, cls.halfWidth * 0.6),
+      bar: new Vector2(-hit.dir.y, hit.dir.x).multiplyScalar(cls.halfWidth + 0.8),
+      tie: [hit.pos.clone(), hit.pos.clone().addScaledVector(forward, 8)],
+      tint: riskTint(Math.max(inspection.curveRisk, inspection.gradeRisk)),
+    };
+  }
+
+  /**
+   * グラフ用のサンプル列。同じ線形を指し続けている間は作り直さない
+   * (毎フレーム作ると SVG を組み直すことになる)。
+   */
+  private profileOf(segment: SegmentId): InspectProfile {
+    const cached = this.inspectProfile;
+    if (cached && cached.segment === segment && cached.version === this.network.version) {
+      return cached.profile;
+    }
+    const profile = sampleProfile(this.network.alignmentOf(segment));
+    this.inspectProfile = { segment, version: this.network.version, profile };
+    return profile;
   }
 
   /** 平行に敷く目印。基準の線形をなぞり、間隔を渡り線で示す。 */
@@ -683,6 +755,7 @@ export class BuildTool {
       snap: this.snapKind,
       markers: this.markers,
       hoverSegment: this.hoverSegment,
+      inspect: this.inspection,
       cost:
         length *
         (this.scissorsPlan ? getClass(this.scissorsPlan.classId).costPerMeter : this.cls.costPerMeter),

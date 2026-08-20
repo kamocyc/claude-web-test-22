@@ -72,6 +72,7 @@ import {
   forceRunMode,
   modeAt,
   unifyParallelRuns,
+  type StructureMode,
   type StructureRun,
 } from '../network/structure';
 import {
@@ -228,6 +229,7 @@ export class WorldBuilder {
   /** 直近の rebuild で使った、踏切に合わせた高さ補正。 */
   private blends = new Map<SegmentId, SurfaceBlend[]>();
   private cant = new Map<SegmentId, CantProfile>();
+  private structureRuns = new Map<SegmentId, StructureRun[]>();
 
   /**
    * 面の塗り方。`connectivity` にすると、行き来できる系統ごとに色を変える。
@@ -532,6 +534,7 @@ export class WorldBuilder {
     });
     this.traffic.reset(this.laneGraph);
     this.vehicleView.clear();
+    this.structureRuns = structures;
 
     return {
       warnings,
@@ -817,6 +820,14 @@ export class WorldBuilder {
     }
     for (const { segment, blend } of spills) add(segment, blend);
     return blends;
+  }
+
+  /**
+   * その弧長の構造形式。まだ組み立てていなければ地表とみなす。
+   * 確認モードの読み取りに使う。
+   */
+  structureModeAt(segment: SegmentId, s: number): StructureMode {
+    return modeAt(this.structureRuns.get(segment) ?? [], s);
   }
 
   /** サンプル列にカントを乗せる (踏切の補正の上に重ねる)。 */

@@ -22,7 +22,7 @@ import { MeshBuilder, UP } from '../core/meshbuilder';
 export type SnapKind = 'none' | 'node' | 'segment' | 'parallel' | 'scissors';
 
 export interface SnapMarker {
-  kind: 'node' | 'segment' | 'parallel';
+  kind: 'node' | 'segment' | 'parallel' | 'inspect';
   /** 吸い付いた点。 */
   pos: Vector3;
   /** 目印の半径 [m] (交差点なら面の広がり)。 */
@@ -35,6 +35,8 @@ export interface SnapMarker {
   tie?: [Vector3, Vector3];
   /** 確定済み (引き始めた点) なら控えめに描く。 */
   fixed?: boolean;
+  /** 種別ごとの既定色を上書きする (確認モードで規格比の色にする)。 */
+  tint?: readonly [number, number, number];
 }
 
 /** 種別ごとの色。舗装の上でも草の上でも見えるように明るくする。 */
@@ -42,6 +44,7 @@ const COLORS: Record<SnapMarker['kind'], readonly [number, number, number]> = {
   node: [0.25, 0.85, 1.0],
   segment: [1.0, 0.78, 0.28],
   parallel: [0.4, 1.0, 0.55],
+  inspect: [0.85, 0.95, 1.0],
 };
 
 /** 目印を浮かせる高さ [m]。 */
@@ -94,7 +97,7 @@ export class SnapView {
 }
 
 function addMarker(mb: MeshBuilder, marker: SnapMarker): void {
-  const color = COLORS[marker.kind];
+  const color = marker.tint ?? COLORS[marker.kind];
   const dim: [number, number, number] = [color[0] * 0.6, color[1] * 0.6, color[2] * 0.6];
   const tint = marker.fixed ? dim : color;
   const at = new Vector3(marker.pos.x, marker.pos.y + LIFT, marker.pos.z);

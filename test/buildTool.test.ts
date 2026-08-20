@@ -4,6 +4,14 @@ import { Mesh } from 'three';
 import { BuildTool } from '../src/app/buildTool';
 import { SnapView } from '../src/render/snapView';
 import { Network } from '../src/network/network';
+import { Vector2, MeshBasicMaterial } from 'three';
+import { getClass } from '../src/network/classes';
+import { anchorFromNode, computePlacement, placeSegment } from '../src/network/editing';
+import { formatRadius } from '../src/app/inspect';
+import { buildDemoNetwork } from '../src/app/demo';
+import { WorldBuilder } from '../src/render/worldBuilder';
+import { DEFAULT_TERRAIN, generateTerrain } from '../src/terrain/generator';
+import { TerrainMesh } from '../src/terrain/terrainMesh';
 import { Heightfield } from '../src/terrain/heightfield';
 
 /**
@@ -428,5 +436,185 @@ describe('スナップ目印の描画', () => {
     // 路面より上に浮かせて描く (舗装に埋もれない)。
     expect(Math.min(...ys)).toBeGreaterThan(5);
     view.dispose();
+  });
+});
+
+describe('確認モードの読み取り', () => {
+  /** カーソルの高さを指定して指す。 */
+  function look(tool: BuildTool, p: Vector3): void {
+    tool.update(p.clone(), { straight: false, noSnap: false });
+  }
+
+  /** 直線から `side` 側へ曲がる線形を 1 本引く。 */
+  function curve(classId: string, side: 1 | -1): { network: Network; segment: number } {
+    const network = new Network();
+    const cls = getClass(classId);
+    const a = network.addNode(new Vector3(-300, 0, 0));
+    const b = network.addNode(new Vector3(0, 0, 0));
+    network.addSegment({
+      classId,
+      a: a.id,
+      b: b.id,
+      ctrlA: new Vector2(-200, 0),
+      ctrlB: new Vector2(-100, 0),
+      gradeA: 0,
+      gradeB: 0,
+    });
+    const tip = network.getNode(b.id);
+    const anchor = anchorFromNode(network, tip, cls);
+    const target = new Vector3(240, 0, side * 70);
+    const preview = computePlacement(anchor, target, { straight: false, cls });
+    const result = placeSegment(network, classId, anchor, { pos: target }, preview);
+    return { network, segment: result.segment };
+  }
+
+  /** 線形の 3 点から外接円の半径を出す (報告された半径の突き合わせ用)。 */
+  function circumradius(p0: Vector3, p1: Vector3, p2: Vector3): number {
+    const a = Math.hypot(p1.x - p0.x, p1.z - p0.z);
+    const b = Math.hypot(p2.x - p1.x, p2.z - p1.z);
+    const c = Math.hypot(p2.x - p0.x, p2.z - p0.z);
+    const area = Math.abs(
+      (p1.x - p0.x) * (p2.z - p0.z) - (p2.x - p0.x) * (p1.z - p0.z),
+    ) / 2;
+    return area < 1e-9 ? Infinity : (a * b * c) / (4 * area);
+  }
+
+  it('曲がる向きが符号で分かる (左右を取り違えない)', () => {
+    for (const side of [1, -1] as const) {
+      const { network, segment } = curve('rail_single', side);
+      const tool = new BuildTool(network, flatField(), () => {});
+      tool.setMode('inspect');
+      const alignment = network.alignmentOf(segment);
+      look(tool, alignment.sampleAt(alignment.length * 0.8).pos);
+      const inspect = tool.status().inspect!;
+      expect(inspect.segment).toBe(segment);
+      // 線形の向きに見て右カーブが正。読み取りの見出しもその向きで出す。
+      expect(Math.sign(inspect.curvature)).toBe(side);
+      expect(formatRadius(inspect.curvature).startsWith(side > 0 ? '右' : '左')).toBe(true);
+    }
+  });
+
+  it('報告された曲線半径が、実際の線形の曲がり方と合っている', () => {
+    const { network, segment } = curve('rail_single', 1);
+    const tool = new BuildTool(network, flatField(), () => {});
+    tool.setMode('inspect');
+    const alignment = network.alignmentOf(segment);
+    const s = alignment.length * 0.85;
+    look(tool, alignment.sampleAt(s).pos);
+    const inspect = tool.status().inspect!;
+    const reported = 1 / Math.abs(inspect.curvature);
+    // 前後 5 m の 3 点を通る円の半径。別の求め方で突き合わせる。
+    const want = circumradius(
+      alignment.sampleAt(inspect.s - 5).pos,
+      alignment.sampleAt(inspect.s).pos,
+      alignment.sampleAt(inspect.s + 5).pos,
+    );
+    expect(reported / want).toBeGreaterThan(0.97);
+    expect(reported / want).toBeLessThan(1.03);
+  });
+
+  it('線路では曲率が立ち上がる様子が読める (道路は跳ぶ)', () => {
+    const rail = curve('rail_single', 1);
+    const road = curve('road_medium', 1);
+    const profileOf = (made: { network: Network; segment: number }): Float32Array => {
+      const tool = new BuildTool(made.network, flatField(), () => {});
+      tool.setMode('inspect');
+      const alignment = made.network.alignmentOf(made.segment);
+      look(tool, alignment.sampleAt(alignment.length * 0.5).pos);
+      return tool.status().inspect!.profile.curvature;
+    };
+
+    const railK = profileOf(rail);
+    const peak = Math.max(...railK);
+    // 入口は 0 から始まり、単調に増えて頭打ちになる。
+    expect(Math.abs(railK[0])).toBeLessThan(peak * 0.05);
+    for (let i = 1; i < railK.length; i++) expect(railK[i]).toBeGreaterThan(railK[i - 1] - 1e-5);
+    // 立ち上がりの途中の点がいくつもある (跳んでいない)。
+    expect(railK.filter((k) => k > peak * 0.1 && k < peak * 0.9).length).toBeGreaterThan(1);
+
+    // 道路は緩和曲線を入れないので、入口から曲率が付いている。
+    const roadK = profileOf(road);
+    expect(Math.abs(roadK[0])).toBeGreaterThan(Math.max(...roadK) * 0.9);
+  });
+
+  it('直線の上では直線と出る', () => {
+    const { network, segment } = curve('rail_single', 1);
+    void segment;
+    const tool = new BuildTool(network, flatField(), () => {});
+    tool.setMode('inspect');
+    // 最初に置いた直線区間の途中。
+    look(tool, new Vector3(-150, 0, 0));
+    const inspect = tool.status().inspect!;
+    expect(Math.abs(inspect.curvature)).toBeLessThan(1e-6);
+    expect(formatRadius(inspect.curvature)).toBe('直線');
+  });
+
+  it('道路にはカントが無い (0 ではなく「無い」)', () => {
+    const { network, segment } = curve('road_medium', 1);
+    const tool = new BuildTool(network, flatField(), () => {});
+    tool.setMode('inspect');
+    const alignment = network.alignmentOf(segment);
+    look(tool, alignment.sampleAt(alignment.length * 0.8).pos);
+    expect(tool.status().inspect!.cant).toBeNull();
+  });
+
+  it('線形から離れた所を指すと何も出ない', () => {
+    const { network } = curve('rail_single', 1);
+    const tool = new BuildTool(network, flatField(), () => {});
+    tool.setMode('inspect');
+    look(tool, new Vector3(-150, 0, 200));
+    expect(tool.status().inspect).toBeNull();
+  });
+
+  it('敷設モードのスナップ表示が残らない', () => {
+    const { tool } = tJunction();
+    tool.update(new Vector3(0, 0, 0), MODS);
+    expect(tool.status().snap).not.toBe('none');
+    tool.setMode('inspect');
+    tool.update(new Vector3(0, 0, 0), { straight: false, noSnap: false });
+    expect(tool.status().snap).toBe('none');
+  });
+
+  it('描画側を渡すと、構造形式とカントも読める', () => {
+    // 実際に組み立てた世界で確かめる。カントも構造形式も、線形だけからは
+    // 決まらない (描画側が持っている) ため。
+    const field = new Heightfield();
+    generateTerrain(field, DEFAULT_TERRAIN);
+    const network = new Network();
+    buildDemoNetwork(network, field);
+    const world = new WorldBuilder(network, field, new TerrainMesh(field, new MeshBasicMaterial()));
+    const result = world.rebuild();
+    const tool = new BuildTool(network, field, () => {}, world);
+    tool.setMode('inspect');
+
+    // 橋になっている区間を探して、その真ん中を指す。
+    let bridge: { segment: number; s: number } | null = null;
+    for (const [segment, runs] of result.structures) {
+      for (const run of runs) {
+        if (run.mode === 'bridge' && run.s1 - run.s0 > 20) {
+          bridge = { segment, s: (run.s0 + run.s1) / 2 };
+        }
+      }
+    }
+    expect(bridge).not.toBeNull();
+    look(tool, network.alignmentOf(bridge!.segment).sampleAt(bridge!.s).pos);
+    expect(tool.status().inspect!.structure).toBe('bridge');
+
+    // カントの付いている線路を探して指す。
+    let canted: { segment: number; s: number } | null = null;
+    for (const seg of network.segments.values()) {
+      if (network.classOf(seg).kind !== 'rail') continue;
+      const alignment = network.alignmentOf(seg.id);
+      for (let i = 1; i < 20; i++) {
+        const s = (alignment.length * i) / 20;
+        if (Math.abs(world.cantAt(seg.id, s)) > 0.01) canted = { segment: seg.id, s };
+      }
+    }
+    expect(canted).not.toBeNull();
+    look(tool, network.alignmentOf(canted!.segment).sampleAt(canted!.s).pos);
+    const inspect = tool.status().inspect!;
+    expect(inspect.cant).not.toBeNull();
+    expect(inspect.cant!).toBeGreaterThan(0.01);
+    expect(inspect.structure).not.toBeNull();
   });
 });
