@@ -53,6 +53,45 @@ function shapeWarnings(network: Network): string[] {
   return out;
 }
 
+describe('規格最大勾配', () => {
+  /**
+   * 縦断勾配の規格は、実物の基準 (生活道路 12%、線路 3.5% など) より
+   * 5 割ほど緩めてある。地形の起伏に対して敷地が狭く、実物どおりでは
+   * 思うように繋げられないため。
+   */
+  const cases: [string, number, number][] = [
+    // 種別, 置ける勾配, 置けない勾配
+    ['road_small', 0.17, 0.19],
+    ['road_medium', 0.13, 0.14],
+    ['road_large', 0.1, 0.11],
+    ['road_highway', 0.07, 0.08],
+    ['road_ramp', 0.11, 0.13],
+    ['rail_single', 0.048, 0.055],
+    ['rail_yard', 0.028, 0.032],
+  ];
+
+  for (const [classId, ok, tooSteep] of cases) {
+    it(`${classId} は ${(ok * 100).toFixed(1)}% で置けて ${(tooSteep * 100).toFixed(1)}% では置けない`, () => {
+      const cls = getClass(classId);
+      const network = new Network();
+      const check = (grade: number): string[] => {
+        const length = 300;
+        const a = new Vector3(0, 20, 0);
+        const b = new Vector3(length, 20 + grade * length, 0);
+        return checkPlacement({
+          network,
+          cls,
+          alignment: straight(a, b),
+          start: { pos: a },
+          end: { pos: b },
+        }).blockers;
+      };
+      expect(check(ok)).toEqual([]);
+      expect(check(tooSteep).join(' ')).toContain('勾配');
+    });
+  }
+});
+
 describe('敷設できるかどうかの判定', () => {
   /**
    * 判定の要:「余裕をもって離れているか」ではなく「交差点の形が保てるか」。

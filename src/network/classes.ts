@@ -44,7 +44,12 @@ export interface NetworkClass {
 
   /** 規格最小曲線半径 [m]。 */
   minRadius: number;
-  /** 規格最大縦断勾配 (0.08 = 8%)。 */
+  /**
+   * 規格最大縦断勾配 (0.08 = 8%)。
+   *
+   * 実際の道路構造令・線路の規格より 5 割ほど緩めてある。地形の起伏に
+   * 対して敷地が狭く、実物どおりの勾配では思うように繋げられないため。
+   */
   maxGrade: number;
   /** 交差点の隅角部の丸め半径 [m]。 */
   cornerRadius: number;
@@ -166,7 +171,7 @@ export const NETWORK_CLASSES: NetworkClass[] = [
     laneWidth: 3.0,
     sidewalkWidth: 1.6,
     minRadius: 12,
-    maxGrade: 0.12,
+    maxGrade: 0.18,
     cornerRadius: 5,
     designSpeed: 30,
     signalCapable: false,
@@ -181,7 +186,7 @@ export const NETWORK_CLASSES: NetworkClass[] = [
     laneWidth: 3.25,
     sidewalkWidth: 2.4,
     minRadius: 30,
-    maxGrade: 0.09,
+    maxGrade: 0.135,
     cornerRadius: 8,
     designSpeed: 50,
     signalCapable: true,
@@ -196,7 +201,7 @@ export const NETWORK_CLASSES: NetworkClass[] = [
     laneWidth: 3.4,
     sidewalkWidth: 3.0,
     minRadius: 45,
-    maxGrade: 0.07,
+    maxGrade: 0.105,
     cornerRadius: 11,
     designSpeed: 60,
     signalCapable: true,
@@ -212,7 +217,7 @@ export const NETWORK_CLASSES: NetworkClass[] = [
     sidewalkWidth: 0,
     divided: true,
     minRadius: 120,
-    maxGrade: 0.05,
+    maxGrade: 0.075,
     cornerRadius: 15,
     designSpeed: 100,
     signalCapable: false,
@@ -229,7 +234,7 @@ export const NETWORK_CLASSES: NetworkClass[] = [
     shoulderWidth: 1.5,
     oneWay: true,
     minRadius: 45,
-    maxGrade: 0.08,
+    maxGrade: 0.12,
     cornerRadius: 8,
     designSpeed: 50,
     signalCapable: false,
@@ -242,7 +247,7 @@ export const NETWORK_CLASSES: NetworkClass[] = [
     label: '線路',
     shoulder: 2.2,
     minRadius: 120,
-    maxGrade: 0.035,
+    maxGrade: 0.05,
     designSpeed: 100,
     costPerMeter: 150,
   }),
@@ -251,7 +256,7 @@ export const NETWORK_CLASSES: NetworkClass[] = [
     label: '側線 (低規格)',
     shoulder: 1.8,
     minRadius: 50,
-    maxGrade: 0.02,
+    maxGrade: 0.03,
     designSpeed: 40,
     costPerMeter: 90,
   }),

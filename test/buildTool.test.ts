@@ -103,8 +103,8 @@ describe('敷設ツール', () => {
     });
 
     it('取り付いた直後でも、続きの向きに縛られずに引ける', () => {
-      // 北から交差点に取り付き、そのまま東へ (曲線モード)。続きの接線を
-      // 引き継ぐと、南向きから東向きへ回る急な曲線になって置けなくなる。
+      // 北から交差点に取り付き、そのまま北東へ (曲線モード)。続きの接線を
+      // 引き継ぐと、南向きから北東へ回る急な曲線になって置けなくなる。
       const network = new Network();
       const tool = new BuildTool(network, flatField(), () => {});
       tool.setClass('road_medium');
@@ -115,13 +115,13 @@ describe('敷設ツール', () => {
       clickAt(tool, 0, 120);
       clickAt(tool, 0, 0);
       const curve = { straight: false, noSnap: false };
-      tool.update(new Vector3(120, 0, 0), curve);
+      tool.update(new Vector3(120, 0, 120), curve);
       // 一度やめて交差点を指し直した場合と同じであること。
       const continued = tool.status();
       tool.cancel();
       tool.update(new Vector3(0, 0, 0), curve);
       tool.click();
-      tool.update(new Vector3(120, 0, 0), curve);
+      tool.update(new Vector3(120, 0, 120), curve);
       const restarted = tool.status();
       expect(continued.blockers).toEqual([]);
       expect(continued.blockers).toEqual(restarted.blockers);
@@ -230,6 +230,93 @@ describe('スナップの目印', () => {
     tool.setMode('bulldoze');
     tool.update(new Vector3(0, 0, 0), MODS);
     expect(tool.status().markers).toEqual([]);
+  });
+});
+
+describe('引いてきた道の上への折り返し', () => {
+  /** 東西の道路を 1 本引いて、終点に居る (続きを引ける) 状態にする。 */
+  function drawn(mods = MODS): { tool: BuildTool; network: Network } {
+    const network = new Network();
+    const tool = new BuildTool(network, flatField(), () => {});
+    tool.setClass('road_medium');
+    tool.setParallelSnap(false);
+    tool.update(new Vector3(0, 0, 0), mods);
+    tool.click();
+    tool.update(new Vector3(150, 0, 0), mods);
+    tool.click();
+    return { tool, network };
+  }
+
+  /**
+   * 終点から 180° 反対 (引いてきた道の上) を指した場合。接線に接して
+   * 真後ろを通る円弧は無いので、線形の解が直線に潰れて、道の上に道を
+   * 重ねられてしまっていた。
+   */
+  for (const x of [120, 100, 40, 5]) {
+    it(`終点から x=${x} (引いてきた道の上) は置けない`, () => {
+      const { tool } = drawn();
+      tool.update(new Vector3(x, 0, 0), MODS);
+      expect(tool.status().blockers.join(' ')).toContain('折り返');
+    });
+  }
+
+  it('一度やめて端点を指し直しても同じ (折り返せない)', () => {
+    const { tool, network } = drawn();
+    tool.cancel();
+    const before = network.segments.size;
+    tool.update(new Vector3(150, 0, 0), MODS);
+    expect(tool.status().snap).toBe('node');
+    tool.click();
+    tool.update(new Vector3(60, 0, 0), MODS);
+    expect(tool.status().blockers.join(' ')).toContain('折り返');
+    tool.click();
+    expect(network.segments.size).toBe(before);
+  });
+
+  it('少し外して指しても、指した所まで届かない線形は置けない', () => {
+    // 真後ろに近い所は、接線に接する円弧が何百 m も回り込む。
+    const { tool } = drawn();
+    tool.update(new Vector3(60, 0, 12), { straight: false, noSnap: false });
+    const status = tool.status();
+    expect(status.length).toBeGreaterThan(400);
+    expect(status.blockers.join(' ')).toContain('届きません');
+  });
+
+  it('前へ続けるのはそのまま置ける', () => {
+    const { tool, network } = drawn();
+    tool.update(new Vector3(260, 0, 40), MODS);
+    expect(tool.status().blockers).toEqual([]);
+    tool.click();
+    expect(network.segments.size).toBe(2);
+  });
+
+  it('道の途中から引き返して同じ道に戻ることもできない', () => {
+    // 端点の接線が無い所 (道路は途中接続で向きを引き継がない) でも、
+    // 出てきた線形の上に戻る線形は止まる。
+    const { tool, network } = drawn();
+    tool.cancel();
+    const before = network.segments.size;
+    tool.update(new Vector3(120, 0, 0), MODS);
+    expect(tool.status().snap).toBe('segment');
+    tool.click();
+    tool.update(new Vector3(20, 0, 0), MODS);
+    expect(tool.status().blockers.join(' ')).toContain('重なって');
+    tool.click();
+    expect(network.segments.size).toBe(before);
+  });
+
+  it('道から離れて戻る迂回路は置ける', () => {
+    const { tool, network } = drawn();
+    tool.cancel();
+    tool.update(new Vector3(120, 0, 0), MODS);
+    tool.click();
+    tool.update(new Vector3(60, 0, 80), MODS);
+    expect(tool.status().blockers).toEqual([]);
+    tool.click();
+    tool.update(new Vector3(20, 0, 0), MODS);
+    expect(tool.status().blockers).toEqual([]);
+    tool.click();
+    expect(network.segments.size).toBeGreaterThan(2);
   });
 });
 

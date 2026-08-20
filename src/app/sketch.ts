@@ -208,6 +208,12 @@ export function smoothProfile(
     startY?: number;
     /** 高さを固定する経由点 (踏切など、他の線形と高さを合わせたい点)。 */
     fixed?: { index: number; y: number }[];
+    /**
+     * 経由点間で許す勾配。既定は規格の 9 割。
+     * 規格いっぱいまで使うと地形をそのままなぞってしまうので、
+     * 「規格は満たすが、もっと緩く通したい」線形はここで抑える。
+     */
+    grade?: number;
   } = {},
 ): Waypoint[] {
   const cls = getClass(classId);
@@ -234,9 +240,9 @@ export function smoothProfile(
     locked.add(fix.index);
   }
 
-  // 経由点間の勾配は規格の 9 割までに抑える。区間内の最大勾配は
-  // computePlacement 側でも規格に収まるよう調整される。
-  const limit = cls.maxGrade * 0.9;
+  // 経由点間の勾配は指定がなければ規格の 9 割までに抑える。区間内の
+  // 最大勾配は computePlacement 側でも規格に収まるよう調整される。
+  const limit = Math.min(options.grade ?? cls.maxGrade * 0.9, cls.maxGrade * 0.9);
   const spans = points.map((p, i) =>
     i === 0 ? 0 : Math.hypot(p.x - points[i - 1].x, p.z - points[i - 1].z),
   );
