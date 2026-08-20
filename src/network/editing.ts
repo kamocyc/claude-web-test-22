@@ -151,6 +151,8 @@ export function computePlacement(
     (anchor.grade ?? average) * startSign,
     average,
     maximum,
+    length,
+    options.cls?.minVerticalRadius ?? Infinity,
   );
   const startGrade = solved.startGrade;
   const endGrade =
@@ -183,14 +185,26 @@ export function computePlacement(
  * なので値域は `[avg - d/3, avg + d]`。ここから、規格を守れる範囲まで
  * `d` を縮める。接続点の勾配が僅かに不連続になるが、非現実的な急勾配が
  * できるよりは望ましい。
+ *
+ * 同じ `d` に、規格最小縦曲線半径からの上限もかける。短い区間で勾配を
+ * 大きく変えると縦断が折れる (勾配は連続でも、変わり方が急すぎる) ため。
  */
 export function solveVerticalTangents(
   inheritedGrade: number,
   average: number,
   maxGrade: number,
+  length = 0,
+  minVerticalRadius = Infinity,
 ): { startGrade: number; endGrade: number } {
   const headroom = Math.max(0, maxGrade - Math.abs(average));
-  const d = clamp(inheritedGrade - average, -headroom, headroom);
+  // 縦曲線の半径。この形 (m1 = 平均勾配) では最大の 2 階微分が 4|d|/L に
+  // なるので、半径の下限はそのまま d の上限になる。サンプリングは要らない。
+  const byCurve =
+    Number.isFinite(minVerticalRadius) && minVerticalRadius > 0
+      ? length / (4 * minVerticalRadius)
+      : Infinity;
+  const limit = Math.min(headroom, byCurve);
+  const d = clamp(inheritedGrade - average, -limit, limit);
   return { startGrade: average + d, endGrade: average };
 }
 

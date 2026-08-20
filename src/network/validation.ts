@@ -8,19 +8,28 @@ export interface SegmentDiagnostics {
   minRadius: number;
   /** 区間内の最大縦断勾配 (絶対値)。 */
   maxGrade: number;
+  /** 区間内の最小縦曲線半径 [m] (勾配の変わり方の急さ)。 */
+  minVerticalRadius: number;
   radiusOk: boolean;
   gradeOk: boolean;
+  verticalOk: boolean;
   /** 0 = 余裕あり, 1 = 規格ちょうど, >1 = 規格超過。 */
   radiusRisk: number;
   gradeRisk: number;
+  verticalRisk: number;
   messages: string[];
 }
 
 export function evaluateAlignment(alignment: Alignment, cls: NetworkClass): SegmentDiagnostics {
   const { minRadius } = alignment.horizontal.extremeCurvature(48);
   const maxGrade = alignment.vertical.maxGrade(32);
+  const minVerticalRadius = alignment.vertical.minVerticalRadius();
   const radiusRisk = minRadius > 1e6 ? 0 : cls.minRadius / Math.max(minRadius, 1e-3);
   const gradeRisk = maxGrade / cls.maxGrade;
+  const verticalRisk =
+    !Number.isFinite(cls.minVerticalRadius) || minVerticalRadius > 1e6
+      ? 0
+      : cls.minVerticalRadius / Math.max(minVerticalRadius, 1e-3);
   const messages: string[] = [];
   if (radiusRisk > 1) {
     messages.push(
@@ -32,21 +41,29 @@ export function evaluateAlignment(alignment: Alignment, cls: NetworkClass): Segm
       `勾配 ${(maxGrade * 100).toFixed(1)}% は ${cls.label} の最大勾配 ${(cls.maxGrade * 100).toFixed(1)}% を超えています。`,
     );
   }
+  if (verticalRisk > 1) {
+    messages.push(
+      `縦曲線半径 ${minVerticalRadius.toFixed(0)} m は ${cls.label} の規格 ${cls.minVerticalRadius} m を下回ります (勾配の変わり方が急すぎます)。`,
+    );
+  }
   return {
     length: alignment.length,
     minRadius,
     maxGrade,
+    minVerticalRadius,
     radiusOk: radiusRisk <= 1,
     gradeOk: gradeRisk <= 1,
+    verticalOk: verticalRisk <= 1,
     radiusRisk,
     gradeRisk,
+    verticalRisk,
     messages,
   };
 }
 
 /** 表示用に 0..1 に丸めた危険度。1 に近いほど規格ぎりぎり。 */
 export function riskLevel(diag: SegmentDiagnostics): number {
-  return clamp(Math.max(diag.radiusRisk, diag.gradeRisk), 0, 2) / 2;
+  return clamp(Math.max(diag.radiusRisk, diag.gradeRisk, diag.verticalRisk), 0, 2) / 2;
 }
 
 /** 点ごとの危険度。診断表示の色分けに使う。 */
