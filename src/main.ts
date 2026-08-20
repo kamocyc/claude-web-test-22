@@ -116,6 +116,15 @@ window.trackBuilder = {
 // ---------------------------------------------------------------- 入力
 
 let cursor: Vector3 | null = null;
+
+/**
+ * カーソルの当たり先。地形に加えて**路面**も見る。
+ *
+ * 地形だけを見ていると、橋の上を指しても橋の下の地面を指したことに
+ * なってしまう。路面を含めれば、橋を指したときは橋の高さが返る
+ * (敷設ツールはその高さで働き、その橋に繋がる)。
+ */
+const pick = (): Vector3 | null => viewport.pick([...terrainMesh.meshes, world.surfaceMesh]);
 const modifiers = { straight: false, noSnap: false };
 let pointerDownAt: { x: number; y: number; time: number } | null = null;
 
@@ -123,7 +132,7 @@ canvas.addEventListener('pointermove', (event) => {
   viewport.setPointer(event.clientX, event.clientY);
   modifiers.straight = event.shiftKey;
   modifiers.noSnap = event.ctrlKey || event.metaKey;
-  cursor = viewport.pick(terrainMesh.meshes);
+  cursor = pick();
 });
 
 canvas.addEventListener('pointerdown', (event) => {
@@ -140,7 +149,7 @@ canvas.addEventListener('pointerup', (event) => {
   // ドラッグによる視点操作とクリックを区別する。
   if (moved > 5 || elapsed > 400) return;
   viewport.setPointer(event.clientX, event.clientY);
-  cursor = viewport.pick(terrainMesh.meshes);
+  cursor = pick();
   tool.update(cursor, modifiers);
   tool.click();
 });

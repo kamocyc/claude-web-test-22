@@ -233,6 +233,73 @@ describe('スナップの目印', () => {
   });
 });
 
+describe('高さで選ぶスナップ', () => {
+  /**
+   * 東西の道路 (地表) と、その上を南北に跨ぐ高架。平面で見ると 2 本は
+   * 交差点で重なるので、「どちらに吸い付くか」は高さでしか決められない。
+   */
+  function overpass(): { tool: BuildTool; network: Network; ground: number; bridge: number } {
+    const network = new Network();
+    const tool = new BuildTool(network, flatField(), () => {});
+    tool.setClass('road_medium');
+    tool.setParallelSnap(false);
+    clickAt(tool, -150, 0);
+    clickAt(tool, 150, 0);
+    tool.cancel();
+    const ground = [...network.segments.keys()][0];
+    // 高さ設定を +12 m にして南北に跨ぐ。
+    tool.adjustElevation(4);
+    clickAt(tool, 0, -150);
+    clickAt(tool, 0, 150);
+    tool.cancel();
+    tool.adjustElevation(-4);
+    const bridge = [...network.segments.keys()].find((id) => id !== ground)!;
+    return { tool, network, ground, bridge };
+  }
+
+  /** カーソルの高さを指定して指す。 */
+  function point(tool: BuildTool, x: number, y: number, z: number): void {
+    tool.update(new Vector3(x, y, z), MODS);
+  }
+
+  it('高架の真下 (地表) を指しても、頭上の高架には吸い付かない', () => {
+    const { tool } = overpass();
+    point(tool, 0, 0, -40);
+    expect(tool.status().snap).toBe('none');
+  });
+
+  it('高さ設定を高架に合わせれば、その高架に吸い付く', () => {
+    const { tool } = overpass();
+    tool.adjustElevation(4);
+    point(tool, 0, 0, -40);
+    expect(tool.status().snap).toBe('segment');
+  });
+
+  it('カーソルが高架に当たっていれば、高さ設定によらずその高架に吸い付く', () => {
+    const { tool } = overpass();
+    // 路面に当たったカーソル (地形より 12 m 高い)。
+    point(tool, 0, 12, -40);
+    expect(tool.status().snap).toBe('segment');
+  });
+
+  it('地表の道路にはこれまでどおり取り付く', () => {
+    const { tool } = overpass();
+    point(tool, 60, 0, 0);
+    expect(tool.status().snap).toBe('segment');
+  });
+
+  it('撤去モードでも、指した高さのものを選ぶ', () => {
+    const { tool, ground, bridge } = overpass();
+    tool.setMode('bulldoze');
+    // 高架の真下 (平面では高架の方が近い) でも、地表を指せば地表の道路。
+    point(tool, 0, 0, 10);
+    expect(tool.status().hoverSegment).toBe(ground);
+    // 高架の路面を指せば高架。
+    point(tool, 0, 12, 10);
+    expect(tool.status().hoverSegment).toBe(bridge);
+  });
+});
+
 describe('引いてきた道の上への折り返し', () => {
   /** 東西の道路を 1 本引いて、終点に居る (続きを引ける) 状態にする。 */
   function drawn(mods = MODS): { tool: BuildTool; network: Network } {

@@ -136,6 +136,11 @@ export interface ParallelSnapOptions {
   direction?: Vector2;
   /** 基準にしないセグメント。 */
   exclude?: Iterable<SegmentId>;
+  /**
+   * `point` の高さからどれだけ離れた線形まで基準にするか [m]。
+   * 既定は 25 m (高架の脇にもう 1 本架ける場面まで許す)。
+   */
+  heightTolerance?: number;
 }
 
 /**
@@ -222,7 +227,7 @@ export function findParallelReference(
     // (もう 1 本の高架を架ける) のは普通の使い方なので許すが、地表の
     // 線形が近くにあればそちらを優先する。
     const rise = Math.abs(point.y - sample.pos.y);
-    if (rise > 25) continue;
+    if (rise > (options.heightTolerance ?? 25)) continue;
 
     // 続けて引くときは、その向きに進める線形だけを基準にする。
     // ノードの上では前後 2 本が同じだけ近いので、これで決まる。

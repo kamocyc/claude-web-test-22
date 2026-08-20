@@ -838,16 +838,18 @@ function crossingTrim(
 const PORTAL_STANDOFF = 3;
 
 /**
- * トンネルの中・坑口にかかる交差点を止める。
+ * 坑口にかかる交差点を止める。
  *
- * トンネルの中に交差点があると、四方の口に坑門が立って車がぶつかり、
- * 交差点そのものも山の中に埋まる。地形と線形の高さで決まることなので、
- * 「掘ってから直す」ことができない。置く前に止める。
+ * トンネルの中の交差点そのものは作れる (交差点面を地中の空洞として囲い、
+ * 枝のトンネルはそこへ開く)。作れないのは**坑口にかかる**交差点で、
+ * 交差点の口に坑門が立って曲がってきた車がぶつかる。地形と線形の高さで
+ * 決まることなので、「掘ってから直す」ことができない。置く前に止める。
  *
  * 判定は交差点になる点 (既存ノード・取り付き・同一平面の交差) のまわりで、
- * **交差点が食べる長さ + 坑門の余裕**の範囲を線形に沿って歩き、そこが
- * トンネルの区間に入るかどうかを見る。地形を横に見ないのは、山腹を
- * 走っているだけの道路を巻き込まないため。
+ * **交差点が食べる長さ + 坑門の余裕**の範囲を線形に沿って歩き、そこに
+ * トンネルと地表の**境目**があるかどうかを見る。全部トンネル (空洞) でも
+ * 全部地表でも構わない。地形を横に見ないのは、山腹を走っているだけの
+ * 道路を巻き込まないため。
  */
 function checkTunnelJunctions(ctx: PlacementContext, connected: Set<SegmentId>): string[] {
   const field = ctx.field;
@@ -855,20 +857,23 @@ function checkTunnelJunctions(ctx: PlacementContext, connected: Set<SegmentId>):
   const { network, cls, alignment } = ctx;
   const out: string[] = [];
 
-  /** 線形の s0 から前後 `reach` の範囲に、トンネルの区間があるか。 */
-  const tunnelNear = (line: Alignment, s0: number, reach: number): boolean => {
+  /** 線形の s0 から前後 `reach` の範囲に、坑口 (トンネルと地表の境目) があるか。 */
+  const portalNear = (line: Alignment, s0: number, reach: number): boolean => {
+    let tunnel = false;
+    let open = false;
     for (let d = 0; d <= reach; d += 2) {
       for (const s of d === 0 ? [s0] : [s0 - d, s0 + d]) {
         if (s < 0 || s > line.length) continue;
         const p = line.sampleAt(s).pos;
-        if (classify(p.y, field.baseHeightAt(p.x, p.z)) === 'tunnel') return true;
+        if (classify(p.y, field.baseHeightAt(p.x, p.z)) === 'tunnel') tunnel = true;
+        else open = true;
       }
     }
-    return false;
+    return tunnel && open;
   };
 
   const blocked = (): void => {
-    out.push('トンネルの中には交差点を作れません (坑口から離してください)。');
+    out.push('トンネルの坑口には交差点を作れません (坑口から離してください)。');
   };
 
   // 1. 既存の線形と同じ高さで交わる所 (新しくできる交差点)。
@@ -883,8 +888,8 @@ function checkTunnelJunctions(ctx: PlacementContext, connected: Set<SegmentId>):
       const sin = Math.abs(hit.dirA.x * hit.dirB.y - hit.dirA.y * hit.dirB.x);
       const cos = Math.abs(hit.dirA.x * hit.dirB.x + hit.dirA.y * hit.dirB.y);
       if (
-        tunnelNear(alignment, hit.sA, crossingTrim(cls, other, sin, cos) + PORTAL_STANDOFF) ||
-        tunnelNear(otherAlignment, hit.sB, crossingTrim(other, cls, sin, cos) + PORTAL_STANDOFF)
+        portalNear(alignment, hit.sA, crossingTrim(cls, other, sin, cos) + PORTAL_STANDOFF) ||
+        portalNear(otherAlignment, hit.sB, crossingTrim(other, cls, sin, cos) + PORTAL_STANDOFF)
       ) {
         blocked();
         return dedupe(out);
@@ -922,13 +927,15 @@ function checkTunnelJunctions(ctx: PlacementContext, connected: Set<SegmentId>):
         });
       }
     }
-    // 交差点にならない端 (行き止まり) は見ない。
-    if (neighbours.length === 0) continue;
+    // 交差点にならない端は見ない。行き止まり (枝なし) と、繋いでも
+    // 2 枝にしかならない端 (道の延伸・折れ点) には交差点の面ができず、
+    // 坑門と喧嘩する口もない。トンネルの中の道はこうして延ばせる。
+    if (neighbours.length < 2) continue;
     for (const neighbour of neighbours) {
       // 直角に取り付く場合のトリム。斜めの取り付きはこれより長くなるが、
       // 足りない分は「止めない側」に外れるので誤検知にならない。
       const reach = cls.halfWidth + neighbour.cls.halfWidth + CORNER_MARGIN + PORTAL_STANDOFF;
-      if (tunnelNear(alignment, s, reach) || tunnelNear(neighbour.line, neighbour.s, reach)) {
+      if (portalNear(alignment, s, reach) || portalNear(neighbour.line, neighbour.s, reach)) {
         blocked();
         return dedupe(out);
       }

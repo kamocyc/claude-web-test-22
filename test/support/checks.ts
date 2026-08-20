@@ -3,6 +3,7 @@ import { surfaceHeightScale } from '../../src/build/crossing';
 import { profileFor, profilePointAt } from '../../src/build/surface';
 import { SURFACE_LIFT } from '../../src/core/units';
 import { selfIntersects } from '../../src/network/junction';
+import { classify } from '../../src/network/structure';
 import {
   drawnSampleAt,
   insidePolygonXZ,
@@ -21,6 +22,19 @@ import {
  * どれも「実際に描かれたもの」から測る。交差点面は描画と同じ earcut 分割で
  * 補間し、垂れ壁や構造物は `world.group` の実メッシュの頂点を見る。
  */
+
+
+/**
+ * トンネルの中の交差点か。
+ *
+ * トンネル区間では地形を切らない (地山をそのまま残す) 仕様なので、
+ * 交差点面が地形より下にあるのが正しい。囲いは覆工の空洞が受け持つ
+ * ので、「地形に埋まらない」「構造物が食い込まない」の検査からは外す。
+ */
+function inTunnel(scene: Scene, node: unknown): boolean {
+  const n = scene.network.getNode(node as never);
+  return classify(n.pos.y, scene.field.baseHeightAt(n.pos.x, n.pos.z)) === 'tunnel';
+}
 
 function push(
   out: Violation[],
@@ -201,6 +215,7 @@ export function junctionBuriedViolations(scene: Scene, tolerance = 0.05): Violat
   const out: Violation[] = [];
   const f = scene.field;
   for (const junction of scene.world.junctions.values()) {
+    if (inTunnel(scene, junction.node)) continue;
     const ring = junctionSurfaceRing(junction.rings);
     if (!ring) continue;
     let minX = Infinity;
@@ -378,6 +393,9 @@ export function structureIntrusionViolations(scene: Scene, clearance = 4.5): Vio
   for (const junction of scene.world.junctions.values()) {
     // 線路の分岐器はレール・枕木が面の上に出るのが正しいので見ない。
     if (junction.approaches.some((ap) => ap.branch.cls.kind !== 'road')) continue;
+    // トンネルの中の交差点は覆工そのものが面を囲うので見ない (坑口の
+    // 坑門が交差点に食い込まないことは、専用の検査で見る)。
+    if (inTunnel(scene, junction.node)) continue;
     const ring = junctionSurfaceRing(junction.rings);
     if (ring) rings.push({ ring, node: String(junction.node) });
   }

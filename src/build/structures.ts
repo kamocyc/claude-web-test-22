@@ -1,7 +1,17 @@
 import { Vector3 } from 'three';
 import type { Alignment, AlignmentSample } from '../core/alignment';
-import { extrudeSkirt, fillPolygon, type MeshBuilder } from '../core/meshbuilder';
-import { DECK_THICKNESS, SURFACE_LIFT } from '../core/units';
+import {
+  extrudeSkirt,
+  fillPolygon,
+  signedAreaXZ,
+  type MeshBuilder,
+} from '../core/meshbuilder';
+import {
+  CLEARANCE_OVER_RAIL,
+  CLEARANCE_OVER_ROAD,
+  DECK_THICKNESS,
+  SURFACE_LIFT,
+} from '../core/units';
 import type { NetworkClass } from '../network/classes';
 import type { Heightfield } from '../terrain/heightfield';
 import { addBox, addTube } from './primitives';
@@ -296,6 +306,11 @@ export function buildTunnel(
   samples: AlignmentSample[],
   cls: NetworkClass,
   field: Heightfield,
+  /**
+   * 坑門を建てる端。交差点の中へ開く端では建てない (坑門の柱が
+   * 交差点の口に立って、曲がってきた車がぶつかる)。
+   */
+  portals: { start?: boolean; end?: boolean } = {},
 ): void {
   if (samples.length < 2) return;
   const section = tunnelSection(cls);
@@ -312,8 +327,65 @@ export function buildTunnel(
   );
   addTube(mb, sections, LINING, false);
 
-  buildPortal(mb, samples[0], field, section);
-  buildPortal(mb, samples[samples.length - 1], field, section);
+  if (portals.start !== false) buildPortal(mb, samples[0], field, section);
+  if (portals.end !== false) buildPortal(mb, samples[samples.length - 1], field, section);
+}
+
+/**
+ * トンネルの中の交差点 (地中の空洞)。
+ *
+ * トンネル区間では地形を切らないので、交差点面をそのまま置くと山の中に
+ * 埋まったままになる。交差点面の外周から覆工の壁を立ち上げ、天井で蓋を
+ * して、枝のトンネルが開く空洞にする。壁を建てないのは**枝の口**だけ
+ * なので、トンネルの断面がそのまま空洞へ繋がる。
+ *
+ * 天井の高さはトンネル断面のアーチ天端に合わせる。土被りが浅い所では
+ * 地山を突き抜けないように下げるが、建築限界だけは必ず残す。
+ */
+export function buildJunctionChamber(
+  mb: MeshBuilder,
+  ring: Vector3[],
+  cls: NetworkClass,
+  field: Heightfield,
+  /** 辺 i が「枝の口」か (`Junction.openEdge`)。 */
+  openEdge: boolean[],
+): void {
+  if (ring.length < 3) return;
+  const section = tunnelSection(cls);
+  const crown = Math.max(...section.map((p) => p.height));
+  const headroom = cls.kind === 'rail' ? CLEARANCE_OVER_RAIL : CLEARANCE_OVER_ROAD;
+
+  // 壁の足元は路面より少し下げる。舗装の縁との間に隙間が見えないように。
+  const floor = ring.map((p) => new Vector3(p.x, p.y + SURFACE_LIFT - 1, p.z));
+  const ceiling = floor.map((p) => {
+    const ground = Math.min(field.baseHeightAt(p.x, p.z), field.heightAt(p.x, p.z));
+    const road = p.y + 1;
+    return new Vector3(
+      p.x,
+      Math.max(road + headroom + 0.2, Math.min(road + crown, ground - 0.4)),
+      p.z,
+    );
+  });
+
+  // 壁は内側を向く。外から見るものではないので、外向きの面は作らない。
+  const n = floor.length;
+  const normal = new Vector3();
+  const inward = signedAreaXZ(floor) > 0 ? -1 : 1;
+  for (let i = 0; i < n; i++) {
+    if (openEdge[i]) continue;
+    const j = (i + 1) % n;
+    normal.set((floor[j].z - floor[i].z) * inward, 0, -(floor[j].x - floor[i].x) * inward);
+    if (normal.lengthSq() < 1e-12) continue;
+    normal.normalize();
+    const t = mb.vertexCount;
+    mb.vertex(floor[i], normal, 0, 0, LINING);
+    mb.vertex(floor[j], normal, 1, 0, LINING);
+    mb.vertex(ceiling[j], normal, 1, 1, LINING);
+    mb.vertex(ceiling[i], normal, 0, 1, LINING);
+    mb.quad(t, t + 1, t + 2, t + 3);
+  }
+  // 天井。下から見上げる面なので下向きに張る。
+  fillPolygon(mb, ceiling, LINING, 0.1, 0, true);
 }
 
 /** 坑門 (ポータル)。左右の柱と上の梁で開口を作る。 */

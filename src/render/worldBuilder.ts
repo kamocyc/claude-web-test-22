@@ -35,6 +35,7 @@ import {
 import {
   alignmentSamplesInRange,
   buildBridge,
+  buildJunctionChamber,
   buildJunctionDeck,
   buildTunnel,
   structureFootprintHalfWidth,
@@ -206,7 +207,13 @@ const MAX_AERIAL_SPANS = 1.6;
  */
 export class WorldBuilder {
   readonly group = new Group();
-  private readonly surfaceMesh: Mesh;
+  /**
+   * 路面 (舗装・交差点面) のメッシュ。
+   *
+   * カーソルの当たり判定に使う。地形だけを見ていると、橋の上を指しても
+   * 橋の下の地面を指したことになってしまう。
+   */
+  readonly surfaceMesh: Mesh;
   private readonly overlayMesh: Mesh;
   private readonly structureMesh: Mesh;
   private readonly propGroup = new Group();
@@ -413,6 +420,17 @@ export class WorldBuilder {
     };
     const diagnostics = new Map<SegmentId, SegmentDiagnostics>();
 
+    // トンネルの中で線形が繋がるノード。ここにはトンネルの端があるが、
+    // 坑口ではない (先にもトンネルが続く)。坑門を建てると、長いトンネルの
+    // 途中に壁が立ち、交差点では枝の口を塞いでしまう。
+    const underground = new Set<NodeId>();
+    for (const node of network.nodes.values()) {
+      if (network.branchesAt(node.id).length < 2) continue;
+      if (classify(node.pos.y, this.field.baseHeightAt(node.pos.x, node.pos.z)) === 'tunnel') {
+        underground.add(node.id);
+      }
+    }
+
     for (const seg of network.segments.values()) {
       const cls = network.classOf(seg);
       const alignment = network.alignmentOf(seg.id);
@@ -441,6 +459,10 @@ export class WorldBuilder {
         blends.get(seg.id) ?? [],
         stats,
         this.tintFor(connectivity, seg.id),
+        {
+          range,
+          openEnds: { start: underground.has(seg.a), end: underground.has(seg.b) },
+        },
       );
       if (cls.kind === 'road') {
         buildLaneMarkings(overlay, this.surfacePath(seg.id), range, cls);
@@ -1033,6 +1055,8 @@ export class WorldBuilder {
     blends: SurfaceBlend[],
     stats: WorldStats,
     tint?: RGB,
+    /** 区間の範囲と、トンネルの中の交差点へ開く端。 */
+    tunnelEnds?: { range: { s0: number; s1: number }; openEnds: { start: boolean; end: boolean } },
   ): void {
     const profile = profileFor(cls);
     const ground = (x: number, z: number): number => this.field.heightAt(x, z);
@@ -1060,7 +1084,20 @@ export class WorldBuilder {
         });
       } else if (run.mode === 'tunnel') {
         stats.tunnelLength += run.s1 - run.s0;
-        buildTunnel(structure, samples, cls, this.field);
+        // 交差点の空洞へ開く端には坑門を建てない。
+        const range = tunnelEnds?.range;
+        buildTunnel(structure, samples, cls, this.field, {
+          start: !(
+            tunnelEnds?.openEnds.start &&
+            range !== undefined &&
+            run.s0 <= range.s0 + 1e-3
+          ),
+          end: !(
+            tunnelEnds?.openEnds.end &&
+            range !== undefined &&
+            run.s1 >= range.s1 - 1e-3
+          ),
+        });
       }
     }
 
@@ -1189,6 +1226,18 @@ export class WorldBuilder {
 
     // 高い所にある交差点には床版と橋脚を付ける。付けないと路面だけが宙に浮く。
     const terrain = this.field.baseHeightAt(node.pos.x, node.pos.z);
+    // トンネルの中の交差点は、地中の空洞として囲う。囲わないと交差点面が
+    // 山の中に埋まったままになる。
+    if (classify(node.pos.y, terrain) === 'tunnel' && junction.rings.length > 0) {
+      // 覆工は舗装のすぐ外に立てる (面の上に出すと建築限界に食い込む)。
+      buildJunctionChamber(
+        structure,
+        expandRing(junction.rings[0], 0.4),
+        cls,
+        this.field,
+        junction.openEdge,
+      );
+    }
     if (classify(node.pos.y, terrain) === 'bridge' && junction.rings.length > 0) {
       buildJunctionDeck(structure, junction.rings[0], cls, this.field, {
         canPlace: (x, z, y) =>

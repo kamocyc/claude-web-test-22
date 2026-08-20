@@ -116,11 +116,11 @@ describe('敵対的検証: 配置表', () => {
     expectClean('面の重なり', all((s) => C.junctionOverlapViolations(s)));
   });
 
-  it('作れない配置には理由が付く (トンネルの中の交差点)', () => {
+  it('トンネルの中でも交差点は作れる (地中の空洞になる)', () => {
+    // 坑口にかかる交差点だけは止まる (`test/tunnel.test.ts`)。
     const scene = tunnelInsideCase().make();
-    expect(scene.blocked.join('\n')).toContain('トンネルの中には交差点を作れません');
-    // 止めたあとの世界は壊れていない (交差点が作られていない)。
-    expect(scene.result.stats.intersections).toBe(0);
+    expect(scene.blocked).toEqual([]);
+    expect(scene.result.stats.intersections).toBe(1);
   });
 });
 

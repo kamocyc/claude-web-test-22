@@ -7,6 +7,15 @@ import { getClass, type NetworkClass } from './classes';
 export type NodeId = number;
 export type SegmentId = number;
 
+/**
+ * 高さでの絞り込み。立体交差の上下を選り分けるのに使う。
+ * `y` のまわり ±`tolerance` [m] にあるものだけを見る。
+ */
+export interface NearHeight {
+  y: number;
+  tolerance: number;
+}
+
 export interface NetNode {
   id: NodeId;
   pos: Vector3;
@@ -292,10 +301,11 @@ export class Network {
   }
 
   /** 指定半径内で最も近いノードを返す。 */
-  findNodeNear(point: Vector3, radius: number): NetNode | null {
+  findNodeNear(point: Vector3, radius: number, height?: NearHeight): NetNode | null {
     let best: NetNode | null = null;
     let bestDist = radius * radius;
     for (const node of this.nodes.values()) {
+      if (height && Math.abs(node.pos.y - height.y) > height.tolerance) continue;
       const dx = node.pos.x - point.x;
       const dz = node.pos.z - point.z;
       const d = dx * dx + dz * dz;
@@ -307,10 +317,17 @@ export class Network {
     return best;
   }
 
-  /** 指定半径内で最も近いセグメント上の点を返す。 */
+  /**
+   * 指定半径内で最も近いセグメント上の点を返す。
+   *
+   * `height` を渡すと、その高さのあたりを通っている所だけを見る。
+   * 立体交差では平面で見ると上下の線形が重なるので、これが無いと
+   * 「地上の道を指しているのに橋に吸い付く」ことになる。
+   */
   findSegmentNear(
     point: Vector3,
     radius: number,
+    height?: NearHeight,
   ): { segment: SegmentId; s: number; pos: Vector3; dir: Vector2 } | null {
     let best: { segment: SegmentId; s: number; pos: Vector3; dir: Vector2 } | null = null;
     let bestDist = radius * radius;
@@ -321,8 +338,11 @@ export class Network {
       const steps = Math.max(4, Math.ceil(L / 2));
       let localS = 0;
       let localDist = Infinity;
+      const atHeight = (s: number): boolean =>
+        !height || Math.abs(al.vertical.yAt(s) - height.y) <= height.tolerance;
       for (let i = 0; i <= steps; i++) {
         const s = (i / steps) * L;
+        if (!atHeight(s)) continue;
         const q = al.horizontal.pointAt(s);
         const d = q.distanceToSquared(p);
         if (d < localDist) {
@@ -330,12 +350,14 @@ export class Network {
           localS = s;
         }
       }
+      if (localDist === Infinity) continue;
       // 2 m 刻みの粗探索だけでは、クリック位置が線路上でも最大 1 m ずれる。
       // 最良点の前後を2段階で詰め、分岐の接点を実際のマウス位置へ合わせる。
       let span = L / steps;
       for (let pass = 0; pass < 2; pass++) {
         for (let i = -4; i <= 4; i++) {
           const s = clampStation(localS + (span * i) / 4, L);
+          if (!atHeight(s)) continue;
           const d = al.horizontal.pointAt(s).distanceToSquared(p);
           if (d < localDist) {
             localDist = d;

@@ -74,6 +74,18 @@ interface Target {
 }
 
 const ELEVATION_STEP = 3;
+
+/**
+ * 吸い付く相手と「今働いている高さ」の差の上限 [m]。
+ *
+ * 立体交差の桁下は道路で 4.5 m + 床版 1.1 m あるので、これより狭く
+ * 取れば上下の線形を取り違えない。高さ設定の刻み (3 m) より広いので、
+ * 1 段ずれていても既存の線形に繋がる。
+ */
+const SNAP_HEIGHT = 4;
+
+/** カーソルが構造物 (橋の路面) に当たっているとみなす、地形との差 [m]。 */
+const ON_STRUCTURE = 2;
 const ANGLE_SNAP = 15 * DEG;
 
 /**
@@ -146,8 +158,14 @@ export class BuildTool {
     this.parallelSnap = on;
   }
 
+  /**
+   * 敷設高さを上下する。
+   *
+   * 下は深いトンネルの底まで届かせる。スナップは「地形 + 高さ設定」の
+   * あたりを見るので、トンネルの中の道に繋ぐにはここを掘り下げる。
+   */
   adjustElevation(steps: number): void {
-    this.elevationOffset = clamp(this.elevationOffset + steps * ELEVATION_STEP, -30, 60);
+    this.elevationOffset = clamp(this.elevationOffset + steps * ELEVATION_STEP, -60, 60);
     this.refreshPreview();
   }
 
@@ -181,7 +199,13 @@ export class BuildTool {
     }
 
     if (this.mode === 'bulldoze' || this.mode === 'inspect') {
-      const hit = this.network.findSegmentNear(cursor, 12);
+      // 撤去・確認も指した高さのものを選ぶ (橋を指せば橋、下の道を
+      // 指せば下の道)。カーソルは路面にも当たるので、橋の上を指せば
+      // 橋の高さが返ってくる。
+      const hit = this.network.findSegmentNear(cursor, 12, {
+        y: cursor.y,
+        tolerance: SNAP_HEIGHT,
+      });
       this.hoverSegment = hit?.segment ?? null;
       this.preview = null;
       this.showMarkers([]);
@@ -206,24 +230,36 @@ export class BuildTool {
 
   private modifiers: CursorModifiers = { straight: false, noSnap: false };
 
+  /**
+   * 今どの高さで働いているか。
+   *
+   * 原則は**地形 + 高さ設定**。橋を指しているとき (カーソルが橋の路面に
+   * 当たっているとき) だけは、その橋の高さで働く。立体交差の上下は平面で
+   * 見ると重なるので、これが無いと「地上の道を引いているのに頭上の橋に
+   * 吸い付く」ことになる。
+   */
+  private workingY(cursor: Vector3): number {
+    const ground = this.field.heightAt(cursor.x, cursor.z);
+    if (cursor.y - ground > ON_STRUCTURE) return cursor.y;
+    return ground + this.elevationOffset;
+  }
+
   /** 現在のカーソル位置から、接続先を含めた到達点を決める。 */
   private resolveTarget(): Target {
     const cursor = this.cursor!;
     const cls = this.cls;
-    const free = new Vector3(
-      cursor.x,
-      this.field.heightAt(cursor.x, cursor.z) + this.elevationOffset,
-      cursor.z,
-    );
+    const free = new Vector3(cursor.x, this.workingY(cursor), cursor.z);
+    const height = { y: free.y, tolerance: SNAP_HEIGHT };
 
     if (this.modifiers.noSnap) return { anchor: { pos: free }, snap: 'none', marker: null };
 
     // 候補を集めて、カーソルからいちばん近い所へ寄せる。ノードの近くでは
     // ノードに、路肩の外では平行の位置に付く、という素直な決まりになる。
+    // どの候補も「今働いている高さのあたり」にあるものだけを見る。
     const candidates: (Target & { snap: SnapMarker['kind']; distance: number })[] = [];
 
     const nodeSnapRadius = Math.max(8, cls.halfWidth * 1.4);
-    const node = this.network.findNodeNear(cursor, nodeSnapRadius);
+    const node = this.network.findNodeNear(cursor, nodeSnapRadius, height);
     if (node && this.canJoin(node)) {
       candidates.push({
         anchor: anchorFromNode(this.network, node, cls),
@@ -233,7 +269,7 @@ export class BuildTool {
       });
     }
 
-    const onSegment = this.network.findSegmentNear(cursor, cls.halfWidth + 3);
+    const onSegment = this.network.findSegmentNear(cursor, cls.halfWidth + 3, height);
     if (onSegment) {
       const other = this.network.classOf(this.network.getSegment(onSegment.segment));
       // 種別が違う場合は交差 (踏切・立体交差) にしたいのでスナップしない。
@@ -263,7 +299,7 @@ export class BuildTool {
 
     // 枝の上でなくても、交差点の面の中を指していればその交差点に繋ぐ
     // (面の隅を指したときや、面が広い大通りの交差点のため)。
-    const inside = this.junctionUnder(cursor);
+    const inside = this.junctionUnder(cursor, free.y);
     if (inside) {
       candidates.push({
         anchor: anchorFromNode(this.network, inside.node, cls),
@@ -365,9 +401,10 @@ export class BuildTool {
   }
 
   /** カーソルが交差点の面の中にあれば、その交差点のノード。 */
-  private junctionUnder(cursor: Vector3): { node: NetNode; distance: number } | null {
+  private junctionUnder(cursor: Vector3, y: number): { node: NetNode; distance: number } | null {
     let best: { node: NetNode; distance: number } | null = null;
     for (const node of this.network.nodes.values()) {
+      if (Math.abs(node.pos.y - y) > SNAP_HEIGHT) continue;
       const distance = Math.hypot(node.pos.x - cursor.x, node.pos.z - cursor.z);
       if (distance > 60 || (best && distance >= best.distance)) continue;
       if (!this.canJoin(node)) continue;
@@ -380,7 +417,12 @@ export class BuildTool {
   /** 平行に敷ける基準の線形を探す (無効化されていれば null)。 */
   private findParallel(at: Vector3, direction?: Vector2): ParallelReference | null {
     if (!this.parallelSnap || this.modifiers.noSnap) return null;
-    return findParallelReference(this.network, this.cls, at, { direction });
+    // 基準にするのも「今働いている高さのあたり」の線形だけ。頭上の高架に
+    // 平行して地面の上に引く、といったことにならない。
+    return findParallelReference(this.network, this.cls, at, {
+      direction,
+      heightTolerance: SNAP_HEIGHT,
+    });
   }
 
   private refreshPreview(): void {
