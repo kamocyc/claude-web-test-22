@@ -319,15 +319,35 @@ export class Network {
       const al = this.alignmentOf(seg.id);
       const L = al.length;
       const steps = Math.max(4, Math.ceil(L / 2));
+      let localS = 0;
+      let localDist = Infinity;
       for (let i = 0; i <= steps; i++) {
         const s = (i / steps) * L;
         const q = al.horizontal.pointAt(s);
         const d = q.distanceToSquared(p);
-        if (d < bestDist) {
-          bestDist = d;
-          const sample = al.sampleAt(s);
-          best = { segment: seg.id, s, pos: sample.pos, dir: sample.forwardXZ };
+        if (d < localDist) {
+          localDist = d;
+          localS = s;
         }
+      }
+      // 2 m 刻みの粗探索だけでは、クリック位置が線路上でも最大 1 m ずれる。
+      // 最良点の前後を2段階で詰め、分岐の接点を実際のマウス位置へ合わせる。
+      let span = L / steps;
+      for (let pass = 0; pass < 2; pass++) {
+        for (let i = -4; i <= 4; i++) {
+          const s = clampStation(localS + (span * i) / 4, L);
+          const d = al.horizontal.pointAt(s).distanceToSquared(p);
+          if (d < localDist) {
+            localDist = d;
+            localS = s;
+          }
+        }
+        span /= 4;
+      }
+      if (localDist < bestDist) {
+        bestDist = localDist;
+        const sample = al.sampleAt(localS);
+        best = { segment: seg.id, s: localS, pos: sample.pos, dir: sample.forwardXZ };
       }
     }
     return best;
@@ -360,4 +380,8 @@ export class Network {
   static branchNormal(branch: Branch): Vector2 {
     return perp(branch.dir);
   }
+}
+
+function clampStation(s: number, length: number): number {
+  return s < 0 ? 0 : s > length ? length : s;
 }

@@ -23,12 +23,17 @@ import {
   type ParallelReference,
 } from '../network/parallel';
 import { checkPlacement, junctionReach } from '../network/rules';
+import {
+  placeScissorsCrossover,
+  scissorsPlanAt,
+  type ScissorsPlan,
+} from '../network/scissors';
 import { evaluateAlignment, type SegmentDiagnostics } from '../network/validation';
 import { createPreviewMaterial, setPreviewBlocked } from '../render/materials';
 import { SnapView, type SnapKind, type SnapMarker } from '../render/snapView';
 import type { Heightfield } from '../terrain/heightfield';
 
-export type ToolMode = 'build' | 'bulldoze' | 'inspect';
+export type ToolMode = 'build' | 'scissors' | 'bulldoze' | 'inspect';
 
 export interface CursorModifiers {
   /** Shift: 直線・角度スナップ。 */
@@ -105,6 +110,8 @@ export class BuildTool {
   private parallel: ParallelReference | null = null;
   /** 平行スナップで組み立てた線形 (プレビューと同じもの)。 */
   private parallelAlignmentPreview: Alignment | null = null;
+  /** シーサスクロッシングの一括施工プレビュー。 */
+  private scissorsPlan: ScissorsPlan | null = null;
 
   constructor(
     private readonly network: Network,
@@ -154,6 +161,7 @@ export class BuildTool {
     this.parallelAlignmentPreview = null;
     this.anchorMarker = null;
     this.showMarkers([]);
+    this.scissorsPlan = null;
     this.updatePreviewMesh();
   }
 
@@ -166,6 +174,8 @@ export class BuildTool {
     if (!cursor) {
       this.preview = null;
       this.showMarkers(this.anchorMarker ? [this.anchorMarker] : []);
+      this.scissorsPlan = null;
+      if (this.mode === 'scissors') this.blockers = [];
       this.updatePreviewMesh();
       return;
     }
@@ -173,6 +183,18 @@ export class BuildTool {
     if (this.mode === 'bulldoze' || this.mode === 'inspect') {
       const hit = this.network.findSegmentNear(cursor, 12);
       this.hoverSegment = hit?.segment ?? null;
+      this.preview = null;
+      this.showMarkers([]);
+      this.updatePreviewMesh();
+      return;
+    }
+
+    if (this.mode === 'scissors') {
+      const result = scissorsPlanAt(this.network, cursor);
+      this.scissorsPlan = result.plan;
+      this.hoverSegment = result.hoverSegment;
+      this.blockers = result.blockers;
+      this.snapKind = result.plan ? 'scissors' : 'none';
       this.preview = null;
       this.showMarkers([]);
       this.updatePreviewMesh();
@@ -388,7 +410,7 @@ export class BuildTool {
     }
 
     this.endAnchor = end;
-    this.preview = computePlacement(this.anchor, end.pos, {
+    this.preview = computePlacement(this.anchor, end, {
       straight: this.modifiers.straight,
       cls: this.cls,
     });
@@ -485,7 +507,16 @@ export class BuildTool {
   private updatePreviewMesh(): void {
     const mb = new MeshBuilder();
     const preview = this.preview;
-    if (preview && this.anchor) {
+    if (this.scissorsPlan) {
+      const cls = getClass(this.scissorsPlan.classId);
+      for (const connection of this.scissorsPlan.connections) {
+        buildRibbon(mb, connection.alignment.sample(2), profileFor(cls), {
+          skirt: false,
+          cls,
+        });
+      }
+      this.lastDiagnostics = null;
+    } else if (preview && this.anchor) {
       const cls = this.cls;
       const alignment = this.previewAlignment(preview);
       this.lastDiagnostics = evaluateAlignment(alignment, cls);
@@ -499,7 +530,7 @@ export class BuildTool {
         field: this.field,
       }).blockers;
       buildRibbon(mb, alignment.sample(2), profileFor(cls), { skirt: false, cls });
-    } else {
+    } else if (this.mode !== 'scissors') {
       this.lastDiagnostics = null;
       this.blockers = [];
     }
@@ -523,6 +554,16 @@ export class BuildTool {
       return;
     }
     if (this.mode === 'inspect') return;
+    if (this.mode === 'scissors') {
+      if (!this.scissorsPlan || this.blockers.length > 0) return;
+      placeScissorsCrossover(this.network, this.scissorsPlan);
+      this.scissorsPlan = null;
+      this.preview = null;
+      this.blockers = [];
+      this.onChanged();
+      this.update(this.cursor, this.modifiers);
+      return;
+    }
 
     const target = this.resolveTarget();
     if (!this.anchor) {
@@ -579,20 +620,30 @@ export class BuildTool {
 
   status(): ToolStatus {
     const preview = this.preview;
-    const length = preview ? preview.horizontal.length : 0;
+    const length = this.scissorsPlan?.length ?? (preview ? preview.horizontal.length : 0);
     return {
       mode: this.mode,
       classId: this.classId,
       elevation: this.elevationOffset,
-      drawing: this.anchor !== null,
+      drawing: this.anchor !== null || this.scissorsPlan !== null,
       length,
-      radius: preview ? preview.radius : Infinity,
-      grade: preview ? preview.grade : 0,
+      radius: this.scissorsPlan
+        ? Math.min(...this.scissorsPlan.connections.map((item) => item.preview.radius))
+        : preview
+          ? preview.radius
+          : Infinity,
+      grade: this.scissorsPlan
+        ? Math.max(...this.scissorsPlan.connections.map((item) => item.preview.grade))
+        : preview
+          ? preview.grade
+          : 0,
       diagnostics: this.lastDiagnostics,
       snap: this.snapKind,
       markers: this.markers,
       hoverSegment: this.hoverSegment,
-      cost: length * this.cls.costPerMeter,
+      cost:
+        length *
+        (this.scissorsPlan ? getClass(this.scissorsPlan.classId).costPerMeter : this.cls.costPerMeter),
       blockers: this.blockers,
       parallelSnap: this.parallelSnap,
       parallelTo: this.parallel?.segment ?? null,

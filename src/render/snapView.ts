@@ -19,7 +19,7 @@ import { MeshBuilder, UP } from '../core/meshbuilder';
  * 地形や舗装に隠れると意味がないので、深度テストを切って常に手前に描く。
  */
 
-export type SnapKind = 'none' | 'node' | 'segment' | 'parallel';
+export type SnapKind = 'none' | 'node' | 'segment' | 'parallel' | 'scissors';
 
 export interface SnapMarker {
   kind: 'node' | 'segment' | 'parallel';

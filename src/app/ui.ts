@@ -1,4 +1,4 @@
-import { NETWORK_CLASSES } from '../network/classes';
+import { NETWORK_CLASSES, getClass } from '../network/classes';
 import { viewUniforms } from '../render/materials';
 import type { BuildResult } from '../render/worldBuilder';
 import type { ToolMode, ToolStatus } from './buildTool';
@@ -47,6 +47,7 @@ export class Ui {
     const modes = el('div', 'row');
     for (const [mode, label, hint] of [
       ['build', '敷設', 'B'],
+      ['scissors', 'シーサス', 'C'],
       ['bulldoze', '撤去', 'X'],
       ['inspect', '確認', 'V'],
     ] as [ToolMode, string, string][]) {
@@ -163,6 +164,7 @@ export class Ui {
       '<b>左クリック</b> 始点 → もう一度で確定 (続けて連結)',
       '<b>右クリック / Esc</b> 中断',
       '<b>Shift</b> 直線・15° スナップ / <b>Ctrl</b> スナップ解除',
+      '<b>C</b> 平行線路へシーサスクロッシングを一括敷設',
       '<b>右ドラッグ</b> 視点移動 / <b>ホイール</b> 拡大縮小',
     ]
       .map((line) => `<div>${line}</div>`)
@@ -202,7 +204,14 @@ export class Ui {
       rows.push(['勾配', `${(status.grade * 100).toFixed(2)} %`]);
       rows.push(['概算', `¥${Math.round(status.cost).toLocaleString('ja-JP')}`]);
     } else {
-      rows.push(['操作', status.mode === 'build' ? 'クリックで始点を指定' : '対象をクリック']);
+      rows.push([
+        '操作',
+        status.mode === 'build'
+          ? 'クリックで始点を指定'
+          : status.mode === 'scissors'
+            ? '平行線路上で位置を指定'
+            : '対象をクリック',
+      ]);
     }
     if (status.parallelTo !== null) rows.push(['平行', `線形 #${status.parallelTo} に沿う`]);
     rows.push([
@@ -210,9 +219,13 @@ export class Ui {
       status.snap === 'node'
         ? '交差点・端点に接続'
         : status.snap === 'segment'
-          ? '既存線形に取り付き'
+          ? getClass(status.classId).kind === 'rail'
+            ? '分岐接続 (接線)'
+            : '既存線形に取り付き'
           : status.snap === 'parallel'
             ? '平行'
+            : status.snap === 'scissors'
+              ? 'シーサスクロッシング'
             : 'なし',
     ]);
 

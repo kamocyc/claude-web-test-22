@@ -1,5 +1,5 @@
 import { Vector2, Vector3 } from 'three';
-import { HorizontalCurve, arcFromTangent, type XZ } from '../core/curve';
+import { HorizontalCurve, arcFromTangent, curveFromTangents, type XZ } from '../core/curve';
 import { DEG, clamp } from '../core/units';
 import type { NetworkClass } from './classes';
 import type { Network, NetNode, NodeId, SegmentId } from './network';
@@ -17,6 +17,8 @@ export interface Anchor {
   split?: { segment: SegmentId; s: number };
   /** 接続先から引き継ぐ進行方向 (この向きに接線を合わせる)。 */
   tangent?: Vector2;
+  /** セグメント途中のように、接線の正逆どちらへも出入りできる。 */
+  bidirectional?: boolean;
   /** 接続先から引き継ぐ縦断勾配。 */
   grade?: number;
 }
@@ -41,38 +43,76 @@ export interface PlacementPreview {
  */
 export function computePlacement(
   anchor: Anchor,
-  target: Vector3,
+  target: Vector3 | Anchor,
   options: { straight: boolean; cls?: NetworkClass },
 ): PlacementPreview {
+  const destination: Anchor = target instanceof Vector3 ? { pos: target } : target;
   const a: XZ = new Vector2(anchor.pos.x, anchor.pos.z);
-  const b: XZ = new Vector2(target.x, target.z);
+  const b: XZ = new Vector2(destination.pos.x, destination.pos.z);
+  const chord = b.clone().sub(a);
+
+  // セグメント途中はどちら向きにも分岐できる。カーソル側を向く接線を選ぶ
+  // ことで、クリック位置そのものを接点にした分岐を最初のプレビューから出す。
+  let startDirection = anchor.tangent?.clone();
+  let startSign = 1;
+  if (startDirection && anchor.bidirectional && startDirection.dot(chord) < 0) {
+    startDirection.negate();
+    startSign = -1;
+  }
+
+  // 終点アンカーの tangent は「そこから先へ延長するときの向き」。到着側では
+  // 逆向きが線形の終端接線になる。途中接続なら、弦から遠ざかる向きを選べる。
+  let endOutward = destination.tangent?.clone();
+  let endSign = 1;
+  if (endOutward && destination.bidirectional && endOutward.dot(chord) > 0) {
+    endOutward.negate();
+    endSign = -1;
+  }
+  const endDirection = endOutward?.clone().negate();
 
   let horizontal: HorizontalCurve;
   let endTangent: Vector2;
   let radius = Infinity;
 
-  if (options.straight || !anchor.tangent) {
+  if (options.straight || (!startDirection && !endDirection)) {
     horizontal = HorizontalCurve.straight(a, b);
     endTangent = b.clone().sub(a);
-    if (endTangent.lengthSq() < 1e-9) endTangent = anchor.tangent?.clone() ?? new Vector2(1, 0);
+    if (endTangent.lengthSq() < 1e-9) endTangent = startDirection ?? new Vector2(1, 0);
     endTangent.normalize();
-  } else {
-    const arc = arcFromTangent(a, anchor.tangent, b);
+  } else if (startDirection && endDirection) {
+    horizontal = curveFromTangents(a, startDirection, b, endDirection);
+    endTangent = horizontal.tangentAt(horizontal.length);
+    radius = horizontal.extremeCurvature(48).minRadius;
+  } else if (startDirection) {
+    const arc = arcFromTangent(a, startDirection, b);
     horizontal = arc.curve;
     endTangent = arc.endTangent;
+    radius = arc.radius;
+  } else {
+    // 終点から逆向きに円弧を解いて反転すれば、始点が自由でも終点では
+    // 既存線形へ接する。端点へ繋ぐ場合も確定後に形が変わらない。
+    const arc = arcFromTangent(b, endOutward!, a);
+    horizontal = new HorizontalCurve(arc.curve.p1, arc.curve.c1, arc.curve.c0, arc.curve.p0);
+    endTangent = horizontal.tangentAt(horizontal.length);
     radius = arc.radius;
   }
 
   const length = Math.max(horizontal.length, 1e-3);
   const endXZ = horizontal.p1;
-  const end = new Vector3(endXZ.x, target.y, endXZ.y);
+  const end = new Vector3(endXZ.x, destination.pos.y, endXZ.y);
 
   const average = (end.y - anchor.pos.y) / length;
-  const { startGrade, endGrade } = solveVerticalTangents(
-    anchor.grade ?? average,
+  const maximum = options.cls?.maxGrade ?? 0.35;
+  const solved = solveVerticalTangents(
+    (anchor.grade ?? average) * startSign,
     average,
-    options.cls?.maxGrade ?? 0.35,
+    maximum,
   );
+  const startGrade = solved.startGrade;
+  const endGrade =
+    destination.grade === undefined
+      ? solved.endGrade
+      : clamp(-destination.grade * endSign, -maximum, maximum);
 
   return {
     horizontal,
@@ -405,9 +445,19 @@ export function anchorFromNode(network: Network, node: NetNode, cls: NetworkClas
 
 /**
  * セグメント途中に接続する場合のアンカー。
- * T 字の取り付きは向きを自由に決めたいので、接線は引き継がない。
+ * 線路上のクリック位置を接点にして分岐できるよう、接線と勾配を引き継ぐ。
+ * 正逆どちらへ分かれるかは次のカーソル位置から `computePlacement` が選ぶ。
  */
 export function anchorFromSegment(network: Network, segment: SegmentId, s: number): Anchor {
   const sample = network.alignmentOf(segment).sampleAt(s);
-  return { pos: sample.pos.clone(), split: { segment, s } };
+  if (network.classOf(network.getSegment(segment)).kind !== 'rail') {
+    return { pos: sample.pos.clone(), split: { segment, s } };
+  }
+  return {
+    pos: sample.pos.clone(),
+    split: { segment, s },
+    tangent: sample.forwardXZ.clone(),
+    grade: sample.grade,
+    bidirectional: true,
+  };
 }
