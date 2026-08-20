@@ -49,6 +49,42 @@ export class VerticalProfile {
     return (d00 * this.y0 + d01 * this.y1) / L + d10 * this.m0 + d11 * this.m1;
   }
 
+  /**
+   * 弧長 s における 2 階微分 d²y/ds²。
+   *
+   * 3 次エルミートなので `t` について線形。つまり極値は必ず両端にあり、
+   * 縦曲線の一番きつい所を探すのにサンプリングは要らない。
+   */
+  secondDerivativeAt(s: number): number {
+    const L = this.length;
+    if (L <= 1e-6) return 0;
+    const t = Math.max(0, Math.min(1, s / L));
+    const d2 =
+      (12 * t - 6) * this.y0 +
+      (6 * t - 4) * this.m0 * L +
+      (-12 * t + 6) * this.y1 +
+      (6 * t - 2) * this.m1 * L;
+    return d2 / (L * L);
+  }
+
+  /**
+   * 区間内で一番きつい縦曲線の半径 [m]。真っ直ぐなら `Infinity`。
+   *
+   * 端点勾配を `m1 = 平均勾配`, `m0 = 平均勾配 + d` にした標準の形では
+   * `L / (4|d|)` になる。敷設時のクランプはその式を直接使っている。
+   */
+  minVerticalRadius(): number {
+    const L = this.length;
+    if (L <= 1e-6) return Infinity;
+    let worst = 0;
+    for (const s of [0, L]) {
+      const g = this.gradeAt(s);
+      const k = Math.abs(this.secondDerivativeAt(s)) / Math.pow(1 + g * g, 1.5);
+      if (k > worst) worst = k;
+    }
+    return worst < 1e-9 ? Infinity : 1 / worst;
+  }
+
   /** 区間内の最大勾配 (絶対値)。 */
   maxGrade(samples = 24): number {
     let m = 0;

@@ -51,6 +51,15 @@ export interface NetworkClass {
    * 対して敷地が狭く、実物どおりの勾配では思うように繋げられないため。
    */
   maxGrade: number;
+  /**
+   * 規格最小縦曲線半径 [m]。勾配をどれだけ急に変えてよいかの上限。
+   *
+   * 実物の線路は 3000 m 以上だが、この縮尺 (区間長 40〜200 m) では
+   * 1 区間で勾配を 1% も変えられなくなり縦断が真っ平らになる。実質
+   * 「1 区間で変えてよい勾配の量」として較正した値を入れている。
+   * 標準の縦断 (終点勾配 = 平均勾配) では `|Δ勾配| ≤ L / (4·この値)`。
+   */
+  minVerticalRadius: number;
   /** 交差点の隅角部の丸め半径 [m]。 */
   cornerRadius: number;
   /** 設計速度 [km/h]。HUD 表示と規格の目安。 */
@@ -81,6 +90,7 @@ function road(opts: {
   divided?: boolean;
   minRadius: number;
   maxGrade: number;
+  minVerticalRadius?: number;
   cornerRadius: number;
   designSpeed: number;
   signalCapable: boolean;
@@ -114,6 +124,7 @@ function road(opts: {
     tracks: [],
     minRadius: opts.minRadius,
     maxGrade: opts.maxGrade,
+    minVerticalRadius: opts.minVerticalRadius ?? Infinity,
     cornerRadius: opts.cornerRadius,
     designSpeed: opts.designSpeed,
     signalCapable: opts.signalCapable,
@@ -134,6 +145,7 @@ function rail(opts: {
   shoulder: number;
   minRadius: number;
   maxGrade: number;
+  minVerticalRadius?: number;
   designSpeed: number;
   costPerMeter: number;
 }): NetworkClass {
@@ -151,6 +163,7 @@ function rail(opts: {
     tracks: [0],
     minRadius: opts.minRadius,
     maxGrade: opts.maxGrade,
+    minVerticalRadius: opts.minVerticalRadius ?? Infinity,
     cornerRadius: 0,
     designSpeed: opts.designSpeed,
     signalCapable: false,

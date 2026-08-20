@@ -6,6 +6,7 @@ import {
   reversedCurve,
   type XZ,
 } from '../core/curve';
+import { VerticalProfile } from '../core/profile';
 import { DEG, clamp } from '../core/units';
 import type { NetworkClass } from './classes';
 import type { Network, NetNode, NodeId, SegmentId } from './network';
@@ -126,7 +127,7 @@ export function computePlacement(
     startGrade,
     endGrade,
     radius,
-    grade: profileMaxGrade(startGrade, endGrade, average),
+    grade: profileMaxGrade(startGrade, endGrade, average, length),
     endTangent,
   };
 }
@@ -156,10 +157,16 @@ export function solveVerticalTangents(
 }
 
 /** 端点勾配と平均勾配から、区間内の最大勾配 (絶対値) を求める。 */
-function profileMaxGrade(startGrade: number, endGrade: number, average: number): number {
-  void endGrade;
-  const d = startGrade - average;
-  return Math.max(Math.abs(average + d), Math.abs(average - d / 3));
+function profileMaxGrade(
+  startGrade: number,
+  endGrade: number,
+  average: number,
+  length: number,
+): number {
+  // 縦断そのものを規則と同じサンプラで測る。閉じた式 (値域 [avg-d/3, avg+d])
+  // は終点勾配が平均勾配のときしか正しくないが、線路の途中に取り付いた
+  // ときは終点勾配を接続先から引き継ぐので、その前提が崩れる。
+  return new VerticalProfile(0, average * length, startGrade, endGrade, length).maxGrade(32);
 }
 
 /** アンカーを実際のノードに解決する (必要ならセグメントを分割する)。 */
