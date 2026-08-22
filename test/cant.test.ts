@@ -188,6 +188,53 @@ describe('踏切とカント', () => {
   });
 });
 
+describe('車両とカント', () => {
+  /**
+   * 走る車両は「描画に使った路面」と同じ傾きを持たなければならない。
+   * 位置だけを路面に合わせて姿勢を水平のままにすると、カントの付いた
+   * 曲線で車体だけが直立し、道床から浮いた所と潜った所ができる。
+   */
+  it('車線の姿勢が、その点のカントをそのまま持つ', () => {
+    const scene = turnoutOnCurve();
+    const { network, world } = scene;
+    let worst = 0;
+    let tilted = 0;
+    let checked = 0;
+    for (const lane of world.laneGraph.lanes) {
+      if (lane.kind !== 'segment' || lane.vehicleKind !== 'train') continue;
+      for (let i = 0; i <= 40; i++) {
+        const pose = lane.path.poseAt((i / 40) * lane.path.length);
+        const hit = network.findSegmentNear(pose.pos, 8);
+        if (!hit) continue;
+        const sample = network.alignmentOf(hit.segment).sampleAt(hit.s);
+        // 弧長の向きが逆の車線では、「右」も逆なので符号が反転する。
+        const forward = sample.forward.dot(pose.dir) > 0;
+        const want = world.cantAt(hit.segment, hit.s) * (forward ? 1 : -1);
+        worst = Math.max(worst, Math.abs(pose.roll - want));
+        if (Math.abs(pose.roll) > 0.01) tilted++;
+        checked++;
+      }
+    }
+    // 空振り防止: 実際に傾いている点が十分あること。
+    expect(checked).toBeGreaterThan(100);
+    expect(tilted).toBeGreaterThan(20);
+    expect(worst).toBeLessThan(3e-3);
+  });
+
+  it('交差点の中の進路は水平 (面がねじれない所を走る)', () => {
+    const scene = turnoutOnCurve();
+    let connectors = 0;
+    for (const lane of scene.world.laneGraph.lanes) {
+      if (lane.kind !== 'connector') continue;
+      for (let i = 0; i <= 4; i++) {
+        expect(lane.path.poseAt((i / 4) * lane.path.length).roll).toBe(0);
+      }
+      connectors++;
+    }
+    expect(connectors).toBeGreaterThan(0);
+  });
+});
+
 describe('分岐した先の重なりとカント', () => {
   /**
    * 曲線の途中をクリックして分けた分岐器。分岐側は本線の接線から出るので、

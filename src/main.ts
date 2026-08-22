@@ -293,7 +293,7 @@ function frame(): void {
   world.animate(time, dt);
   // 乗車モードのカメラは、車両を進めたあとに置く (1 フレーム遅れないように)。
   const riding = ride.update(world.traffic.vehicles, dt);
-  if (riding) viewport.placeEye(riding.pose.eye, riding.pose.forward);
+  if (riding) viewport.placeEye(riding.pose.eye, riding.pose.forward, riding.pose.up);
 
   // 乗車中は敷設のプレビューを出さない (カーソルは画面外を指している)。
   tool.update(riding ? null : cursor, modifiers);

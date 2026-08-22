@@ -23,6 +23,8 @@ export interface BodySize {
 export interface BodyPose {
   pos: Vector3;
   dir: Vector3;
+  /** 路面の横断勾配 (右へ 1 m あたりの上がり)。カントで車体が傾く。 */
+  roll: number;
 }
 
 export interface Vehicle {

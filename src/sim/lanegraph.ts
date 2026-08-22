@@ -18,10 +18,18 @@ import type { Network, NodeId, SegmentId } from '../network/network';
 
 export type VehicleKind = 'car' | 'train';
 
+/** 走行経路上の 1 点。位置・進行方向と、路面の横断勾配 (右が高いと正)。 */
+export interface LanePose {
+  pos: Vector3;
+  dir: Vector3;
+  /** 路面の横断勾配 (右へ 1 m あたりの上がり)。カント・踏切の傾き。 */
+  roll: number;
+}
+
 /** 走行経路 1 本。弧長で位置と向きを引ける。 */
 export interface LanePath {
   readonly length: number;
-  poseAt(s: number): { pos: Vector3; dir: Vector3 };
+  poseAt(s: number): LanePose;
 }
 
 export interface GraphLane {
@@ -90,11 +98,11 @@ class SegmentLanePath implements LanePath {
     this.length = Math.max(0, s1 - s0);
   }
 
-  poseAt(d: number): { pos: Vector3; dir: Vector3 } {
+  poseAt(d: number): LanePose {
     const along = clamp(d, 0, this.length);
     const s = this.forward ? this.s0 + along : this.s1 - along;
     const sample = this.alignment.sampleAt(s);
-    // 路面と同じ補正を通す。踏切の前後で舗装は 0.8 m ほど上下する。
+    // 路面と同じ補正を通す。踏切の前後で舗装は上下し、曲線ではカントで傾く。
     const blend = this.surface?.(this.segment, s, sample.pos.y) ?? { dy: 0, roll: 0 };
     return {
       pos: new Vector3(
@@ -103,6 +111,8 @@ class SegmentLanePath implements LanePath {
         sample.pos.z + sample.right.z * this.offset,
       ),
       dir: this.forward ? sample.forward.clone() : sample.forward.clone().negate(),
+      // 弧長の向きが逆なら「右」も逆になるので、横断勾配の符号も反転する。
+      roll: this.forward ? blend.roll : -blend.roll,
     };
   }
 }
@@ -132,12 +142,13 @@ class ConnectorPath implements LanePath {
     this.length = Math.max(0.5, horizontal.length);
   }
 
-  poseAt(d: number): { pos: Vector3; dir: Vector3 } {
+  poseAt(d: number): LanePose {
     const sample = this.alignment.sampleAt(clamp(d, 0, this.alignment.length));
     const pos = sample.pos.clone();
     const floor = this.floor?.(pos.x, pos.z);
     if (floor !== null && floor !== undefined && floor > pos.y) pos.y = floor;
-    return { pos, dir: sample.forward.clone() };
+    // 交差点の面は水平断面で組む (カントは面の手前で 0 に戻してある)。
+    return { pos, dir: sample.forward.clone(), roll: 0 };
   }
 }
 

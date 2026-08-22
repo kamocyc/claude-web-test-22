@@ -856,6 +856,8 @@ describe('探索', () => {
       ['交差点の 12m 先', junctionCrossingScene(12)],
       ['曲線', curvedCrossingScene(0)],
       ['ノードの 3m 脇', nodeCrossingScene(3)],
+      ['斜め 30° 9%', crossingScene({ angle: 30, roadGrade: 0.09, roadClass: 'road_small' })],
+      ['斜め 45° 12%', crossingScene({ angle: 45, roadGrade: 0.12, roadClass: 'road_small' })],
     ];
     for (const [name, scene] of scenes) {
       const r = roadProfileThroughCrossings(scene);
@@ -1004,6 +1006,98 @@ function buildableBlockers(scene: Scene): string[] {
   return out;
 }
 
+/**
+ * 踏切の前後の路面を、**世界座標で端から端まで**舐めて調べる。
+ *
+ * 区間ごとの弧長で見ると、すり付けが隣の区間へ渡っている所を見落とす
+ * (補正の届く範囲は区間の長さと関係がない)。道路がまっすぐな配置で、
+ * 交点から前後へ一直線に舐めれば、区間の継ぎ目もそのまま通る。
+ */
+function roadTopProfile(
+  scene: Scene,
+  reach: number,
+  step = 0.5,
+): { gaps: string[]; maxGrade: number; samples: number } {
+  const crossing = levelCrossings(scene)[0];
+  const al = scene.network.alignmentOf(crossing.roadSegment);
+  const c = al.sampleAt(crossing.sRoad);
+  const dir = c.forwardXZ;
+  const surfaces = new SurfaceIndex(scene);
+  const gaps: string[] = [];
+  let prev: number | null = null;
+  let maxGrade = 0;
+  let samples = 0;
+  for (let d = -reach; d <= reach + 1e-6; d += step) {
+    const x = c.pos.x + dir.x * d;
+    const z = c.pos.z + dir.y * d;
+    // 交点から離れるほど路面は上下する。天井はどんな勾配より高く取る。
+    const top = surfaces.topAt(x, z, c.pos.y + Math.abs(d) * 0.4 + 3);
+    if (top === null) {
+      gaps.push(`d=${d.toFixed(1)}`);
+      prev = null;
+      continue;
+    }
+    if (prev !== null) maxGrade = Math.max(maxGrade, Math.abs(top - prev) / step);
+    prev = top;
+    samples++;
+  }
+  return { gaps, maxGrade, samples };
+}
+
+/**
+ * 短い区間が続く道路が、浅い角度・急な勾配で線路を渡る配置。
+ * すり付けが 1 つ隣の区間では収まらず、その先まで届く。
+ */
+function shortSegmentCrossingScene(roadGrade: number, angleDeg = 30) {
+  const y0 = 40;
+  const a = (angleDeg * Math.PI) / 180;
+  return buildScene(flat(y0), (net, field) => {
+    draw(net, field, 'rail_single', [
+      { x: -300, z: 0, y: y0 },
+      { x: 300, z: 0, y: y0 },
+    ], { straight: true });
+    const pts: Waypoint[] = [];
+    for (let d = -200; d <= 200; d += 25) {
+      pts.push({ x: Math.cos(a) * d, z: Math.sin(a) * d, y: y0 + roadGrade * d });
+    }
+    draw(net, field, 'road_small', pts, { straight: true });
+  });
+}
+
+describe('急な道路が渡る踏切', () => {
+  /**
+   * 線路の面に舗装を合わせるには、道路が急なほど・交差角が浅いほど、
+   * 道路を大きく作り直すことになる。以前はその量に上限を置いて敷設ごと
+   * 止めていたが、すり付けを**変形の大きさに応じて伸ばせば**繋がる。
+   * ここでは繋がっていることを、路面を端から端まで舐めて確かめる。
+   */
+  const cases: [string, () => Scene, number][] = [
+    ['直交 12%', () => crossingScene({ roadGrade: 0.12, roadClass: 'road_small' }), 0.12],
+    ['斜め 45° 12%', () => crossingScene({ angle: 45, roadGrade: 0.12, roadClass: 'road_small' }), 0.12],
+    ['斜め 30° 9%', () => crossingScene({ angle: 30, roadGrade: 0.09, roadClass: 'road_small' }), 0.09],
+    ['斜め 30° 大通り 6%', () => crossingScene({ angle: 30, roadGrade: 0.06, roadClass: 'road_large' }), 0.06],
+    ['斜め 25° 幹線 9%', () => crossingScene({ angle: 25, roadGrade: 0.09, roadClass: 'road_medium' }), 0.09],
+    ['短い区間が続く道路 30° 9%', () => shortSegmentCrossingScene(0.09), 0.09],
+  ];
+
+  it('敷設でき、路面が途切れず、勾配がすり付けのぶんに収まる', () => {
+    for (const [name, make, own] of cases) {
+      const scene = make();
+      expect(levelCrossings(scene).length, `${name}: 踏切ができていない`).toBe(1);
+      expect(buildableBlockers(scene), `${name}: 敷設できない`).toEqual([]);
+      const r = roadTopProfile(scene, 150);
+      // 補正が隣の区間へ渡っていないと、そこで路面が破れる。
+      expect(r.gaps.slice(0, 5), `${name}: 路面が途切れる`).toEqual([]);
+      expect(r.samples, `${name}: 検査点が少なすぎる`).toBeGreaterThan(500);
+      // 路面の勾配は「道路自身 + すり付けのぶん」に収まる。
+      expect(
+        r.maxGrade,
+        `${name}: 路面の勾配が ${(r.maxGrade * 100).toFixed(1)}%`,
+      ).toBeLessThan(own + 0.07);
+    }
+  }, 120000);
+});
+
 describe('踏切でレールが舗装の上に出ている', () => {
   /**
    * 「敷設できる踏切なら、レールは必ず舗装の上に出ている」ことを、
@@ -1026,6 +1120,10 @@ describe('踏切でレールが舗装の上に出ている', () => {
     for (const rc of ['road_small', 'road_medium', 'road_large', 'road_highway']) {
       cases.push([`${rc} rail3%`, crossingScene({ roadClass: rc, railGrade: 0.03 })]);
     }
+    // すり付けが限界を超える配置 (規則が止める側)。急な道路が浅い角度で
+    // 渡ると、線路の面に合わせるのに道路を作り直すことになる。
+    cases.push(['急坂を浅く渡る', crossingScene({ roadGrade: 0.16, angle: 25, roadClass: 'road_small' })]);
+    cases.push(['広い道を浅く渡る', crossingScene({ roadGrade: 0.1, angle: 25, roadClass: 'road_large' })]);
     for (const dy of [0.2, -0.2]) cases.push([`dy=${dy}`, crossingScene({ dy })]);
     for (const crest of [0.6, -0.6]) cases.push([`railCrest=${crest}`, crossingScene({ railCrest: crest })]);
     for (const crest of [1, -1]) cases.push([`roadCrest=${crest}`, crossingScene({ roadCrest: crest })]);
@@ -1044,12 +1142,15 @@ describe('踏切でレールが舗装の上に出ている', () => {
     const problems: string[] = [];
     let buildable = 0;
     let blocked = 0;
+    /** すり付けの限界で止まった配置。 */
+    let liftBlocked = 0;
     let checked = 0;
     for (const [name, scene] of cases) {
       expect(levelCrossings(scene).length, `${name}: 踏切ができていない`).toBeGreaterThan(0);
       const blockers = buildableBlockers(scene);
       if (blockers.length > 0) {
         blocked++;
+        if (blockers.some((m) => m.includes('踏切にできません'))) liftBlocked++;
         continue;
       }
       buildable++;
@@ -1060,6 +1161,7 @@ describe('踏切でレールが舗装の上に出ている', () => {
     // 空振り防止: 引ける配置が十分あり、実際に測れていること。
     expect(buildable, '引ける配置が少なすぎる').toBeGreaterThan(20);
     expect(blocked, '規則が止める配置が 1 つもない (規則が効いていない)').toBeGreaterThan(2);
+    expect(liftBlocked, 'すり付けの限界で止まる配置が 1 つもない').toBeGreaterThan(0);
     expect(checked, '舗装の上の検査点が少なすぎる').toBeGreaterThan(2000);
     expect(problems.join('\n')).toBe('');
   }, 300000);

@@ -29,6 +29,13 @@ export interface RidePose {
   eye: Vector3;
   /** 見ている向き (単位ベクトル)。 */
   forward: Vector3;
+  /**
+   * 頭の上の向き (単位ベクトル)。
+   *
+   * カントの付いた曲線では車体ごと傾くので、鉛直ではない。車体と同じだけ
+   * 傾けないと、窓の外だけが傾いて見える。
+   */
+  up: Vector3;
 }
 
 /** 乗車中の状態。表示用。 */
@@ -90,18 +97,20 @@ export function cabPose(vehicle: Vehicle, look: LookAngles = { yaw: 0, pitch: 0 
   const body = vehicle.bodies[0];
   const dir =
     body && body.dir.lengthSq() > 1e-8 ? body.dir.clone().normalize() : new Vector3(0, 0, 1);
-  const basis = bodyQuaternion(dir);
+  // 車体と同じ姿勢 (カントで傾いた基底) の上に運転台を置く。
+  const basis = bodyQuaternion(dir, body?.roll ?? 0);
   const { ahead, up } = cabOffset(vehicle);
+  const head = new Vector3(0, 1, 0).applyQuaternion(basis);
   const eye = (body ? body.pos.clone() : new Vector3())
     .addScaledVector(dir, ahead)
-    .addScaledVector(new Vector3(0, 1, 0).applyQuaternion(basis), up);
+    .addScaledVector(head, up);
 
   const pitch = clamp(look.pitch, -MAX_PITCH, MAX_PITCH);
   const cp = Math.cos(pitch);
   const forward = new Vector3(cp * Math.sin(look.yaw), Math.sin(pitch), cp * Math.cos(look.yaw))
     .applyQuaternion(basis)
     .normalize();
-  return { eye, forward };
+  return { eye, forward, up: head };
 }
 
 /** その点にいちばん近い車両。1 両も走っていなければ `null`。 */
@@ -135,6 +144,7 @@ export class Ride {
   private readonly look: LookAngles = { yaw: 0, pitch: 0 };
   private readonly eye = new Vector3();
   private readonly forward = new Vector3(0, 0, 1);
+  private readonly up = new Vector3(0, 1, 0);
   /** いちど車両に乗ったか。乗る前・乗り換えた直後は平滑化しない。 */
   private seated = false;
 
@@ -194,7 +204,7 @@ export class Ride {
     }
     if (!vehicle) {
       return {
-        pose: { eye: this.eye.clone(), forward: this.forward.clone() },
+        pose: { eye: this.eye.clone(), forward: this.forward.clone(), up: this.up.clone() },
         vehicle: null,
         kind: null,
         speed: 0,
@@ -207,6 +217,7 @@ export class Ride {
     if (!this.seated || this.eye.distanceTo(target.eye) > SNAP_DISTANCE) {
       this.eye.copy(target.eye);
       this.forward.copy(target.forward);
+      this.up.copy(target.up);
       this.seated = true;
     } else {
       const step = clamp(dt, 0, 0.1);
@@ -214,10 +225,13 @@ export class Ride {
       this.forward.lerp(target.forward, blend(step, DIR_TAU));
       if (this.forward.lengthSq() < 1e-8) this.forward.copy(target.forward);
       this.forward.normalize();
+      this.up.lerp(target.up, blend(step, DIR_TAU));
+      if (this.up.lengthSq() < 1e-8) this.up.copy(target.up);
+      this.up.normalize();
     }
 
     return {
-      pose: { eye: this.eye.clone(), forward: this.forward.clone() },
+      pose: { eye: this.eye.clone(), forward: this.forward.clone(), up: this.up.clone() },
       vehicle,
       kind: vehicle.kind,
       speed: vehicle.speed,

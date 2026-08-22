@@ -138,10 +138,15 @@ export class Viewport {
     this.controls.update();
   }
 
-  /** 一人称視点のカメラを、目の位置と向きから置く。 */
-  placeEye(eye: Vector3, forward: Vector3): void {
+  /**
+   * 一人称視点のカメラを、目の位置・向き・頭の上の向きから置く。
+   *
+   * `up` を渡すのはカントのため。鉛直に固定すると、車体だけが傾いて
+   * 窓の外は水平のまま、という見え方になる。
+   */
+  placeEye(eye: Vector3, forward: Vector3, up: Vector3): void {
     this.camera.position.copy(eye);
-    this.camera.up.set(0, 1, 0);
+    this.camera.up.copy(up);
     this.camera.lookAt(eye.x + forward.x, eye.y + forward.y, eye.z + forward.z);
     // 影のカメラは注視点に追従するので、見ている先を渡しておく。
     this.controls.target.copy(eye).addScaledVector(forward, 40);

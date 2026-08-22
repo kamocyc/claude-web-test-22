@@ -12,6 +12,7 @@ import {
   smoothstep,
 } from '../core/units';
 import {
+  GENTLE_CROSSING_LIFT,
   applySurfaceBlend,
   buildFlangeways,
   buildLevelCrossing,
@@ -304,7 +305,7 @@ export class WorldBuilder {
 
     // 踏切に合わせた道路側の高さ補正をセグメントごとにまとめる。
     // 交差点の断面もこの高さで作る必要があるので、交差点を解く前に用意する。
-    const blends = this.collectCrossingBlends(crossings);
+    const blends = this.collectCrossingBlends(crossings, warnings);
     this.blends = blends;
     // 帯・交差点の取り付き断面・標示・当たり判定が、みな同じ点を通るように
     // 「描画に使う高さの補正」をここ 1 か所から配る。
@@ -542,9 +543,9 @@ export class WorldBuilder {
     // (通れなくなった車線に取り残された車が残り続けるのを防ぐ)。
     // 車が走る高さは、描画に使った路面と同じにする。踏切のまわりで
     // 舗装が上下する分を無視すると、車が路面の下を通ることになる。
-    this.laneGraph = buildLaneGraph(network, junctions, ranges, {
-      surface: (segment, s, y) => surfaceBlendAt(blends.get(segment) ?? [], s, y),
-    });
+    // 走る高さも傾きも、描画に使った路面と同じ (`blendAt`) を見る。踏切の
+    // 上下だけでなくカントも通るので、曲線では車体がカントのぶん傾く。
+    this.laneGraph = buildLaneGraph(network, junctions, ranges, { surface: blendAt });
     this.traffic.reset(this.laneGraph);
     this.vehicleView.clear();
     this.structureRuns = structures;
@@ -775,7 +776,10 @@ export class WorldBuilder {
    * 踏切がセグメントの端の近くにあるときは、ノードを越えて隣のセグメントへも
    * 同じ補正を伝える。そうしないと継ぎ目で帯どうしに段差ができる。
    */
-  private collectCrossingBlends(crossings: Crossing[]): Map<SegmentId, SurfaceBlend[]> {
+  private collectCrossingBlends(
+    crossings: Crossing[],
+    warnings: WorldWarning[],
+  ): Map<SegmentId, SurfaceBlend[]> {
     const network = this.network;
     const blends = new Map<SegmentId, SurfaceBlend[]>();
     const add = (segment: SegmentId, blend: SurfaceBlend): void => {
@@ -794,27 +798,41 @@ export class WorldBuilder {
         this.cantAt(crossing.rail.segment, crossing.rail.s),
       );
       add(blend.segment, blend);
+      if (blend.lift > GENTLE_CROSSING_LIFT) {
+        warnings.push({
+          message:
+            `踏切に合わせて道路を ±${blend.lift.toFixed(1)} m すり付けています ` +
+            '(交差角を大きくするか、道路の勾配を緩めると穏やかになります)。',
+          position: crossing.point.clone(),
+          severity: 'warning',
+        });
+      }
 
       const seg = network.segments.get(blend.segment);
       if (!seg) continue;
       const length = network.alignmentOf(blend.segment).length;
 
-      const spill = (nodeId: NodeId, distance: number): void => {
+      // すり付けは隣のセグメントへはみ出す。区間が短ければその先へも続く
+      // ので、届く範囲まで道路を辿って配る (1 つ隣までで止めると、そこで
+      // 補正が切れて段差になる)。
+      const seen = new Set<SegmentId>([blend.segment]);
+      const spill = (fromId: SegmentId, nodeId: NodeId, distance: number, sign: number): void => {
         if (distance >= blend.halfLength) return;
         const node = network.nodes.get(nodeId);
-        if (!node) return;
-        for (const otherId of node.segments) {
-          if (otherId === blend.segment) continue;
+        const from = network.segments.get(fromId);
+        if (!node || !from) return;
+        for (const otherId of [...node.segments]) {
+          if (seen.has(otherId)) continue;
           const other = network.segments.get(otherId);
           if (!other || network.classOf(other).kind !== 'road') continue;
+          seen.add(otherId);
           // 隣のセグメントから見た踏切の弧長 (範囲外の値になる)。
           const otherAlignment = network.alignmentOf(otherId);
           const startsHere = other.a === nodeId;
           const s = startsHere ? -distance : otherAlignment.length + distance;
           // 2 本が同じノードから同じ向きに出ていれば、弧長の向きは逆。
           // 傾きの符号もそのぶん反転させないと、隣で逆向きに傾く。
-          const reversed = (seg.a === nodeId) === startsHere;
-          const sign = reversed ? -1 : 1;
+          const next = (from.a === nodeId) === startsHere ? -sign : sign;
           spills.push({
             segment: otherId,
             blend: {
@@ -822,14 +840,16 @@ export class WorldBuilder {
               s,
               // 目標面は絶対高さなので、弧長の向きが逆になる分だけ
               // 勾配と横断勾配の符号を反転させればよい。
-              targetSlope: blend.targetSlope * sign,
-              roll: blend.roll * sign,
+              targetSlope: blend.targetSlope * next,
+              roadGrade: blend.roadGrade * next,
+              roll: blend.roll * next,
             },
           });
+          spill(otherId, startsHere ? other.b : other.a, distance + otherAlignment.length, next);
         }
       };
-      spill(seg.a, blend.s);
-      spill(seg.b, length - blend.s);
+      spill(seg.id, seg.a, blend.s, 1);
+      spill(seg.id, seg.b, length - blend.s, 1);
     }
     for (const { segment, blend } of spills) add(segment, blend);
     return blends;

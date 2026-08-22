@@ -43,6 +43,24 @@ describe('車両の姿勢', () => {
     expect(worst.slice(0, 5)).toEqual([]);
   });
 
+  it('横断勾配のぶんだけ、車体が左右に傾く', () => {
+    for (const roll of [-0.07, -0.02, 0, 0.02, 0.07]) {
+      for (let deg = 0; deg < 360; deg += 11) {
+        const rad = (deg * Math.PI) / 180;
+        const dir = new Vector3(Math.sin(rad), 0, Math.cos(rad));
+        const q = bodyQuaternion(dir, roll);
+        const right = RIGHT.clone().applyQuaternion(q);
+        const up = UP.clone().applyQuaternion(q);
+        // 進行方向は傾けても変わらない。
+        expect(FORWARD.clone().applyQuaternion(q).distanceTo(dir)).toBeLessThan(1e-6);
+        // 右へ水平に 1 m 行くと、`roll` だけ上がる (道床の面と平行)。
+        expect(right.y / Math.hypot(right.x, right.z)).toBeCloseTo(roll, 9);
+        // 屋根は上を向いたまま。
+        expect(up.y).toBeGreaterThan(0.99);
+      }
+    }
+  });
+
   it('向きが取れないときも姿勢が壊れない', () => {
     const q = bodyQuaternion(new Vector3(0, 0, 0));
     const up = UP.clone().applyQuaternion(q);

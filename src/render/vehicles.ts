@@ -11,7 +11,7 @@ import {
 } from 'three';
 import type { RGB } from '../build/surface';
 import type { VehicleKind } from '../sim/lanegraph';
-import type { Vehicle } from '../sim/traffic';
+import type { BodyPose, Vehicle } from '../sim/traffic';
 
 /**
  * 走行中の車両の描画。
@@ -42,8 +42,9 @@ export function roofOf(kind: VehicleKind): number {
 const BODY = new BoxGeometry(1, 1, 1);
 const FORWARD = new Vector3(0, 0, 1);
 const UP = new Vector3(0, 1, 0);
-/** 姿勢を組み立てるための使い回しの行列。 */
+/** 姿勢を組み立てるための使い回しの行列と四元数。 */
 const BASIS = new Matrix4();
+const ROLL = new Quaternion();
 
 const glass = new MeshStandardMaterial({ color: 0x1b2228, roughness: 0.25, metalness: 0.4 });
 const tyre = new MeshStandardMaterial({ color: 0x15171a, roughness: 0.9 });
@@ -98,7 +99,7 @@ export class VehicleView {
       const paint = paintFor(vehicle.color);
       for (const pose of vehicle.bodies) {
         const body = this.bodyAt(used++);
-        place(body, vehicle, pose.pos, pose.dir, paint);
+        place(body, vehicle, pose, paint);
       }
     }
     for (let i = used; i < this.pool.length; i++) this.pool[i].object.visible = false;
@@ -130,11 +131,10 @@ export class VehicleView {
 function place(
   body: Body,
   vehicle: Vehicle,
-  pos: Vector3,
-  dir: Vector3,
+  pose: BodyPose,
   paint: MeshStandardMaterial,
 ): void {
-  orient(body.object, pos, dir);
+  orient(body.object, pose);
   const { length, width, height } = vehicle.size;
   const train = vehicle.kind === 'train';
 
@@ -161,14 +161,22 @@ function place(
 }
 
 /**
- * 進行方向から車体の姿勢を作る。勾配のある所では前後に傾く。
+ * 進行方向と路面の横断勾配から車体の姿勢を作る。勾配のある所では前後に、
+ * カント (踏切の傾き) のある所では左右に傾く。
  *
  * 「+Z から進行方向への最短回転」で作ってはいけない。ほぼ -Z へ進むとき
  * (向きが真後ろ) は回転軸が定まらず、勾配のわずかな上下成分だけで軸が X 側
  * へ倒れて、車体が**上下反転**することがある。上向きを固定した基底から
  * 作れば、どの向き・どの勾配でも屋根が上を向く。
+ *
+ * 横断勾配は、その基底を進行方向まわりに回して与える。右が高い (正) なら
+ * 右へ傾く。傾きは勾配 (右へ 1 m あたりの上がり) なので、角度は `atan`。
  */
-export function bodyQuaternion(dir: Vector3, target = new Quaternion()): Quaternion {
+export function bodyQuaternion(
+  dir: Vector3,
+  roll = 0,
+  target = new Quaternion(),
+): Quaternion {
   const forward = dir.lengthSq() < 1e-8 ? FORWARD.clone() : dir.clone().normalize();
   const right = new Vector3().crossVectors(UP, forward);
   if (right.lengthSq() < 1e-10) {
@@ -178,11 +186,13 @@ export function bodyQuaternion(dir: Vector3, target = new Quaternion()): Quatern
   }
   right.normalize();
   const up = new Vector3().crossVectors(forward, right).normalize();
-  return target.setFromRotationMatrix(BASIS.makeBasis(right, up, forward));
+  target.setFromRotationMatrix(BASIS.makeBasis(right, up, forward));
+  if (roll !== 0) target.multiply(ROLL.setFromAxisAngle(FORWARD, Math.atan(roll)));
+  return target;
 }
 
-/** 位置と進行方向から姿勢を決める。 */
-function orient(object: Object3D, pos: Vector3, dir: Vector3): void {
-  object.position.copy(pos);
-  bodyQuaternion(dir, object.quaternion);
+/** 位置・進行方向・横断勾配から姿勢を決める。 */
+function orient(object: Object3D, pose: BodyPose): void {
+  object.position.copy(pose.pos);
+  bodyQuaternion(pose.dir, pose.roll, object.quaternion);
 }

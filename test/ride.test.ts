@@ -28,6 +28,7 @@ function vehicleAt(
   dir: Vector3,
   kind: VehicleKind = 'train',
   id = 1,
+  roll = 0,
 ): Vehicle {
   return {
     id,
@@ -38,7 +39,7 @@ function vehicleAt(
     size: { ...SIZES[kind] },
     cars: kind === 'train' ? 3 : 1,
     color: [0.5, 0.5, 0.5],
-    bodies: [{ pos: pos.clone(), dir: dir.clone().normalize() }],
+    bodies: [{ pos: pos.clone(), dir: dir.clone().normalize(), roll }],
   };
 }
 
@@ -133,6 +134,30 @@ describe('運転台の位置', () => {
     expect(limit.y).toBeLessThan(0.95);
     // 目の位置は見回しでは動かない。
     expect(cabPose(vehicle, { yaw: 2, pitch: 1 }).eye.distanceTo(cabPose(vehicle).eye)).toBe(0);
+  });
+
+  it('カントの付いた所では、目も車体と一緒に傾く', () => {
+    const roll = 0.07; // カント 0.1 m / 軌間 1.435 m ≒ 4°
+    const level = vehicleAt(new Vector3(0, 0, 0), new Vector3(0, 0, 1), 'train', 1, 0);
+    const canted = vehicleAt(new Vector3(0, 0, 0), new Vector3(0, 0, 1), 'train', 1, roll);
+    const angle = Math.atan(roll);
+
+    // 右が高い (正のカント) なら、頭は左へ倒れる。左カーブの外軌が右に
+    // あるときの姿勢で、車体は曲線の内側へ傾く。
+    expect(level.bodies[0].roll).toBe(0);
+    expect(cabPose(level).up.x).toBeCloseTo(0, 9);
+    expect(cabPose(canted).up.x).toBeCloseTo(-Math.sin(angle), 6);
+    expect(cabPose(canted).up.y).toBeCloseTo(Math.cos(angle), 6);
+    // 目は車体に固定されているので、傾いたぶん横にも動く。
+    const { up } = cabOffset(canted);
+    expect(cabPose(canted).eye.x).toBeCloseTo(-up * Math.sin(angle), 6);
+    expect(cabPose(canted).eye.y).toBeCloseTo(up * Math.cos(angle), 6);
+    // 進行方向は変わらない。
+    expect(cabPose(canted).forward.z).toBeCloseTo(1, 6);
+    // 見回しの向きも車体基準なので、傾いた基底の上で回る。右を向けば、
+    // その先は高い側なので視線がわずかに上を向く。
+    const right = cabPose(canted, { yaw: Math.PI / 2, pitch: 0 }).forward;
+    expect(right.y).toBeCloseTo(Math.sin(angle), 6);
   });
 
   it('横を向いた車両でも、視線が上下に転ばない', () => {
