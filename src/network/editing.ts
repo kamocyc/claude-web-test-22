@@ -10,7 +10,7 @@ import { easementFromTangent } from '../core/easement';
 import { VerticalProfile } from '../core/profile';
 import { DEG, clamp } from '../core/units';
 import type { NetworkClass } from './classes';
-import type { Network, NetNode, NodeId, SegmentId } from './network';
+import type { Branch, Network, NetNode, NodeId, SegmentId } from './network';
 
 /** 自動的に交差点にまとめる高低差の上限 [m]。 */
 const AUTO_JUNCTION_TOLERANCE = 0.4;
@@ -29,6 +29,14 @@ export interface Anchor {
   bidirectional?: boolean;
   /** 接続先から引き継ぐ縦断勾配。 */
   grade?: number;
+  /**
+   * 接続先ノードに集まっている枝 (外向きの方位と外向き勾配)。
+   *
+   * 3 叉以上のノードでは「どの枝の続きか」が、出入りする向きが決まるまで
+   * 決まらない。方位を添えて全部渡しておき、`computePlacement` が向きから
+   * 選ぶ。分岐器で本線の反対側の勾配を拾って繋ぎ目が折れるのを防ぐ。
+   */
+  branches?: { dir: Vector2; grade: number }[];
   /**
    * 接続先から引き継ぐ曲率 [1/m] (`tangent` の向きに進んだときの値)。
    * これを繋いでいくと、緩和曲線で曲率が連続する線形になる。
@@ -147,18 +155,34 @@ export function computePlacement(
 
   const average = (end.y - anchor.pos.y) / length;
   const maximum = options.cls?.maxGrade ?? 0.35;
+
+  // 出ていく向きの真逆を向いている枝が「この線形の続き元」。2 本しかない
+  // 継ぎ目でも分岐器でも、同じ規則で正しい枝を選べる。
+  const away = startDirection ?? (chord.lengthSq() > 1e-9 ? chord.clone().normalize() : null);
+  const from = away ? pickBranch(anchor.branches, away.clone().negate()) : undefined;
+  const inherited =
+    from !== undefined
+      ? -from
+      : anchor.grade !== undefined
+        ? anchor.grade * startSign
+        : average;
+
   const solved = solveVerticalTangents(
-    (anchor.grade ?? average) * startSign,
+    inherited,
     average,
     maximum,
     length,
     options.cls?.minVerticalRadius ?? Infinity,
   );
   const startGrade = solved.startGrade;
+  // 到着側は、終端接線の向きに続く枝の外向き勾配に合わせる。
+  const into = pickBranch(destination.branches, endTangent);
   const endGrade =
-    destination.grade === undefined
-      ? solved.endGrade
-      : clamp(-destination.grade * endSign, -maximum, maximum);
+    into !== undefined
+      ? clamp(into, -maximum, maximum)
+      : destination.grade === undefined
+        ? solved.endGrade
+        : clamp(-destination.grade * endSign, -maximum, maximum);
 
   return {
     horizontal,
@@ -173,18 +197,41 @@ export function computePlacement(
 }
 
 /**
+ * `dir` の向きにいちばん近い枝の外向き勾配を返す。枝が無ければ `undefined`。
+ */
+function pickBranch(
+  branches: { dir: Vector2; grade: number }[] | undefined,
+  dir: Vector2,
+): number | undefined {
+  if (!branches || branches.length === 0) return undefined;
+  let best = branches[0];
+  for (const b of branches) {
+    if (b.dir.dot(dir) > best.dir.dot(dir)) best = b;
+  }
+  return best.grade;
+}
+
+/**
  * 縦断の端点勾配を決める。
  *
  * 終点勾配は区間の平均勾配に合わせる。`2*avg - m0` にすると勾配変化が
  * 線形の素直な縦断になるが、起伏を追って区間をつなぐと勾配が区間ごとに
  * 増幅し、平均の 3 倍まで育ってしまうため採用しない。
  *
- * 始点勾配は接続元から引き継ぐが、そのままだと区間内の最大勾配が規格を
- * 超えることがある。3 次エルミートの勾配は
+ * 始点勾配は接続元からそのまま引き継ぐ。ここを削ると繋ぎ目で勾配が跳ぶ
+ * ので、削るのは規格を守れなくなるときだけにする。
+ *
+ * どこまで引き継げるかは、縦断の勾配の値域そのものから出る。3 次エルミートの
+ * 勾配は
  *   q(t) = avg + d * (3t - 1)(t - 1),  d = m0 - avg
- * なので値域は `[avg - d/3, avg + d]`。ここから、規格を守れる範囲まで
- * `d` を縮める。接続点の勾配が僅かに不連続になるが、非現実的な急勾配が
- * できるよりは望ましい。
+ * で、値域はちょうど `avg + d` (= 始点) と `avg - d/3` (= t が 2/3 の所) の
+ * 間。つまり
+ *   |avg + d| <= maxGrade  かつ  |avg - d/3| <= maxGrade
+ * を満たす `d` なら、区間のどこも規格を割らない。
+ *
+ * 以前はここを `|d| <= maxGrade - |avg|` にしていたが、これは上の条件より
+ * ずっと厳しい。平均勾配が規格の半分を超えたあたりから、繋げるはずの勾配まで
+ * 削ってしまい、継ぎ目で勾配が不連続になっていた。
  *
  * 同じ `d` に、規格最小縦曲線半径からの上限もかける。短い区間で勾配を
  * 大きく変えると縦断が折れる (勾配は連続でも、変わり方が急すぎる) ため。
@@ -196,15 +243,26 @@ export function solveVerticalTangents(
   length = 0,
   minVerticalRadius = Infinity,
 ): { startGrade: number; endGrade: number } {
-  const headroom = Math.max(0, maxGrade - Math.abs(average));
+  // 始点勾配が規格に収まる範囲。
+  let lo = -maxGrade - average;
+  let hi = maxGrade - average;
+  // 途中の折り返し (avg - d/3) も規格に収まる範囲。
+  const bendLo = 3 * (average - maxGrade);
+  const bendHi = 3 * (average + maxGrade);
+  // 平均勾配が既に規格外だと両立しない。その場合は始点勾配だけを守る。
+  if (bendLo <= hi && bendHi >= lo) {
+    lo = Math.max(lo, bendLo);
+    hi = Math.min(hi, bendHi);
+  }
   // 縦曲線の半径。この形 (m1 = 平均勾配) では最大の 2 階微分が 4|d|/L に
   // なるので、半径の下限はそのまま d の上限になる。サンプリングは要らない。
   const byCurve =
     Number.isFinite(minVerticalRadius) && minVerticalRadius > 0
       ? length / (4 * minVerticalRadius)
       : Infinity;
-  const limit = Math.min(headroom, byCurve);
-  const d = clamp(inheritedGrade - average, -limit, limit);
+  lo = Math.max(lo, -byCurve);
+  hi = Math.min(hi, byCurve);
+  const d = lo > hi ? 0 : clamp(inheritedGrade - average, lo, hi);
   return { startGrade: average + d, endGrade: average };
 }
 
@@ -246,6 +304,8 @@ export interface PlaceResult {
   autoJunctions: NodeId[];
   /** 折れをなめらかにしたノード。 */
   smoothed: NodeId[];
+  /** 勾配の折れをなめらかにしたノード。 */
+  gradeSmoothed: NodeId[];
 }
 
 /** 折れをなめらかにする角度の範囲。これより浅ければ元から折れていない。 */
@@ -319,6 +379,95 @@ export function smoothJoint(network: Network, node: NodeId): boolean {
   return false;
 }
 
+/**
+ * ノードでの勾配の折れをなめらかにする。
+ *
+ * 敷設時に勾配は接続元から引き継ぐが、平均勾配が規格ぎりぎりの区間では
+ * 引き継ぎきれずに削られる (`solveVerticalTangents`)。その残りをここで
+ * 両側に振り分ける。片側だけを動かさないので、既に敷いてある線形の縦断も
+ * 大きくは変わらない。
+ *
+ * 平面の `smoothJoint` と違って端の制御点は触らないので、緩和曲線の入った
+ * 線形でも安全に掛けられる。線路は原則として緩和曲線つきなので、こちらが
+ * 効かないと繋ぎ目の勾配差がそのまま残ってしまう。
+ */
+export function smoothGradeJoint(network: Network, node: NodeId): boolean {
+  const branches = network.branchesAt(node);
+  if (branches.length !== 2) return false;
+  const [b0, b1] = branches;
+  if (b0.cls.kind !== b1.cls.kind) return false;
+  // 外向き勾配が符号違いで揃っていれば、そこは折れていない。
+  if (Math.abs(b0.grade + b1.grade) < 1e-6) return false;
+
+  // 外向き勾配が ±target で揃えば折れが消える。両側から同じだけ寄せる。
+  const target = (b0.grade - b1.grade) / 2;
+  return branches
+    .map((b, i) => approachGrade(network, b, i === 0 ? target : -target))
+    .some(Boolean);
+}
+
+/**
+ * 枝の外向き勾配を `want` へ寄せる。動かせるのは、その区間の縦断が規格を
+ * 割らない範囲まで。
+ *
+ * 最大勾配も縦曲線の 2 階微分も端点勾配について 1 次なので、「規格に収まる
+ * 勾配」はひとつながりの区間になる。だから今の値 (収まっている) と目標の
+ * 間を二分すれば、届く限界がそのまま出る。
+ */
+function approachGrade(network: Network, b: Branch, want: number): boolean {
+  const seg = network.getSegment(b.segment);
+  const original = { gradeA: seg.gradeA, gradeB: seg.gradeB };
+  const before = gradeQuality(network, b.segment);
+  const apply = (outward: number): void => {
+    const grade = b.atStart ? outward : -outward;
+    network.updateSegment(b.segment, b.atStart ? { gradeA: grade } : { gradeB: grade });
+  };
+  const accepts = (outward: number): boolean => {
+    apply(outward);
+    return withinVerticalStandard(gradeQuality(network, b.segment), before, b.cls);
+  };
+
+  if (accepts(want)) return true;
+  let ok = b.grade;
+  let bad = want;
+  for (let i = 0; i < 12; i++) {
+    const mid = (ok + bad) / 2;
+    if (accepts(mid)) ok = mid;
+    else bad = mid;
+  }
+  if (Math.abs(ok - b.grade) < 1e-9) {
+    network.updateSegment(b.segment, original);
+    return false;
+  }
+  apply(ok);
+  return true;
+}
+
+interface GradeQuality {
+  maxGrade: number;
+  minVerticalRadius: number;
+}
+
+function gradeQuality(network: Network, segment: SegmentId): GradeQuality {
+  const vertical = network.alignmentOf(segment).vertical;
+  return { maxGrade: vertical.maxGrade(32), minVerticalRadius: vertical.minVerticalRadius() };
+}
+
+/**
+ * 縦断が規格に収まっているか。元から規格を外れている線形 (地形に合わせて
+ * 敷いた急勾配など) を触るときは、少なくとも悪化していなければよしとする。
+ */
+function withinVerticalStandard(
+  after: GradeQuality,
+  before: GradeQuality,
+  cls: NetworkClass,
+): boolean {
+  return (
+    after.maxGrade <= Math.max(cls.maxGrade, before.maxGrade) + 1e-9 &&
+    after.minVerticalRadius >= Math.min(cls.minVerticalRadius, before.minVerticalRadius) - 1e-6
+  );
+}
+
 function signedAngle(from: Vector2, to: Vector2): number {
   return Math.atan2(from.x * to.y - from.y * to.x, from.dot(to));
 }
@@ -367,12 +516,15 @@ export function placeSegment(
   const autoJunctions = resolveAutoJunctions(network, segment.id);
   // 既存の線形の端に繋いだ所は、両方を少し振って折れを消す。
   const smoothed = [startNode.id, endNode.id].filter((id) => smoothJoint(network, id));
+  // 平面が見送られても (緩和曲線つきの線形など)、勾配の折れは別に均す。
+  const gradeSmoothed = [startNode.id, endNode.id].filter((id) => smoothGradeJoint(network, id));
   return {
     segment: segment.id,
     startNode: startNode.id,
     endNode: endNode.id,
     autoJunctions,
     smoothed,
+    gradeSmoothed,
   };
 }
 
@@ -506,7 +658,11 @@ export function anchorFromNode(network: Network, node: NetNode, cls: NetworkClas
 
   const same = branches.find((b) => b.cls.kind === cls.kind) ?? branches[0];
   // 勾配は枝が何本あっても引き継ぐ (繋ぎ目に段差ができないように)。
+  // どの枝の続きになるかは出入りの向き次第なので、方位を添えて全部渡す。
   anchor.grade = -same.grade;
+  anchor.branches = branches
+    .filter((b) => b.cls.kind === same.cls.kind)
+    .map((b) => ({ dir: b.dir.clone(), grade: b.grade }));
   if (branches.length === 1) {
     anchor.tangent = same.dir.clone().negate();
     // 接線を引き継ぐときだけ、曲率も引き継ぐ (向きが自由な分岐では、

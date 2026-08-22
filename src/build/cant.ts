@@ -1,7 +1,8 @@
+import type { XZ } from '../core/curve';
 import { RAIL_GAUGE, clamp } from '../core/units';
 import type { NetworkClass } from '../network/classes';
 import { turnoutTangentLength } from '../network/junction';
-import type { Network, NodeId, SegmentId } from '../network/network';
+import type { Branch, Network, NodeId, SegmentId } from '../network/network';
 import type { Crossing } from '../network/crossings';
 
 /**
@@ -30,6 +31,12 @@ const FACE_MARGIN = 2;
 /** 交差点の面が広がる長さの上限 [m] (`rules.ts` のトリム上限と同じ)。 */
 const MAX_FACE = 40;
 
+/** 分かれた 2 本の重なりを追う刻み [m]。 */
+const OVERLAP_STEP = 2;
+
+/** 重なりを追う長さの上限 [m]。これより長く重なる分岐は想定しない。 */
+const MAX_OVERLAP = 140;
+
 /** 曲率 `curvature` [1/m] における横断勾配 (中心から右へ 1 m あたりの上がり)。 */
 export function cantRoll(cls: NetworkClass, curvature: number): number {
   if (cls.kind !== 'rail' || cls.maxCant <= 0) return 0;
@@ -53,13 +60,44 @@ interface FlatZone {
 export type CantProfile = (s: number) => number;
 
 /**
+ * 分岐したあと、2 本の道床がまだ重なっている長さ [m]。
+ *
+ * 分岐器を出てすぐは、分かれた 2 本が同じ所を通っている。左右のレールが
+ * 離れきるまでは 1 つの構造物なので、そこに違うカントを付けると、同じ場所に
+ * 高さの違う面が 2 枚できてしまう。実物でも、分岐器とその先の重なりが
+ * 解けるまでは水平な 1 枚の面に載せる。
+ *
+ * 同じ弧長の点どうしの距離を追い、道床の幅ぶん離れた所を重なりの終わりと
+ * みなす。
+ */
+function overlapReach(network: Network, a: Branch, b: Branch): number {
+  const need = a.cls.halfWidth + b.cls.halfWidth;
+  const als = [network.alignmentOf(a.segment), network.alignmentOf(b.segment)];
+  const brs = [a, b];
+  const limit = Math.min(MAX_OVERLAP, als[0].length, als[1].length);
+  const at = (i: number, s: number): XZ => {
+    const L = als[i].length;
+    return als[i].horizontal.pointAt(brs[i].atStart ? Math.min(s, L) : Math.max(0, L - s));
+  };
+  let s = 0;
+  for (; s < limit; s = Math.min(s + OVERLAP_STEP, limit)) {
+    const next = Math.min(s + OVERLAP_STEP, limit);
+    if (at(0, next).distanceTo(at(1, next)) >= need) return next;
+    if (next >= limit) break;
+  }
+  return limit;
+}
+
+/**
  * ノードのまわりでカントを抜いておく長さ [m]。0 ならそのまま通してよい。
  *
- * 見るのは 2 つ。
+ * 見るのは 3 つ。
  *
  *  - **交差点の面**が広がっている範囲。面の中でカントが枝ごとに違うと
  *    道床がねじれる。`solveJunctions` を解く前に要るので、枝の形だけから
  *    見積もる。
+ *  - 分岐したあと**道床が重なっている**範囲 (`overlapReach`)。浅い分岐ほど
+ *    長く、交差点の面よりずっと先まで続く。
  *  - 面が無い継ぎ目でも、**両側のカントが食い違う**なら 0 に戻す。曲線と
  *    直線がほぼ一直線に繋がっている所では、そのままだと帯に段差ができる。
  */
@@ -67,22 +105,27 @@ function flatReach(network: Network, node: NodeId): number {
   const branches = network.branchesAt(node);
   if (branches.length === 0) return 0;
 
-  let reach = 0;
+  let face = 0;
+  let overlap = 0;
   for (let i = 0; i < branches.length; i++) {
     for (let j = i + 1; j < branches.length; j++) {
       const dot = clamp(branches[i].dir.dot(branches[j].dir), -1, 1);
+      // 同じ側へ出ていく枝どうしだけが重なる。向かい合う枝 (線形の続き)
+      // は最初から離れていくので測るまでもない。
+      if (dot > 0) overlap = Math.max(overlap, overlapReach(network, branches[i], branches[j]));
       const deflection = Math.PI - Math.acos(dot);
       // ほぼ一直線に繋がる継ぎ目には交差点の面ができない。
       if (deflection < 2 * (Math.PI / 180)) continue;
       const radius = Math.min(branches[i].cls.minRadius, branches[j].cls.minRadius);
-      reach = Math.max(
-        reach,
+      face = Math.max(
+        face,
         turnoutTangentLength(radius, deflection),
         branches[i].cls.halfWidth + branches[j].cls.halfWidth,
       );
     }
   }
-  if (reach > 0) return Math.min(reach + FACE_MARGIN, MAX_FACE);
+  const reach = Math.max(Math.min(face, MAX_FACE), Math.min(overlap, MAX_OVERLAP));
+  if (reach > 0) return reach + FACE_MARGIN;
 
   // 面が無い継ぎ目。カントが繋がっていれば触らない。外向きに測った
   // 曲率は符号が逆になるので、繋がっていれば横断勾配の和が 0 になる。
