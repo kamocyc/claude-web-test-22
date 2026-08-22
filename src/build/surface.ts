@@ -2,13 +2,14 @@ import { Vector3 } from 'three';
 import type { AlignmentSample } from '../core/alignment';
 import {
   MeshBuilder,
-  earcutXZ,
   extrudeSkirt,
   extrudeSkirtTo,
   fillPolygon,
+  polygonHeightSampler,
 } from '../core/meshbuilder';
 import { GRADING_MARGIN, SURFACE_LIFT, SURFACE_SKIRT, TERRAIN_CELL } from '../core/units';
 import type { NetworkClass } from '../network/classes';
+import { pointRisk } from '../network/validation';
 
 export type RGB = readonly [number, number, number];
 
@@ -124,8 +125,15 @@ export function applyTint(color: RGB, tint?: RGB): RGB {
 /** 整地後の地形の高さを引く関数。 */
 export type GroundQuery = (x: number, z: number) => number;
 
-/** 垂れ壁を伸ばす上限 [m]。これを超える段差は橋・擁壁の領分。 */
-const MAX_SKIRT = 8;
+/**
+ * 垂れ壁を伸ばす上限 [m]。
+ *
+ * 盛土の路面は、隣に別の線形の整地された回廊があると、そちらの高さまで
+ * 法面を伸ばせない (相手の回廊は守られる)。その段差を閉じるのは垂れ壁の
+ * 役目なので、盛土として成立する高さ (橋にする閾値) では足りない。
+ * 上限は「そこまで下りても穴が開くよりまし」という安全弁として置く。
+ */
+const MAX_SKIRT = 30;
 
 /**
  * 垂れ壁の下端。地形まで届かせることで、勾配差の大きい交差点や
@@ -158,9 +166,8 @@ export function buildRibbon(
   const normal = new Vector3();
 
   for (const sample of samples) {
-    const gradeRisk = Math.abs(sample.grade) / cls.maxGrade;
-    const radius = Math.abs(sample.curvature) > 1e-6 ? 1 / Math.abs(sample.curvature) : Infinity;
-    const curveRisk = radius > 1e6 ? 0 : cls.minRadius / radius;
+    // 頂点ごとの規格比 (診断色のもと)。HUD の数値と同じ式を使う。
+    const { gradeRisk, curveRisk } = pointRisk(sample.curvature, sample.grade, cls);
     const scale = options.heightScale?.(sample.s) ?? 1;
     const row: number[] = [];
     for (let k = 0; k < profile.length; k++) {
@@ -383,36 +390,7 @@ const SKIRT_COLOR: RGB = [0.3, 0.28, 0.26];
  * 判定できる。分岐器の軌道を道床に埋めないために使う。範囲外なら null。
  */
 export function surfaceHeightAt(ring: Vector3[], x: number, z: number): number | null {
-  if (ring.length < 3) return null;
-  const flat: number[] = [];
-  for (const p of ring) flat.push(p.x, p.z);
-  const tris = earcutXZ(flat);
-  for (let i = 0; i < tris.length; i += 3) {
-    const a = ring[tris[i]];
-    const b = ring[tris[i + 1]];
-    const c = ring[tris[i + 2]];
-    const y = heightInTriangle(a, b, c, x, z);
-    if (y !== null) return y;
-  }
-  return null;
-}
-
-/** 三角形の内側なら重心座標で高さを返す。外側なら null。 */
-function heightInTriangle(
-  a: Vector3,
-  b: Vector3,
-  c: Vector3,
-  x: number,
-  z: number,
-): number | null {
-  const d = (b.z - c.z) * (a.x - c.x) + (c.x - b.x) * (a.z - c.z);
-  if (Math.abs(d) < 1e-12) return null;
-  const u = ((b.z - c.z) * (x - c.x) + (c.x - b.x) * (z - c.z)) / d;
-  const v = ((c.z - a.z) * (x - c.x) + (a.x - c.x) * (z - c.z)) / d;
-  const w = 1 - u - v;
-  const eps = -1e-6;
-  if (u < eps || v < eps || w < eps) return null;
-  return u * a.y + v * b.y + w * c.y;
+  return polygonHeightSampler(ring)(x, z);
 }
 
 /** 同じ頂点数の 2 本のリングの間を帯で埋める。 */

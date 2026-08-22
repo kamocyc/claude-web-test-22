@@ -20,17 +20,35 @@ const GATE_STANDOFF = 1.6;
  * 差が小さすぎると Z ファイティングでレールが点線になる。
  */
 export const PAVEMENT_BELOW_RAILHEAD = 0.06;
-/** 舗装を線路に合わせた分を、道路の本来の高さへ戻すのにかける距離 [m]。 */
+/** 舗装を線路に合わせた分を、道路の本来の高さへ戻すのにかける最短距離 [m]。 */
 const BLEND_RAMP = 14;
 /**
- * 踏切に合わせて道路を持ち上げ / 下げてよい量の目安 [m]。
+ * すり付けで道路の勾配に足してよい量。
  *
- * 交差角が浅く道路の勾配が急な踏切は、線路の面に合わせようとすると
- * 道路に何十 m もの平坦部を刻むことになる。そこまでの変形は現実の
- * 施工に合わないので、ここで頭を打たせる (敷設時は `rules.ts` が
- * そもそも禁止する)。
+ * 戻す距離を固定にすると、変形が大きいほど繋ぎ目が急になり、踏切の前後に
+ * こぶができる。逆に**変形の大きさに応じて距離を伸ばせば**、勾配の足し前は
+ * 一定に保てる。実物の踏切も、急な道路では前後を長く取り直して線路の面に
+ * すり付ける。重み関数 (smoothstep) の傾きは平均の 1.5 倍まで立つので、
+ * その分を見込んで長さを決める。
  */
-export const MAX_CROSSING_LIFT = 0.8;
+const RAMP_SLOPE = 0.06;
+const RAMP_PEAK = 1.5;
+/** すり付けにかけてよい距離の上限 [m]。 */
+const MAX_RAMP = 60;
+/**
+ * 踏切に合わせて道路を持ち上げ / 下げてよい量 [m]。
+ *
+ * 交差角が浅く道路の勾配が急な踏切ほど、線路の面に合わせるのに道路を
+ * 大きく変形させることになる。`MAX_RAMP` の距離を使ってもすり付けが
+ * `RAMP_SLOPE` に収まらない量が上限で、それを超える配置は `rules.ts` が
+ * そもそも禁止する。
+ */
+export const MAX_CROSSING_LIFT = (MAX_RAMP * RAMP_SLOPE) / RAMP_PEAK;
+/**
+ * これを超える変形は、道路の縦断を目に見えて作り直すことになる [m]。
+ * 敷設は止めないが、そうなっていることを警告で知らせる。
+ */
+export const GENTLE_CROSSING_LIFT = 0.8;
 
 /**
  * 描画高さを局所的にずらす指定。
@@ -57,6 +75,16 @@ export interface SurfaceBlend {
   targetY: number;
   /** 目標面の、道路の弧長方向の勾配。 */
   targetSlope: number;
+  /**
+   * 道路自身の縦断勾配。
+   *
+   * `core` の外では、目標面をこの勾配で伸ばす (道路と平行に走らせる)。
+   * 線路の面をどこまでも伸ばすと、平坦部から離れるほど目標が道路から
+   * 離れていき、戻す量が距離とともに増える。すり付けを長く取っても
+   * 繋ぎ目が急なままになるのはそのためで、実物の踏切の形 (線路に合わせた
+   * 平坦部 + 元の勾配に戻すすり付け) とも合わない。
+   */
+  roadGrade: number;
   /** 横断勾配。中心線から右へ 1 m につき上がる量。 */
   roll: number;
   /** 補正を全量かける範囲 (片側) [m]。舗装が線路に接している範囲。 */
@@ -108,6 +136,11 @@ export interface LevelCrossingBuild {
  * 道床と枕木は舗装の下に隠れ、レールだけが頭を出す。
  */
 export interface LevelCrossingOptions {
+  /**
+   * 舗装を敷く道路の弧長の範囲。複線を渡る踏切のように、複数の交差を
+   * 1 か所の踏切としてまとめるときに渡す。省略すると交差 1 つぶん。
+   */
+  span?: { s0: number; s1: number };
   /** 遮断機を置いてよい場所か (線路や他の道路と重ならないか)。 */
   canPlace?: (x: number, z: number, y: number) => boolean;
   /** 足元の地面の高さ。 */
@@ -132,9 +165,9 @@ export function buildLevelCrossing(
   const groundY = options.groundY ?? ((_x, _z, surfaceY) => surfaceY);
 
   const halfLength = panelHalfLength(crossing, railClass);
-
-  const sRoad0 = road.s - halfLength;
-  const sRoad1 = road.s + halfLength;
+  // まとめた踏切では、いちばん外の線路の外側までが 1 枚の舗装になる。
+  const sRoad0 = Math.min(options.span?.s0 ?? Infinity, road.s - halfLength);
+  const sRoad1 = Math.max(options.span?.s1 ?? -Infinity, road.s + halfLength);
 
   paintPanel(mb, roadPath, sRoad0, sRoad1, roadClass);
 
@@ -148,10 +181,12 @@ export function buildLevelCrossing(
     // 進行方向の左 = 断面オフセットが負の側。
     const side = forward ? -1 : 1;
     // 線路や他の道路に当たる場合は、踏切から遠ざかる向きに置き直す。
-    let placed: { base: Vector3; sample: RoadSample; distance: number } | null = null;
+    let placed: { base: Vector3; sample: RoadSample; station: number } | null = null;
     for (const extra of [0, 1.5, 3, 5]) {
-      const distance = halfLength + GATE_STANDOFF + extra;
-      const sample = roadPath.sampleAt(forward ? road.s - distance : road.s + distance);
+      // 遮断機は舗装の外側。まとめた踏切では、線路の間ではなく
+      // まとまり全体の外に立つ。
+      const station = forward ? sRoad0 - GATE_STANDOFF - extra : sRoad1 + GATE_STANDOFF + extra;
+      const sample = roadPath.sampleAt(station);
       if (!sample) continue;
 
       const mode = modeAt(sample);
@@ -166,7 +201,7 @@ export function buildLevelCrossing(
       const surfaceY = sample.pos.y + roadClass.curbHeight;
       const baseY = onBridge ? surfaceY : groundY(x, z, surfaceY);
       if (!canPlace(x, z, baseY)) continue;
-      placed = { base: new Vector3(x, baseY, z), sample, distance };
+      placed = { base: new Vector3(x, baseY, z), sample, station };
       break;
     }
     if (!placed) continue;
@@ -177,8 +212,7 @@ export function buildLevelCrossing(
     gates.push({ base: placed.base, across, facing, length: boomLength });
 
     // 停止線は遮断機の少し手前。ノードを跨いだ場合はその先のセグメントに引く。
-    const stopDistance = placed.distance + 0.8;
-    const stop = roadPath.sampleAt(forward ? road.s - stopDistance : road.s + stopDistance);
+    const stop = roadPath.sampleAt(placed.station + (forward ? -0.8 : 0.8));
     if (stop) {
       stopStations.push({
         segment: stop.segment,
@@ -217,16 +251,20 @@ export function computeCrossingBlend(
   crossing: Crossing,
   railAlignment: Alignment,
   roadAlignment: Alignment,
-): SurfaceBlend & { segment: SegmentId } {
+  /** 線路のカント (横断勾配)。踏切では 0 に戻してあるが、念のため見る。 */
+  railRoll = 0,
+): SurfaceBlend & { segment: SegmentId; lift: number } {
   const road = crossing.road!;
   const rail = crossing.rail!;
   const railSample = railAlignment.sampleAt(rail.s);
   const roadSample = roadAlignment.sampleAt(road.s);
 
-  // 線路の面の勾配ベクトル (水平 1 m あたりの上がり)。
-  const gradient = new Vector2(railSample.forwardXZ.x, railSample.forwardXZ.y).multiplyScalar(
-    railSample.grade,
-  );
+  // レール頭頂面の勾配ベクトル (水平 1 m あたりの上がり)。縦断勾配だけで
+  // なく**横断勾配 (カント) も足す**。線路方向の傾きしか見ないと、カントが
+  // 付いている所で舗装が片方のレールに潜り、もう片方から浮く。
+  const gradient = new Vector2(railSample.forwardXZ.x, railSample.forwardXZ.y)
+    .multiplyScalar(railSample.grade)
+    .addScaledVector(new Vector2(railSample.right.x, railSample.right.z), railRoll);
   const forward = roadSample.forwardXZ;
   const right = new Vector2(roadSample.right.x, roadSample.right.z);
 
@@ -238,22 +276,28 @@ export function computeCrossingBlend(
 
   const targetY = railSample.pos.y - PAVEMENT_BELOW_RAILHEAD;
   const targetSlope = gradient.dot(forward);
-  // 変形が大きくなりすぎる所で頭を打たせる。舗装が線路に接している範囲
-  // (パネル) だけは、切り詰めるとレールが舗装から出なくなるので残す。
   const deltaY = targetY - roadSample.pos.y;
   const slope = targetSlope - roadSample.grade;
+  // 変形が大きくなりすぎる所で頭を打たせる。舗装が線路に接している範囲
+  // (パネル) だけは、切り詰めるとレールが舗装から出なくなるので残す。
   const budget = Math.max(0, MAX_CROSSING_LIFT - Math.abs(deltaY));
   const limit = Math.abs(slope) > 1e-4 ? budget / Math.abs(slope) : Infinity;
   const core = Math.max(panel, Math.min(geometric, limit));
+  // 全量かける範囲の端で、道路の本来の高さからどれだけ離れるか。これを
+  // 元に戻すのがすり付けなので、長さもこれで決める。
+  const lift = Math.abs(deltaY) + core * Math.abs(slope);
+  const ramp = clamp((RAMP_PEAK * lift) / RAMP_SLOPE, BLEND_RAMP, MAX_RAMP);
 
   return {
     segment: road.segment,
     s: road.s,
     targetY,
     targetSlope,
+    roadGrade: roadSample.grade,
     roll: gradient.dot(right),
     core,
-    halfLength: core + BLEND_RAMP,
+    halfLength: core + ramp,
+    lift,
   };
 }
 
@@ -438,7 +482,7 @@ export function surfaceBlendAt(
     // 平均すると、どちらの線路の高さにも合わない面ができる (高さの違う
     // 線路が並んでいる所では、その間で路面が繋がっていなければならない)。
     const p = w / (0.25 + Math.abs(s - blend.s));
-    target += p * (blend.targetY + blend.targetSlope * (s - blend.s));
+    target += p * levelAt(blend, s);
     roll += p * blend.roll;
     total += p;
   }
@@ -457,6 +501,21 @@ export function surfaceHeightScale(blends: SurfaceBlend[], s: number): number {
   let w = 0;
   for (const blend of blends) w = Math.max(w, blendWeight(blend, s));
   return 1 - w;
+}
+
+/**
+ * その弧長での目標の路面高さ。
+ *
+ * 舗装が線路に接する範囲 (`core`) の中では線路の面そのもの。その外では
+ * **道路自身の勾配で伸ばす**ので、道路との差は平坦部の端の値のまま変わらず、
+ * あとは重み (`blendWeight`) が距離をかけて 0 に戻すだけになる。線路の面を
+ * どこまでも伸ばすと、差が距離に比例して開き続けるため、すり付けをいくら
+ * 長くしても繋ぎ目の勾配が緩まない。
+ */
+function levelAt(blend: SurfaceBlend, s: number): number {
+  const d = s - blend.s;
+  const inside = clamp(d, -blend.core, blend.core);
+  return blend.targetY + blend.targetSlope * inside + blend.roadGrade * (d - inside);
 }
 
 /** 補正をどれだけ効かせるか。舗装の下では全量、そこから滑らかに 0 へ戻す。 */

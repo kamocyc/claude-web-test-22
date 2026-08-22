@@ -5,8 +5,11 @@ import type { Network } from '../network/network';
 import type { Heightfield } from '../terrain/heightfield';
 
 /**
- * 道路上で、路面が自然地形といちばん近い高さになっている地点を探す。
- * 踏切や交差点は、切土・盛土の少ない所に置きたい。
+ * 道路上で、踏切・交差点を置くのに向いた地点を探す。
+ *
+ * 見るのは 2 つ。**路面が自然地形と同じ高さ**であること (切土・盛土が
+ * 少ない) と、**路面が平坦**であること。急勾配の途中に置くと、幅のある
+ * 線路の面に道路を合わせるのに何十 m もすり付けることになる。
  */
 function findAtGradePoint(
   network: Network,
@@ -17,12 +20,17 @@ function findAtGradePoint(
 ): Vector3 | null {
   let best: Vector3 | null = null;
   let bestDelta = Infinity;
+  let bestCost = Infinity;
   for (let x = xRange[0]; x <= xRange[1]; x += 10) {
     if (avoid && Math.abs(x - avoid.x) < avoid.radius) continue;
     const hit = network.findSegmentNear(new Vector3(x, 0, z), 25);
     if (!hit) continue;
     const delta = Math.abs(hit.pos.y - field.baseHeightAt(hit.pos.x, hit.pos.z));
-    if (delta < bestDelta) {
+    const grade = Math.abs(network.alignmentOf(hit.segment).vertical.gradeAt(hit.s));
+    // 勾配 1% を高さのずれ 0.4 m と同じ重みで嫌う。
+    const cost = delta + grade * 40;
+    if (cost < bestCost) {
+      bestCost = cost;
       bestDelta = delta;
       best = hit.pos.clone();
     }
@@ -42,7 +50,12 @@ export function buildDemoNetwork(network: Network, field: Heightfield): void {
   const roadZ = -40;
   const trunk: Waypoint[] = [];
   for (let x = -430; x <= 430; x += 60) trunk.push({ x, z: roadZ });
-  draw(network, field, 'road_medium', smoothProfile(field, trunk, 'road_medium'), {
+  // 縦断は規格 (13.5%) より大幅に緩い 6% までにする。地形をそのまま
+  // なぞらせると切土・盛土だけで通ってしまい、谷の高架も丘のトンネルも
+  // 出てこない。
+  draw(network, field, 'road_medium', smoothProfile(field, trunk, 'road_medium', {
+    grade: 0.06,
+  }), {
     straight: true,
   });
 
@@ -101,7 +114,9 @@ export function buildDemoNetwork(network: Network, field: Heightfield): void {
   }
 
   // 線路を跨ぐ道路。桁下を確保しているので立体交差になる。
-  const overpassZ = 250;
+  // 側線の終端 (z = branchNode.z + 180 ≒ 245) から離しておく。9 m の
+  // 盛土の裾がかかると、側線の道床が盛土に埋まる。
+  const overpassZ = 270;
   const railUnder = network.findSegmentNear(new Vector3(railX, 0, overpassZ), 30);
   const overpassY = (railUnder ? railUnder.pos.y : railY) + 9;
   draw(

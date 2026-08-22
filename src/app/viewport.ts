@@ -21,6 +21,15 @@ import { MapControls } from 'three/examples/jsm/controls/MapControls.js';
 import { MAP_SIZE } from '../core/units';
 
 /**
+ * 一人称視点のときの近クリップ面 [m]。
+ *
+ * 俯瞰の 1 m のままだと、目の前の路面や車体が切り取られる。近づけすぎると
+ * 遠くで奥行きの精度が落ちるので、目の高さ (1.1〜2.4 m) に対して十分近い所で
+ * 止める。
+ */
+const RIDE_NEAR = 0.4;
+
+/**
  * 3D 表示まわり。レンダラ・カメラ・光源・空と、地形へのレイキャストを持つ。
  */
 export class Viewport {
@@ -31,6 +40,8 @@ export class Viewport {
   private readonly sun: DirectionalLight;
   private readonly raycaster = new Raycaster();
   private readonly pointer = new Vector2();
+  /** 一人称視点に入る前の視点。降りたときに戻す。 */
+  private savedView: { position: Vector3; target: Vector3; near: number } | null = null;
 
   constructor(readonly canvas: HTMLCanvasElement) {
     this.renderer = new WebGLRenderer({ canvas, antialias: true });
@@ -95,8 +106,55 @@ export class Viewport {
     this.sun.target.updateMatrixWorld();
   }
 
-  render(): void {
+  /**
+   * 一人称視点に入る。いまの視点を控え、地図操作を止める。
+   *
+   * `MapControls` は `update()` のたびに注視点と球面座標からカメラを置き直す
+   * ので、止めずに位置を書き込んでも次のフレームで戻されてしまう。
+   */
+  beginRide(): void {
+    if (this.savedView) return;
+    this.savedView = {
+      position: this.camera.position.clone(),
+      target: this.controls.target.clone(),
+      near: this.camera.near,
+    };
+    this.controls.enabled = false;
+    this.camera.near = RIDE_NEAR;
+    this.camera.updateProjectionMatrix();
+  }
+
+  /** 一人称視点をやめ、入る前の視点に戻す。 */
+  endRide(): void {
+    const saved = this.savedView;
+    if (!saved) return;
+    this.savedView = null;
+    this.camera.position.copy(saved.position);
+    this.controls.target.copy(saved.target);
+    this.camera.near = saved.near;
+    this.camera.up.set(0, 1, 0);
+    this.camera.updateProjectionMatrix();
+    this.controls.enabled = true;
     this.controls.update();
+  }
+
+  /**
+   * 一人称視点のカメラを、目の位置・向き・頭の上の向きから置く。
+   *
+   * `up` を渡すのはカントのため。鉛直に固定すると、車体だけが傾いて
+   * 窓の外は水平のまま、という見え方になる。
+   */
+  placeEye(eye: Vector3, forward: Vector3, up: Vector3): void {
+    this.camera.position.copy(eye);
+    this.camera.up.copy(up);
+    this.camera.lookAt(eye.x + forward.x, eye.y + forward.y, eye.z + forward.z);
+    // 影のカメラは注視点に追従するので、見ている先を渡しておく。
+    this.controls.target.copy(eye).addScaledVector(forward, 40);
+  }
+
+  render(): void {
+    // 一人称視点の間は、カメラを外から置いている。
+    if (this.controls.enabled) this.controls.update();
     this.updateShadowCamera();
     this.renderer.render(this.scene, this.camera);
   }
@@ -108,6 +166,20 @@ export class Viewport {
       ((clientX - rect.left) / rect.width) * 2 - 1,
       -((clientY - rect.top) / rect.height) * 2 + 1,
     );
+  }
+
+  /**
+   * 現在のポインタ位置から伸びるレイ (ワールド座標)。
+   *
+   * 地形や路面ではなく**車両**を指すのに使う。車両は毎フレーム動くので
+   * シーングラフに問い合わせず、姿勢から直に当たり判定する (`hitBody`)。
+   */
+  ray(): { origin: Vector3; direction: Vector3 } {
+    this.raycaster.setFromCamera(this.pointer, this.camera);
+    return {
+      origin: this.raycaster.ray.origin.clone(),
+      direction: this.raycaster.ray.direction.clone(),
+    };
   }
 
   /** 現在のポインタ位置から対象メッシュへレイキャストする。 */

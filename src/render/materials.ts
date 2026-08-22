@@ -16,6 +16,38 @@ export const viewUniforms = {
 };
 
 /**
+ * 診断色のランプ。0 = 余裕、1 = 規格ちょうど、1.4 以上 = 大幅超過。
+ *
+ * シェーダと HUD の数値で同じ配色を使うため、ここ 1 か所に置いて
+ * GLSL へは文字列として埋め込む。
+ */
+const RISK_OK = [0.24, 0.72, 0.36] as const;
+const RISK_WARN = [0.95, 0.79, 0.2] as const;
+const RISK_BAD = [0.9, 0.22, 0.18] as const;
+
+const glsl = (rgb: readonly [number, number, number]): string =>
+  `vec3(${rgb.map((v) => v.toFixed(2)).join(', ')})`;
+
+/** 診断色 (0..1 の RGB)。シェーダの `riskColor` と同じ計算。 */
+export function riskTint(risk: number): readonly [number, number, number] {
+  const t = risk < 0.75 ? risk / 0.75 : Math.min(1, Math.max(0, (risk - 0.75) / 0.45));
+  const from = risk < 0.75 ? RISK_OK : RISK_WARN;
+  const to = risk < 0.75 ? RISK_WARN : RISK_BAD;
+  const at = (i: number): number => Math.min(1, Math.max(0, from[i] + (to[i] - from[i]) * t));
+  return [at(0), at(1), at(2)];
+}
+
+/** 診断色を CSS の `#rrggbb` で返す。 */
+export function riskColor(risk: number): string {
+  const hex = (v: number): string =>
+    Math.round(v * 255)
+      .toString(16)
+      .padStart(2, '0');
+  const [r, g, b] = riskTint(risk);
+  return `#${hex(r)}${hex(g)}${hex(b)}`;
+}
+
+/**
  * 診断表示 (勾配・曲率) を注入したマテリアルを作る。
  *
  * 各頂点の `diag` は (勾配の規格比, 曲率の規格比)。1 を超えると規格超過なので
@@ -74,9 +106,9 @@ varying vec2 vDiag;
 
 vec3 riskColor(float risk) {
   // 0 = 余裕, 1 = 規格ちょうど, 1.4 以上 = 大幅超過。
-  vec3 ok = vec3(0.24, 0.72, 0.36);
-  vec3 warn = vec3(0.95, 0.79, 0.20);
-  vec3 bad = vec3(0.90, 0.22, 0.18);
+  vec3 ok = ${glsl(RISK_OK)};
+  vec3 warn = ${glsl(RISK_WARN)};
+  vec3 bad = ${glsl(RISK_BAD)};
   if (risk < 0.75) return mix(ok, warn, risk / 0.75);
   return mix(warn, bad, clamp((risk - 0.75) / 0.45, 0.0, 1.0));
 }`,

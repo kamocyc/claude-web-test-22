@@ -14,6 +14,8 @@ import { intersectPolylines, toPolyline, type PolylinePoint } from './crossings'
 import type { Anchor } from './editing';
 import { CORNER_MARGIN, requiredTrims, type BranchLike } from './junction';
 import type { Branch, Network, NodeId, SegmentId } from './network';
+import { classify } from './structure';
+import type { Heightfield } from '../terrain/heightfield';
 
 /**
  * 敷設してよいかの判定。
@@ -29,6 +31,12 @@ const MIN_CROSSING_ANGLE = 20 * DEG;
 const MAX_TRIM_RATIO = 0.45;
 /** 交差点 1 つが取り込める長さの上限 [m]。 */
 const MAX_TRIM = 40;
+/**
+ * 路面どうしが重なったとみなす深さ [m]。
+ *
+ * 平行スナップは舗装の縁が 0.2 m 空くように並べるので、そこは許す。
+ */
+const OVERLAP_TOLERANCE = 0.15;
 
 export interface PlacementCheck {
   /** 空なら敷設できる。 */
@@ -43,51 +51,64 @@ export interface PlacementContext {
   end: Anchor;
   /** 判定から外すセグメント (既存の線形を引き直すときの自分自身)。 */
   ignore?: SegmentId;
+  /**
+   * 自然地形。渡すと「トンネルの中の交差点」を止められる。
+   * 省略した場合はその判定を行わない。
+   */
+  field?: Heightfield;
 }
 
 /**
  * 敷設できない理由を列挙する。1 つでもあれば置けない。
  *
- * 見るのは次の 4 点。
+ * 見るのは次の 5 点。
  *  1. 規格 (最小曲線半径・最大縦断勾配)
- *  2. 既存の線形との重なり (浅い角度での交差・並走)
- *  3. 立体交差の建築限界 (桁下が足りない / 同一平面で交差する)
- *  4. 交差点が近すぎる (取り付き長が取れない)
+ *  2. 繋ぎ目での折り返し (引いてきた線形の上を引き返す / 指した所に届かない)
+ *  3. 既存の線形との重なり (浅い角度での交差・並走)
+ *  4. 立体交差の建築限界 (桁下が足りない / 同一平面で交差する)
+ *  5. 交差点が近すぎる (取り付き長が取れない)
  */
 export function checkPlacement(ctx: PlacementContext): PlacementCheck {
-  const blockers: string[] = [...evaluate(ctx)];
+  const blockers: string[] = [...evaluate(ctx), ...checkDirection(ctx)];
   const network = ctx.network;
 
   // 端点で繋がる相手は「重なり」ではないので、判定から外す。
   // 分岐したばかりの所は本線の続きとも近いので、2 ホップ先まで見る。
-  const connected = new Set<SegmentId>();
-  const visit = (node: NodeId, depth: number): void => {
-    for (const branch of network.branchesAt(node)) {
-      if (connected.has(branch.segment)) continue;
-      connected.add(branch.segment);
-      if (depth <= 0) continue;
-      const seg = network.segments.get(branch.segment);
-      if (!seg) continue;
-      visit(seg.a === node ? seg.b : seg.a, depth - 1);
-    }
-  };
-  for (const anchor of [ctx.start, ctx.end]) {
+  // どちらの端で繋がっているかは分けて覚えておく。繋ぎ目から離れた所でも
+  // 重なり続けていないかを、`checkRunningAlong` がその端から測るため。
+  const sides = [ctx.start, ctx.end].map((anchor) => {
+    const found = new Set<SegmentId>();
+    const visit = (node: NodeId, depth: number): void => {
+      for (const branch of network.branchesAt(node)) {
+        if (found.has(branch.segment)) continue;
+        found.add(branch.segment);
+        if (depth <= 0) continue;
+        const seg = network.segments.get(branch.segment);
+        if (!seg) continue;
+        visit(seg.a === node ? seg.b : seg.a, depth - 1);
+      }
+    };
     if (anchor.node !== undefined) visit(anchor.node, 1);
     // 途中に取り付く相手も「端点で繋がる相手」。ここを重なりとして数えると、
     // T 字に取り付くだけで必ず「交差点が近すぎます」になってしまう。
     // 取り付きの成否は `checkJunctionSpacing` で分割後の形として見る。
-    if (!anchor.split) continue;
-    connected.add(anchor.split.segment);
-    const seg = network.segments.get(anchor.split.segment);
-    if (seg) {
-      visit(seg.a, 0);
-      visit(seg.b, 0);
+    if (anchor.split) {
+      found.add(anchor.split.segment);
+      const seg = network.segments.get(anchor.split.segment);
+      if (seg) {
+        visit(seg.a, 0);
+        visit(seg.b, 0);
+      }
     }
-  }
+    return found;
+  });
+  const connected = new Set<SegmentId>([...sides[0], ...sides[1]]);
   if (ctx.ignore !== undefined) connected.add(ctx.ignore);
 
   blockers.push(...checkOverlaps(ctx, connected));
+  blockers.push(...checkRunningAlong(ctx, sides[0], sides[1]));
   blockers.push(...checkJunctionSpacing(ctx));
+  blockers.push(...checkTunnelJunctions(ctx, connected));
 
   return { blockers: dedupe(blockers) };
 }
@@ -110,10 +131,71 @@ function evaluate(ctx: PlacementContext): string[] {
   return out;
 }
 
+/**
+ * 接続先の向きに逆らっていないか。
+ *
+ * 端点から続きを引くとき、カーソルを**真後ろ**に置くと、接線に沿った円弧が
+ * 解けない (接線に接し、真後ろの点を通る円は存在しない)。今の解き方はそこで
+ * 直線を返すので、**引いてきた道の上をそのまま引き返す**線形ができてしまう。
+ * 繋ぎ目で 180° 折り返す線形は道路にも線路にもならないので、ここで止める。
+ *
+ * 見るのは折り返しだけ。ヘアピンのように鋭く曲がる繋ぎ方 (折れ点) は
+ * 交差点の側で扱えるので、`MAX_FOLD_ANGLE` までは通す。
+ *
+ * 途中接続 (`bidirectional`) は正逆どちらへも出られるので見ない。向きは
+ * `computePlacement` がカーソル側に合わせて選んでいる。
+ */
+function checkDirection(ctx: PlacementContext): string[] {
+  const { alignment } = ctx;
+  const out: string[] = [];
+  const folded = Math.cos(MAX_FOLD_ANGLE);
+  if (ctx.start.tangent && !ctx.start.bidirectional) {
+    // 始点は接線の向きに出ていくはず。
+    if (alignment.sampleAt(0).forwardXZ.dot(ctx.start.tangent) < folded) out.push(REVERSED);
+  }
+  if (ctx.end.tangent && !ctx.end.bidirectional) {
+    // 終点アンカーの接線は「そこから先へ延びる向き」。線形はそれに
+    // 向かって入ってくるので、同じ向きに抜けていたら折り返している。
+    if (alignment.sampleAt(alignment.length).forwardXZ.dot(ctx.end.tangent) > -folded) {
+      out.push(REVERSED);
+    }
+  }
+
+  // 真後ろに近い所を指すと、接線に接する円弧が大きく回り込む。掃引角の
+  // 制限で線形はそこまで届かず、**指した所とは違う道**ができるので置かせない。
+  const tip = alignment.sampleAt(alignment.length).pos;
+  const gap = Math.hypot(tip.x - ctx.end.pos.x, tip.z - ctx.end.pos.z);
+  if (gap > MAX_REACH_GAP) {
+    out.push(`指した所まで届きません (${gap.toFixed(0)} m 手前で終わっています)。`);
+  }
+  return out;
+}
+
+/**
+ * 線形の終点が指した所からずれてよい距離 [m]。
+ * 平行スナップは既存ノードに 2 m まで寄せて繋ぐので、そこは許す。
+ */
+const MAX_REACH_GAP = 5;
+
+const REVERSED = '接続先の向きと逆に折り返しています (既存の線形の上に重なります)。';
+
+/** 繋ぎ目で折り返したとみなす角度。これを超えると、相手の上を戻ることになる。 */
+const MAX_FOLD_ANGLE = 150 * DEG;
+
 type Sample = PolylinePoint;
 
 function polyline(alignment: Alignment, step = 3): Sample[] {
   return toPolyline(alignment, step);
+}
+
+/** 干渉を見る相手 (近くにある既存の線形)。 */
+interface Candidate {
+  cls: NetworkClass;
+  line: Sample[];
+  alignment: Alignment;
+  hits: ReturnType<typeof intersectPolylines>;
+  /** 中心線どうしの粗い当たり判定に使う距離 [m]。 */
+  reach: number;
 }
 
 /**
@@ -129,13 +211,21 @@ function checkOverlaps(ctx: PlacementContext, connected: Set<SegmentId>): string
   const bounds = boundsOf(mine);
   const out: string[] = [];
 
+  // まず近くの線形と交点を集める。同一平面で交わる所 (交差点・踏切になる
+  // 所) では路面が重なって当たり前なので、あとの重なり判定から外す「窓」を
+  // 先に作っておく。窓を相手 1 本ごとではなく全体で持つのは、交差点の中では
+  // **交わる相手に繋がっている別のセグメント**の路面とも重なるため。
+  const candidates: Candidate[] = [];
+  const windows: { s: number; reach: number }[] = [];
+  const myChords = chordsOf(mine, cls.halfWidth);
   for (const seg of network.segments.values()) {
     if (connected.has(seg.id)) continue;
     const other = network.classOf(seg);
-    const otherLine = polyline(network.alignmentOf(seg.id));
+    const alignment = network.alignmentOf(seg.id);
+    const line = polyline(alignment);
     const reach = cls.halfWidth + other.halfWidth;
     // 遠い線形は見るまでもない。
-    const otherBounds = boundsOf(otherLine);
+    const otherBounds = boundsOf(line);
     if (
       bounds.maxX + reach < otherBounds.minX ||
       otherBounds.maxX + reach < bounds.minX ||
@@ -144,18 +234,74 @@ function checkOverlaps(ctx: PlacementContext, connected: Set<SegmentId>): string
     ) {
       continue;
     }
+    const hits = intersectPolylines(mine, line);
+    candidates.push({ cls: other, line, alignment, hits, reach });
+
+    /** s (自分の弧長) のまわりを「交差点・踏切の中」として覚える。 */
+    const addWindow = (
+      s: number,
+      a: { dx: number; dz: number },
+      b: { dx: number; dz: number },
+    ): void => {
+      const sin = Math.abs(a.dx * b.dz - a.dz * b.dx);
+      const cos = Math.abs(a.dx * b.dx + a.dz * b.dz);
+      // 浅すぎる角度は交差点にならない (別の規則が止める)。ここで
+      // 窓を開けると、重なって並走しているだけの線形まで見逃す。
+      if (sin < Math.sin(MIN_CROSSING_ANGLE)) return;
+      windows.push({ s, reach: crossingTrim(cls, other, sin, cos) + CORNER_MARGIN });
+    };
+
+    for (const hit of hits) {
+      if (Math.abs(hit.yA - hit.yB) > LEVEL_CROSSING_TOLERANCE) continue;
+      addWindow(hit.sA, { dx: hit.dirA.x, dz: hit.dirA.y }, { dx: hit.dirB.x, dz: hit.dirB.y });
+    }
+
+    // 交点がちょうど端に来る所 (線が節で分かれていて、その節の上で交わる)
+    // では、交点が隣のセグメントの側にだけ立つ。節の先に線が続いている
+    // なら、そこも交差点・踏切の中として扱う。
+    for (const atStart of [true, false]) {
+      const anchor = atStart ? ctx.start : ctx.end;
+      if (anchor.node === undefined) continue;
+      // 端が行き止まりなら、そこに交差点はない。
+      const beyond = network
+        .branchesAt(anchor.node)
+        .filter((branch) => branch.segment !== ctx.ignore);
+      if (beyond.length === 0) continue;
+      const p = atStart ? mine[0] : mine[mine.length - 1];
+      const dir = endDirection(mine, atStart);
+      const near = nearestOn(line, p.x, p.z);
+      if (!dir || !near) continue;
+      if (near.distance > TOUCH || Math.abs(p.y - near.y) > LEVEL_CROSSING_TOLERANCE) continue;
+      addWindow(p.s, dir, near);
+    }
+    for (const atStart of [true, false]) {
+      const node = atStart ? seg.a : seg.b;
+      if (network.branchesAt(node).length < 2) continue;
+      const p = atStart ? line[0] : line[line.length - 1];
+      const dir = endDirection(line, atStart);
+      const near = nearestOn(mine, p.x, p.z);
+      if (!dir || !near) continue;
+      if (near.distance > TOUCH || Math.abs(p.y - near.y) > LEVEL_CROSSING_TOLERANCE) continue;
+      addWindow(near.s, near, dir);
+    }
+  }
+
+  for (const candidate of candidates) {
+    const other = candidate.cls;
+    const otherLine = candidate.line;
+    const otherAlignment = candidate.alignment;
+    const otherLength = otherAlignment.length;
+    const hits = candidate.hits;
+    const reach = candidate.reach;
 
     let shallow = false;
     let tooClose = 0;
     let worstClearance = Infinity;
     let worstCrossing = 0;
     let lowerKindOfWorst: 'road' | 'rail' = other.kind;
-    const otherAlignment = network.alignmentOf(seg.id);
-    const otherLength = otherAlignment.length;
 
     // 交点での高さで判定する。横にずれた点どうしを比べると、勾配のある
     // 道路では実際より低い / 高い桁下を読んでしまう。
-    const hits = intersectPolylines(mine, otherLine);
     for (const hit of hits) {
       const dy = hit.yA - hit.yB;
       const sin = Math.abs(hit.dirA.x * hit.dirB.y - hit.dirA.y * hit.dirB.x);
@@ -204,15 +350,37 @@ function checkOverlaps(ctx: PlacementContext, connected: Set<SegmentId>): string
       }
     }
 
-    // 交わらないのに近接が続くのは並走。
+    // 中心線が交わらなくても、**幅の分だけ**重なることはある (突き当たり・
+    // すれ違い・並走)。ここは路面を長方形の帯として見て、重なった所を
+    // 拾う。同じ高さで重なれば置けないし、上下に分かれていても、重なって
+    // いる所には桁下が要る。
+    const otherChords = chordsOf(otherLine, other.halfWidth);
     let overlapLength = 0;
-    if (hits.length === 0) {
-      for (let i = 1; i < mine.length; i++) {
-        const a = mine[i];
-        const near = nearestOn(otherLine, a.x, a.z);
-        if (!near || near.distance > reach) continue;
-        if (Math.abs(a.y - near.y) > LEVEL_CROSSING_TOLERANCE) continue;
-        overlapLength += Math.hypot(a.x - mine[i - 1].x, a.z - mine[i - 1].z);
+    let overlapDepth = 0;
+    for (const chord of myChords) {
+      let depth = 0;
+      for (const b of otherChords) {
+        if (Math.abs(chord.cx - b.cx) > chord.reach + b.reach) continue;
+        if (Math.abs(chord.cz - b.cz) > chord.reach + b.reach) continue;
+        depth = Math.max(depth, rectOverlap(chord, b));
+      }
+      if (depth <= OVERLAP_TOLERANCE) continue;
+      // 交差点・踏切の中は、路面が重なるのも高さが動くのも当たり前。
+      if (windows.some((w) => Math.abs(w.s - chord.s) <= w.reach + chord.halfLength)) continue;
+      const near = nearestOn(otherLine, chord.cx, chord.cz);
+      if (!near) continue;
+      const dy = chord.cy - near.y;
+      if (Math.abs(dy) <= LEVEL_CROSSING_TOLERANCE) {
+        overlapDepth = Math.max(overlapDepth, depth);
+        overlapLength += chord.length;
+        continue;
+      }
+      const lowerKind = dy > 0 ? other.kind : cls.kind;
+      const required = lowerKind === 'rail' ? CLEARANCE_OVER_RAIL : CLEARANCE_OVER_ROAD;
+      const clearance = Math.abs(dy) - DECK_THICKNESS;
+      if (clearance < required && clearance < worstClearance) {
+        worstClearance = clearance;
+        lowerKindOfWorst = lowerKind;
       }
     }
 
@@ -230,8 +398,13 @@ function checkOverlaps(ctx: PlacementContext, connected: Set<SegmentId>): string
           `すり付けが要ります (交差角を大きくするか、道路の勾配を緩めてください)。`,
       );
     }
-    if (!shallow && overlapLength > reach * 2.5) {
-      out.push('既存の線形と重なって並走しています。');
+    if (!shallow && overlapDepth > 0) {
+      out.push(
+        overlapLength > reach * 2.5
+          ? '既存の線形と重なって並走しています。'
+          : `既存の線形と路面が重なります (あと ${Math.max(0.5, overlapDepth).toFixed(1)} m 離すか、` +
+            '中心線どうしを交わらせて交差点にしてください)。',
+      );
     }
     if (Number.isFinite(worstClearance)) {
       const required =
@@ -243,6 +416,91 @@ function checkOverlaps(ctx: PlacementContext, connected: Set<SegmentId>): string
   }
   return out;
 }
+
+/**
+ * 繋がっている相手の上を走っていないか。
+ *
+ * 端点で繋がる相手は重なりの判定から外している。分かれたばかりの所は必ず
+ * 路面が重なるからで、そこは交差点・分岐器の中として扱ってよい。ただし
+ * 外しっぱなしにすると、**引いてきた道の上をそのまま引き返す**線形まで
+ * 通ってしまう。
+ *
+ * 見るのは**両端とも同じ 1 本に繋がる**線形だけ。分岐器やランプのように
+ * 浅い角度で分かれて別の所へ抜ける線形は、離れきるまで何十 m も路盤を
+ * 共有するのが当たり前なので、ここでは触らない。逆に、出た所へ戻って
+ * くる線形は、その間ずっと相手から離れていなければならない。
+ *
+ * 繋ぎ目として許す長さは
+ *
+ *  - 規格最小半径で曲がって幅の分だけ横に逃げる弧長 √(2Rw)
+ *  - その交差点の面の広がり (`junctionReach`)
+ *
+ * の大きい方。
+ */
+function checkRunningAlong(
+  ctx: PlacementContext,
+  atStart: Set<SegmentId>,
+  atEnd: Set<SegmentId>,
+): string[] {
+  const { network, cls, alignment } = ctx;
+  const length = alignment.length;
+  const mine = polyline(alignment);
+  const myChords = chordsOf(mine, cls.halfWidth);
+  const bounds = boundsOf(mine);
+  let along = 0;
+
+  for (const id of atStart) {
+    if (id === ctx.ignore || !atEnd.has(id)) continue;
+    const seg = network.segments.get(id);
+    if (!seg) continue;
+    const other = network.classOf(seg);
+    const line = polyline(network.alignmentOf(id));
+    const reach = cls.halfWidth + other.halfWidth;
+    const otherBounds = boundsOf(line);
+    if (
+      bounds.maxX + reach < otherBounds.minX ||
+      otherBounds.maxX + reach < bounds.minX ||
+      bounds.maxZ + reach < otherBounds.minZ ||
+      otherBounds.maxZ + reach < bounds.minZ
+    ) {
+      continue;
+    }
+    // 繋ぎ目として許す長さ。繋がっていない端からは測らない。
+    const joint = (anchor: Anchor): number => {
+      const spread = anchor.node !== undefined ? junctionReach(network, anchor.node) : 0;
+      return Math.max(Math.sqrt(2 * cls.minRadius * reach), spread) + CORNER_MARGIN;
+    };
+    const fromStart = joint(ctx.start);
+    const fromEnd = joint(ctx.end);
+
+    const otherChords = chordsOf(line, other.halfWidth);
+    for (const chord of myChords) {
+      if (chord.s <= fromStart || length - chord.s <= fromEnd) continue;
+      let depth = 0;
+      for (const b of otherChords) {
+        if (Math.abs(chord.cx - b.cx) > chord.reach + b.reach) continue;
+        if (Math.abs(chord.cz - b.cz) > chord.reach + b.reach) continue;
+        depth = Math.max(depth, rectOverlap(chord, b));
+      }
+      if (depth <= OVERLAP_TOLERANCE) continue;
+      // 上下に分かれていて桁下が足りているなら、立体交差として成り立つ。
+      const near = nearestOn(line, chord.cx, chord.cz);
+      if (!near) continue;
+      const dy = chord.cy - near.y;
+      const lower = dy > 0 ? other.kind : cls.kind;
+      const required = lower === 'rail' ? CLEARANCE_OVER_RAIL : CLEARANCE_OVER_ROAD;
+      if (Math.abs(dy) - DECK_THICKNESS >= required) continue;
+      along += chord.length;
+    }
+  }
+
+  return along > ALONG_TOLERANCE
+    ? ['出てきた線形の上に戻って重なっています (離れるように引いてください)。']
+    : [];
+}
+
+/** 繋ぎ目の先で重なってよい長さ [m]。折れ線の刻み 2 つ分。 */
+const ALONG_TOLERANCE = 6;
 
 /**
  * 踏切で道路をどれだけ変形させることになるか [m]。
@@ -280,29 +538,135 @@ function boundsOf(line: Sample[]): { minX: number; maxX: number; minZ: number; m
   return { minX, maxX, minZ, maxZ };
 }
 
-function nearestOn(
-  line: Sample[],
-  x: number,
-  z: number,
-): { distance: number; y: number } | null {
-  let best: { distance: number; y: number } | null = null;
+/**
+ * 中心線の 1 区間を、幅を持った長方形として見たもの。
+ *
+ * 帯は円ではないので、中心線どうしの距離だけで重なりを測ると、突き当たる
+ * 形 (T 字) の端で実際より近いと判定してしまう。長方形として扱えば、
+ * 並走・突き当たり・斜めのすれ違いを同じ式で見られる。
+ */
+interface Chord {
+  cx: number;
+  cz: number;
+  cy: number;
+  /** 単位方向。 */
+  dx: number;
+  dz: number;
+  halfLength: number;
+  /** 半幅 (舗装・道床の縁まで)。 */
+  half: number;
+  /** 粗い当たり判定用の外接半径 [m]。 */
+  reach: number;
+  /** 中央の弧長 [m]。 */
+  s: number;
+  length: number;
+}
+
+function chordOf(a: Sample, b: Sample, half: number): Chord | null {
+  const dx = b.x - a.x;
+  const dz = b.z - a.z;
+  const length = Math.hypot(dx, dz);
+  if (length < 1e-6) return null;
+  return {
+    cx: (a.x + b.x) / 2,
+    cz: (a.z + b.z) / 2,
+    cy: (a.y + b.y) / 2,
+    dx: dx / length,
+    dz: dz / length,
+    halfLength: length / 2,
+    half,
+    reach: length / 2 + half,
+    s: (a.s + b.s) / 2,
+    length,
+  };
+}
+
+function chordsOf(line: Sample[], half: number): Chord[] {
+  const out: Chord[] = [];
+  for (let i = 0; i + 1 < line.length; i++) {
+    const chord = chordOf(line[i], line[i + 1], half);
+    if (chord) out.push(chord);
+  }
+  return out;
+}
+
+/**
+ * 幅を持った 2 区間 (長方形) の重なりの深さ [m]。0 なら離れている。
+ *
+ * 分離軸で見る。どれか 1 つの軸で離れていれば重なっておらず、どの軸でも
+ * 重なっていれば、いちばん浅い重なりが「あと何 m 離せばよいか」になる。
+ */
+function rectOverlap(a: Chord, b: Chord): number {
+  const axes: [number, number][] = [
+    [a.dx, a.dz],
+    [-a.dz, a.dx],
+    [b.dx, b.dz],
+    [-b.dz, b.dx],
+  ];
+  const ex = b.cx - a.cx;
+  const ez = b.cz - a.cz;
+  let depth = Infinity;
+  for (const [ux, uz] of axes) {
+    const ra =
+      a.halfLength * Math.abs(a.dx * ux + a.dz * uz) + a.half * Math.abs(-a.dz * ux + a.dx * uz);
+    const rb =
+      b.halfLength * Math.abs(b.dx * ux + b.dz * uz) + b.half * Math.abs(-b.dz * ux + b.dx * uz);
+    const gap = ra + rb - Math.abs(ex * ux + ez * uz);
+    if (gap <= 0) return 0;
+    if (gap < depth) depth = gap;
+  }
+  return depth;
+}
+
+/** 線形上のいちばん近い点。 */
+interface Near {
+  distance: number;
+  y: number;
+  /** その点の弧長 [m]。 */
+  s: number;
+  /** その点での単位方向。 */
+  dx: number;
+  dz: number;
+}
+
+function nearestOn(line: Sample[], x: number, z: number): Near | null {
+  let best: Near | null = null;
   for (let i = 0; i + 1 < line.length; i++) {
     const a = line[i];
     const b = line[i + 1];
     const dx = b.x - a.x;
     const dz = b.z - a.z;
     const lengthSq = dx * dx + dz * dz;
-    let t = 0;
-    if (lengthSq > 1e-9) {
-      t = ((x - a.x) * dx + (z - a.z) * dz) / lengthSq;
-      t = t < 0 ? 0 : t > 1 ? 1 : t;
-    }
+    if (lengthSq < 1e-12) continue;
+    let t = ((x - a.x) * dx + (z - a.z) * dz) / lengthSq;
+    t = t < 0 ? 0 : t > 1 ? 1 : t;
     const distance = Math.hypot(x - (a.x + dx * t), z - (a.z + dz * t));
-    if (!best || distance < best.distance) {
-      best = { distance, y: a.y + (b.y - a.y) * t };
-    }
+    if (best && distance >= best.distance) continue;
+    const length = Math.sqrt(lengthSq);
+    best = {
+      distance,
+      y: a.y + (b.y - a.y) * t,
+      s: a.s + (b.s - a.s) * t,
+      dx: dx / length,
+      dz: dz / length,
+    };
   }
   return best;
+}
+
+/** 端点が相手の中心線に乗っているとみなす距離 [m]。 */
+const TOUCH = 0.5;
+
+/** 線形の端での単位方向 (始点は前向き、終点も前向き)。 */
+function endDirection(line: Sample[], atStart: boolean): { dx: number; dz: number } | null {
+  const a = atStart ? line[0] : line[line.length - 2];
+  const b = atStart ? line[1] : line[line.length - 1];
+  if (!a || !b) return null;
+  const dx = b.x - a.x;
+  const dz = b.z - a.z;
+  const length = Math.hypot(dx, dz);
+  if (length < 1e-9) return null;
+  return { dx: dx / length, dz: dz / length };
 }
 
 /**
@@ -442,8 +806,13 @@ function trimAt(network: Network, node: NodeId, segment: SegmentId): number {
   return requiredTrims(branches)[index];
 }
 
-/** その交差点の面が広がっている範囲 [m] (端点・継ぎ目なら 0)。 */
-function junctionReach(network: Network, node: NodeId): number {
+/**
+ * その交差点の面が広がっている範囲 [m] (端点・継ぎ目なら 0)。
+ *
+ * 敷設ツールも同じ値を見る (面の中を指したらその交差点に繋ぐ)。判定と
+ * 操作が同じ範囲を見るので、「指せるのに置けない」所ができない。
+ */
+export function junctionReach(network: Network, node: NodeId): number {
   const branches = network.branchesAt(node);
   if (branches.length < 2) return 0;
   const trims = requiredTrims(branches);
@@ -463,6 +832,117 @@ function crossingTrim(
   cos: number,
 ): number {
   return (other.halfWidth + own.halfWidth * cos) / Math.max(0.05, sin) + CORNER_MARGIN;
+}
+
+/** 坑門が交差点の外に立つために要る余裕 [m] (柱の奥行き + 隅の丸め)。 */
+const PORTAL_STANDOFF = 3;
+
+/**
+ * 坑口にかかる交差点を止める。
+ *
+ * トンネルの中の交差点そのものは作れる (交差点面を地中の空洞として囲い、
+ * 枝のトンネルはそこへ開く)。作れないのは**坑口にかかる**交差点で、
+ * 交差点の口に坑門が立って曲がってきた車がぶつかる。地形と線形の高さで
+ * 決まることなので、「掘ってから直す」ことができない。置く前に止める。
+ *
+ * 判定は交差点になる点 (既存ノード・取り付き・同一平面の交差) のまわりで、
+ * **交差点が食べる長さ + 坑門の余裕**の範囲を線形に沿って歩き、そこに
+ * トンネルと地表の**境目**があるかどうかを見る。全部トンネル (空洞) でも
+ * 全部地表でも構わない。地形を横に見ないのは、山腹を走っているだけの
+ * 道路を巻き込まないため。
+ */
+function checkTunnelJunctions(ctx: PlacementContext, connected: Set<SegmentId>): string[] {
+  const field = ctx.field;
+  if (!field) return [];
+  const { network, cls, alignment } = ctx;
+  const out: string[] = [];
+
+  /** 線形の s0 から前後 `reach` の範囲に、坑口 (トンネルと地表の境目) があるか。 */
+  const portalNear = (line: Alignment, s0: number, reach: number): boolean => {
+    let tunnel = false;
+    let open = false;
+    for (let d = 0; d <= reach; d += 2) {
+      for (const s of d === 0 ? [s0] : [s0 - d, s0 + d]) {
+        if (s < 0 || s > line.length) continue;
+        const p = line.sampleAt(s).pos;
+        if (classify(p.y, field.baseHeightAt(p.x, p.z)) === 'tunnel') tunnel = true;
+        else open = true;
+      }
+    }
+    return tunnel && open;
+  };
+
+  const blocked = (): void => {
+    out.push('トンネルの坑口には交差点を作れません (坑口から離してください)。');
+  };
+
+  // 1. 既存の線形と同じ高さで交わる所 (新しくできる交差点)。
+  const mine = polyline(alignment);
+  for (const seg of network.segments.values()) {
+    if (connected.has(seg.id)) continue;
+    const other = network.classOf(seg);
+    if (other.kind !== cls.kind) continue;
+    const otherAlignment = network.alignmentOf(seg.id);
+    for (const hit of intersectPolylines(mine, polyline(otherAlignment))) {
+      if (Math.abs(hit.yA - hit.yB) > LEVEL_CROSSING_TOLERANCE) continue;
+      const sin = Math.abs(hit.dirA.x * hit.dirB.y - hit.dirA.y * hit.dirB.x);
+      const cos = Math.abs(hit.dirA.x * hit.dirB.x + hit.dirA.y * hit.dirB.y);
+      if (
+        portalNear(alignment, hit.sA, crossingTrim(cls, other, sin, cos) + PORTAL_STANDOFF) ||
+        portalNear(otherAlignment, hit.sB, crossingTrim(other, cls, sin, cos) + PORTAL_STANDOFF)
+      ) {
+        blocked();
+        return dedupe(out);
+      }
+    }
+  }
+
+  // 2. 端点が既存のノード・既存の線形の途中に取り付く所。
+  const ends: [Anchor, number][] = [
+    [ctx.start, 0],
+    [ctx.end, alignment.length],
+  ];
+  for (const [anchor, s] of ends) {
+    const neighbours: { line: Alignment; s: number; cls: NetworkClass }[] = [];
+    if (anchor.node !== undefined) {
+      for (const branch of network.branchesAt(anchor.node)) {
+        if (branch.segment === ctx.ignore) continue;
+        const seg = network.segments.get(branch.segment);
+        if (!seg) continue;
+        const line = network.alignmentOf(branch.segment);
+        neighbours.push({
+          line,
+          s: branch.atStart ? 0 : line.length,
+          cls: network.classOf(seg),
+        });
+      }
+    } else if (anchor.split) {
+      const seg = network.segments.get(anchor.split.segment);
+      if (seg) {
+        const line = network.alignmentOf(anchor.split.segment);
+        neighbours.push({
+          line,
+          s: clamp(anchor.split.s, 0, line.length),
+          cls: network.classOf(seg),
+        });
+      }
+    }
+    // 交差点にならない端は見ない。行き止まり (枝なし) と、繋いでも
+    // 2 枝にしかならない端 (道の延伸・折れ点) には交差点の面ができず、
+    // 坑門と喧嘩する口もない。トンネルの中の道はこうして延ばせる。
+    if (neighbours.length < 2) continue;
+    for (const neighbour of neighbours) {
+      // 直角に取り付く場合のトリム。斜めの取り付きはこれより長くなるが、
+      // 足りない分は「止めない側」に外れるので誤検知にならない。
+      const reach = cls.halfWidth + neighbour.cls.halfWidth + CORNER_MARGIN + PORTAL_STANDOFF;
+      if (portalNear(alignment, s, reach) || portalNear(neighbour.line, neighbour.s, reach)) {
+        blocked();
+        return dedupe(out);
+      }
+    }
+  }
+
+  return out;
 }
 
 function dedupe(list: string[]): string[] {

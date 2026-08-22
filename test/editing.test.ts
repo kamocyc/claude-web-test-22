@@ -4,9 +4,15 @@ import { Alignment } from '../src/core/alignment';
 import { curveFromTangents } from '../src/core/curve';
 import { VerticalProfile } from '../src/core/profile';
 import { getClass } from '../src/network/classes';
-import { anchorFromSegment, computePlacement, placeSegment } from '../src/network/editing';
+import {
+  anchorFromNode,
+  anchorFromSegment,
+  computePlacement,
+  placeSegment,
+} from '../src/network/editing';
 import { solveJunctions } from '../src/network/junction';
 import { Network, type NodeId } from '../src/network/network';
+import { parallelSpacing } from '../src/network/parallel';
 import { checkPlacement } from '../src/network/rules';
 
 /** 2 点を結ぶ直線の線形。 */
@@ -46,6 +52,45 @@ function shapeWarnings(network: Network): string[] {
   }
   return out;
 }
+
+describe('規格最大勾配', () => {
+  /**
+   * 縦断勾配の規格は、実物の基準 (生活道路 12%、線路 3.5% など) より
+   * 5 割ほど緩めてある。地形の起伏に対して敷地が狭く、実物どおりでは
+   * 思うように繋げられないため。
+   */
+  const cases: [string, number, number][] = [
+    // 種別, 置ける勾配, 置けない勾配
+    ['road_small', 0.17, 0.19],
+    ['road_medium', 0.13, 0.14],
+    ['road_large', 0.1, 0.11],
+    ['road_highway', 0.07, 0.08],
+    ['road_ramp', 0.11, 0.13],
+    ['rail_single', 0.048, 0.055],
+    ['rail_yard', 0.028, 0.032],
+  ];
+
+  for (const [classId, ok, tooSteep] of cases) {
+    it(`${classId} は ${(ok * 100).toFixed(1)}% で置けて ${(tooSteep * 100).toFixed(1)}% では置けない`, () => {
+      const cls = getClass(classId);
+      const network = new Network();
+      const check = (grade: number): string[] => {
+        const length = 300;
+        const a = new Vector3(0, 20, 0);
+        const b = new Vector3(length, 20 + grade * length, 0);
+        return checkPlacement({
+          network,
+          cls,
+          alignment: straight(a, b),
+          start: { pos: a },
+          end: { pos: b },
+        }).blockers;
+      };
+      expect(check(ok)).toEqual([]);
+      expect(check(tooSteep).join(' ')).toContain('勾配');
+    });
+  }
+});
 
 describe('敷設できるかどうかの判定', () => {
   /**
@@ -214,7 +259,153 @@ describe('敷設できるかどうかの判定', () => {
   });
 });
 
+/**
+ * 中心線が交わらなくても、路面 (帯) は重なる。
+ *
+ * 中心線どうしの距離だけを見ていると、突き当たる形・すれ違う形で
+ * 「交差点でも踏切でもないのに舗装が重なる」配置が通ってしまう。
+ * 幅を持った帯として見て、重なりと桁下を判定する。
+ */
+describe('中心線が交わらない重なり', () => {
+  /** x 軸に沿う既存の道路を 1 本置いたネットワーク。 */
+  function withMainRoad(classId = 'road_medium', y = 0): Network {
+    const network = new Network();
+    addStraight(network, classId, new Vector3(-150, y, 0), new Vector3(150, y, 0));
+    return network;
+  }
+
+  function check(network: Network, classId: string, a: Vector3, b: Vector3): string[] {
+    return checkPlacement({
+      network,
+      cls: getClass(classId),
+      alignment: straight(a, b),
+      start: { pos: a },
+      end: { pos: b },
+    }).blockers;
+  }
+
+  it('舗装の中で行き止まる道路は置けない (交差点にならない突き当たり)', () => {
+    // 幹線道路の舗装は |z| <= 8.9 m。その中で終わる枝は、交差点にも
+    // ならないまま舗装が重なる。
+    const network = withMainRoad();
+    const blockers = check(
+      network,
+      'road_small',
+      new Vector3(40, 0, -100),
+      new Vector3(40, 0, -6),
+    );
+    expect(blockers.join(' ')).toContain('重なります');
+  });
+
+  it('舗装の外で行き止まるなら置ける', () => {
+    const network = withMainRoad();
+    const blockers = check(
+      network,
+      'road_small',
+      new Vector3(40, 0, -100),
+      new Vector3(40, 0, -10),
+    );
+    expect(blockers).toEqual([]);
+  });
+
+  it('中心線まで届く枝は交差点になるので置ける', () => {
+    const network = withMainRoad();
+    const blockers = check(
+      network,
+      'road_small',
+      new Vector3(40, 0, -100),
+      new Vector3(40, 0, 30),
+    );
+    expect(blockers).toEqual([]);
+  });
+
+  it('舗装の縁をかすめて跨ぐ高架は、桁下が足りなければ置けない', () => {
+    // 中心線は交わらない (道路の手前で終わる) が、桁は舗装の上を通る。
+    const network = withMainRoad();
+    const low = check(
+      network,
+      'road_small',
+      new Vector3(40, 5, -100),
+      new Vector3(40, 5, -6),
+    );
+    expect(low.join(' ')).toContain('建築限界');
+    // 桁下が取れていれば同じ形でも置ける。
+    const high = check(
+      network,
+      'road_small',
+      new Vector3(40, 6, -100),
+      new Vector3(40, 6, -6),
+    );
+    expect(high).toEqual([]);
+  });
+
+  it('少し高い所を並走する高架も、桁下が足りなければ置けない', () => {
+    // 平面では舗装が 1.5 m 重なり、高さは 3 m しか違わない。中心線が
+    // 交わらないので、以前は何も言えなかった。
+    const network = withMainRoad();
+    const blockers = check(
+      network,
+      'road_small',
+      new Vector3(-100, 3, 12),
+      new Vector3(100, 3, 12),
+    );
+    expect(blockers.join(' ')).toContain('建築限界');
+  });
+
+  it('平行スナップの間隔 (舗装の縁が触れ合う幅) は置ける', () => {
+    const cls = getClass('rail_single');
+    const network = new Network();
+    addStraight(network, 'rail_single', new Vector3(-150, 0, 0), new Vector3(150, 0, 0));
+    const gap = parallelSpacing(cls);
+    const blockers = check(
+      network,
+      'rail_single',
+      new Vector3(-120, 0, gap),
+      new Vector3(120, 0, gap),
+    );
+    expect(blockers).toEqual([]);
+    // 1 m 詰めれば重なる。
+    const tight = check(
+      network,
+      'rail_single',
+      new Vector3(-120, 0, gap - 1),
+      new Vector3(120, 0, gap - 1),
+    );
+    expect(tight.join(' ')).toContain('重な');
+  });
+});
+
 describe('既存の線形への取り付き', () => {
+  it('線路途中のクリック位置を接点にして、指した側へ接線分岐する', () => {
+    const network = new Network();
+    addStraight(network, 'rail_yard', new Vector3(-120, 0, 0), new Vector3(120, 0, 0));
+    const [segment] = [...network.segments.keys()];
+    const alignment = network.alignmentOf(segment);
+    const anchor = anchorFromSegment(network, segment, alignment.length / 2);
+
+    for (const side of [-1, 1]) {
+      const preview = computePlacement(anchor, new Vector3(side * 90, 0, 25), {
+        straight: false,
+        cls: getClass('rail_yard'),
+      });
+      const tangent = preview.horizontal.tangentAt(0);
+      expect(tangent.x * side).toBeGreaterThan(0.999);
+      expect(Math.abs(tangent.y)).toBeLessThan(1e-6);
+    }
+  });
+
+  it('既存線路の端点へ、プレビューの時点から接線を揃えて接続する', () => {
+    const network = new Network();
+    addStraight(network, 'rail_yard', new Vector3(-120, 0, 0), new Vector3(0, 0, 0));
+    const node = network.findNodeNear(new Vector3(0, 0, 0), 0.5)!;
+    const end = anchorFromNode(network, node, getClass('rail_yard'));
+    const start = { pos: new Vector3(90, 0, 35) };
+    const preview = computePlacement(start, end, { straight: false, cls: getClass('rail_yard') });
+    const tangent = preview.horizontal.tangentAt(preview.horizontal.length);
+    expect(tangent.x).toBeLessThan(-0.999);
+    expect(Math.abs(tangent.y)).toBeLessThan(1e-6);
+  });
+
   /** 既存の道路の端に、角度 `deg` で新しい道路を繋ぐ。 */
   function joinAt(deg: number, classId = 'road_medium') {
     const network = new Network();
@@ -264,6 +455,37 @@ describe('既存の線形への取り付き', () => {
     const ends = [...joined.network.nodes.values()].map((n) => `${n.pos.x.toFixed(2)}`);
     expect(ends).toContain('-120.00');
     expect(far).toBeDefined();
+  });
+
+  /**
+   * 始点と終点をどちらも同じ線形の途中に取り付けると、始点を分割した時点で
+   * 終点の相手が消える。分かれた片方に取り付き直して、例外にしない。
+   */
+  it('同じ線形の 2 か所に取り付いても例外にならない', () => {
+    const network = new Network();
+    // 大きく曲がった道路。その内側を突っ切る近道を引く。
+    const a = network.addNode(new Vector3(-150, 0, 0));
+    const b = network.addNode(new Vector3(150, 0, 0));
+    network.addSegment({
+      classId: 'road_medium',
+      a: a.id,
+      b: b.id,
+      ctrlA: new Vector2(-90, 180),
+      ctrlB: new Vector2(90, 180),
+      gradeA: 0,
+      gradeB: 0,
+    });
+    const [existing] = [...network.segments.keys()];
+    const alignment = network.alignmentOf(existing);
+    const start = anchorFromSegment(network, existing, alignment.length * 0.25);
+    const end = anchorFromSegment(network, existing, alignment.length * 0.75);
+    const preview = computePlacement(start, end.pos.clone(), {
+      straight: true,
+      cls: getClass('road_medium'),
+    });
+    expect(() => placeSegment(network, 'road_medium', start, { ...end }, preview)).not.toThrow();
+    // 元の線形は 2 か所で分割され、近道が 1 本増える。
+    expect(network.segments.size).toBeGreaterThanOrEqual(4);
   });
 
   it('急な折れは「角」の意図とみなしてそのまま残す', () => {

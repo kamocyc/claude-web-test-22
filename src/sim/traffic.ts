@@ -23,6 +23,8 @@ export interface BodySize {
 export interface BodyPose {
   pos: Vector3;
   dir: Vector3;
+  /** 路面の横断勾配 (右へ 1 m あたりの上がり)。カントで車体が傾く。 */
+  roll: number;
 }
 
 export interface Vehicle {
@@ -39,6 +41,13 @@ export interface Vehicle {
   color: RGB;
   /** 両ごとの姿勢 (先頭から順)。 */
   bodies: BodyPose[];
+  /**
+   * 進入すると決めた交差点の進路。
+   *
+   * 停止線を越えてから信号や進路の取り合いで気が変わると、横断歩道の上や
+   * 交差点の中で止まることになる。越える前に決め、越えたらそのまま渡る。
+   */
+  commit?: number;
 }
 
 /** 加速度・減速度 [m/s^2]。 */
@@ -54,6 +63,8 @@ const MIN_GAP = 2.5;
 const LOOKAHEAD = 90;
 /** 交差点の進路に入る前に、競合の有無を確かめ始める距離 [m]。 */
 const ENTRY_CHECK = 14;
+/** 停止線の無い進路 (分岐器・転回) で、交差点の面の手前に取る余裕 [m]。 */
+const STOP_MARGIN = 0.5;
 /** 連結する車両どうしの間隔 [m]。 */
 const COUPLING = 0.8;
 /** 車両を湧かせるときに、まわりに空けておく距離 [m]。 */
@@ -158,6 +169,17 @@ export class Traffic {
       }
     }
 
+    // 「入ると決めた」進路は、誰が先に判断するかに関わらず押さえておく。
+    // 決めた車が横取りされると、止まりきれない所で止まる羽目になる。
+    for (const vehicle of this.vehicles) {
+      if (vehicle.commit === undefined) continue;
+      const lane = this.graph.lanes[vehicle.commit];
+      if (!lane) continue;
+      occupied.add(lane.id);
+      const target = lane.next[0];
+      if (target !== undefined) tailIn.set(target, 0);
+    }
+
     const space: JunctionSpace = { occupied, tailIn };
     for (const vehicle of this.vehicles) {
       this.advance(vehicle, step, space);
@@ -183,6 +205,10 @@ export class Traffic {
 
     // 前方の車線を順に見て、速度制限・信号・競合・前車を拾う。
     const at = this.locate(vehicle.route, vehicle.head);
+    // 進入すると決めた進路に乗ったら、そこから先は位置で押さえられる。
+    if (vehicle.commit !== undefined && vehicle.route.indexOf(vehicle.commit) <= at.index) {
+      vehicle.commit = undefined;
+    }
     let ahead = -at.s;
     for (let i = at.index; i < vehicle.route.length; i++) {
       const lane = this.graph.lanes[vehicle.route[i]];
@@ -192,24 +218,55 @@ export class Traffic {
       if (ahead <= 25) limit = Math.min(limit, lane.speedLimit);
 
       if (i > at.index && lane.kind === 'connector') {
+        // 止まる位置は停止線。停止線を引いていない進路 (分岐器・転回) は
+        // 交差点の面の際で止める。
+        const line = ahead - (lane.stopLine ?? STOP_MARGIN);
         const entry = ahead;
         // 合流先 (進路を抜けた先の車線) に空きがあるか。別の進路から
         // 合流してくる車は、互いの進路の上にいる間は見えないので、
         // 入る前にここで確かめないと重なってしまう。
         const target = lane.next[0];
         const free = target === undefined ? Infinity : tailIn.get(target) ?? Infinity;
-        if (lane.phase !== undefined && signalStateAt(this.time, lane.phase) !== 0) {
-          stopIn = Math.min(stopIn, entry - 0.5);
-        } else if (
-          entry < ENTRY_CHECK &&
-          (free < room || lane.conflicts.some((c) => occupied.has(c)))
-        ) {
-          stopIn = Math.min(stopIn, entry - 0.5);
-        } else if (entry < ENTRY_CHECK) {
-          // 進入すると決めたら、この場で押さえる。同じ枠を 2 台が同時に
-          // 取ってしまわないよう、判断した順に確定させる。
+        /** 進入すると決めたときの押さえ。 */
+        const reserve = (): void => {
+          // 同じ枠を 2 台が同時に取ってしまわないよう、判断した順に確定する。
           occupied.add(lane.id);
           if (target !== undefined) tailIn.set(target, 0);
+          // もう止まりきれない所まで来たら、そこから先は引き返さない。
+          // (引き返せば、横断歩道や交差点の中で止まることになる。)
+          if (!this.canStopBefore(line, vehicle.speed)) vehicle.commit = lane.id;
+        };
+
+        // 停止線の手前で止まりきれるか。止まれない所で「やっぱり止まる」と
+        // 決めると、横断歩道や交差点の中で止まることになる。
+        const canStop = this.canStopBefore(line, vehicle.speed);
+        // 進路の取り合いは、止まれる距離のうちに見ておく。ぎりぎりで
+        // 気付いても間に合わない。
+        const decideAt = ENTRY_CHECK + this.brakingDistance(vehicle.speed);
+        const signal =
+          lane.phase === undefined ? 0 : signalStateAt(this.time, lane.phase);
+
+        // 進路の取り合い。合流先に空きが無い / 交わる進路に誰かいる。
+        const busy = free < room || lane.conflicts.some((c) => occupied.has(c));
+
+        if (vehicle.commit === lane.id) {
+          // 決めたあとでも、まだ止まれるうちに赤や取り合いに気付いたら
+          // 取り消す。止まれないなら、決めたとおり渡り切る。
+          if (canStop && (signal !== 0 || busy)) {
+            stopIn = Math.min(stopIn, line);
+            vehicle.commit = undefined;
+          } else {
+            reserve();
+          }
+        } else if (signal !== 0) {
+          // 黄で止まりきれず、進路も空いているなら渡り切る (ジレンマゾーン)。
+          // 止まれるなら止まるし、進路が空いていなければ精一杯止まる。
+          if (signal === 1 && !canStop && !busy) reserve();
+          else stopIn = Math.min(stopIn, line);
+        } else if (entry < decideAt && busy) {
+          stopIn = Math.min(stopIn, line);
+        } else if (entry < decideAt) {
+          reserve();
         }
       }
       ahead += lane.path.length;
@@ -239,6 +296,29 @@ export class Traffic {
     vehicle.speed = Math.max(0, v + clamp(accel, -MAX_BRAKE, ACCEL) * dt);
     vehicle.head += vehicle.speed * dt;
     this.trimRoute(vehicle);
+  }
+
+  /**
+   * その速度から停止線までに止まりきるのに要る距離 [m]。
+   *
+   * 減速度 `DECEL` で止まる距離に、判断と車間の余裕を足したもの。
+   * これより手前で「止まる」と決めても間に合わないので、進路の取り合いは
+   * この距離のうちに決める。速いほど長くなるが、上限を切って、交差点を
+   * 何十秒も押さえたままにしない。
+   */
+  private brakingDistance(speed: number): number {
+    return Math.min(60, (speed * speed) / (2 * DECEL) + MIN_GAP);
+  }
+
+  /**
+   * その速度で、`distance` [m] 先の停止線までに止まりきれるか。
+   *
+   * ほとんど止まっている車はいつでも止まれる (停止線の上で待っている車が
+   * 「もう止まれない」と判断して動き出さないように)。
+   */
+  private canStopBefore(distance: number, speed: number): boolean {
+    if (speed < 1.5) return distance > -0.5;
+    return distance >= this.brakingDistance(speed);
   }
 
   /** 前を走る車両との車間 [m] と、その速度。いなければ無限大。 */

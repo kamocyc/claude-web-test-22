@@ -1,0 +1,432 @@
+import { describe, expect, it } from 'vitest';
+import { Vector3 } from 'three';
+import { Ride, cabOffset, cabPose, hitBody, nearestVehicle, pickVehicle } from '../src/app/ride';
+import { roofOf } from '../src/render/vehicles';
+import { draw } from '../src/app/sketch';
+import { solveJunctions } from '../src/network/junction';
+import { Network, type SegmentId } from '../src/network/network';
+import { buildLaneGraph, type LaneGraph, type VehicleKind } from '../src/sim/lanegraph';
+import { Traffic, type Vehicle } from '../src/sim/traffic';
+import { Heightfield } from '../src/terrain/heightfield';
+
+/**
+ * 乗車モード (一人称視点)。
+ *
+ * 目に見えるものを扱う所なので、「乗ったときにどこに目があるか」と
+ * 「走っている間それが暴れないか」を数で押さえる。カメラにも DOM にも
+ * 触らない素の計算なので、ブラウザなしで確かめられる。
+ */
+
+const SIZES: Record<VehicleKind, { length: number; width: number; height: number }> = {
+  car: { length: 4.4, width: 1.8, height: 1.45 },
+  train: { length: 18, width: 2.9, height: 3.6 },
+};
+
+/** 試験用の 1 両。`bodies[0]` だけを見るので、そこだけ埋める。 */
+function vehicleAt(
+  pos: Vector3,
+  dir: Vector3,
+  kind: VehicleKind = 'train',
+  id = 1,
+  roll = 0,
+): Vehicle {
+  return {
+    id,
+    kind,
+    route: [0],
+    head: 0,
+    speed: 12,
+    size: { ...SIZES[kind] },
+    cars: kind === 'train' ? 3 : 1,
+    color: [0.5, 0.5, 0.5],
+    bodies: [{ pos: pos.clone(), dir: dir.clone().normalize(), roll }],
+  };
+}
+
+/** 交差点を解き、描画と同じトリム範囲つきの車線グラフを組み立てる。 */
+function laneGraphOf(network: Network): LaneGraph {
+  const { junctions, trims } = solveJunctions(network);
+  const ranges = new Map<SegmentId, { s0: number; s1: number }>();
+  for (const seg of network.segments.values()) {
+    const trim = trims.get(seg.id)!;
+    const length = network.alignmentOf(seg.id).length;
+    ranges.set(seg.id, { s0: trim.a, s1: Math.max(trim.a + 0.5, length - trim.b) });
+  }
+  return buildLaneGraph(network, junctions, ranges);
+}
+
+/** 曲線と勾配のある 1 本の線路。 */
+function railLine(): Network {
+  const network = new Network();
+  const field = new Heightfield();
+  draw(network, field, 'rail_single', [
+    { x: -400, z: -120, y: 0 },
+    { x: -100, z: -120, y: 4 },
+    { x: 120, z: 40, y: 9 },
+    { x: 380, z: 160, y: 6 },
+  ]);
+  return network;
+}
+
+describe('運転台の位置', () => {
+  it('目は車体の中の、床より上・先端より後ろにある', () => {
+    for (const kind of ['car', 'train'] as VehicleKind[]) {
+      const vehicle = vehicleAt(new Vector3(0, 10, 0), new Vector3(0, 0, 1), kind);
+      const { ahead, up } = cabOffset(vehicle);
+      const { length, height } = vehicle.size;
+      // 前後: 車体の中で、先端より手前。
+      expect(ahead).toBeGreaterThan(0);
+      expect(length / 2 - ahead).toBeGreaterThan(1);
+      // 前を走る車両との車間 (2.5 m) より奥に引っ込めない。詰まったときに
+      // 相手の車体の中が見えてしまう。
+      expect(length / 2 - ahead).toBeLessThan(2.5);
+      // 上下: 足回り (車高の 18 %) より上、屋根より下。
+      expect(up).toBeGreaterThan(height * 0.18);
+      expect(up).toBeLessThan(height);
+
+      const pose = cabPose(vehicle);
+      expect(pose.eye.y).toBeCloseTo(10 + up, 6);
+      expect(pose.eye.z).toBeCloseTo(ahead, 6);
+      expect(pose.forward.z).toBeCloseTo(1, 6);
+    }
+  });
+
+  it('目が自分の車体の屋根より上に出ない', () => {
+    for (const kind of ['car', 'train'] as VehicleKind[]) {
+      const vehicle = vehicleAt(new Vector3(0, 0, 0), new Vector3(0, 0, 1), kind);
+      const { up } = cabOffset(vehicle);
+      const roof = vehicle.size.height * roofOf(kind);
+      // 屋根より上に出ると、自分の車体の屋根を見下ろすことになり、視界の
+      // 下半分が車体色で埋まる (箱の外側の面を上から見る形になるため)。
+      expect(up).toBeLessThan(roof);
+      // かといって低すぎると、床の下から覗くことになる。
+      expect(up).toBeGreaterThan(roof - vehicle.size.height * 0.25);
+    }
+  });
+
+  it('勾配のある所では、目は線路と直角に立つ', () => {
+    const grade = 0.05;
+    const dir = new Vector3(0, grade, 1).normalize();
+    const vehicle = vehicleAt(new Vector3(0, 0, 0), dir);
+    const pose = cabPose(vehicle);
+    const { ahead, up } = cabOffset(vehicle);
+    // 目の位置 = 先頭車の中心 + 進行方向 * ahead + 車体の上向き * up。
+    // 上向きは鉛直ではなく線路と直角なので、前後にも少し出る。
+    expect(pose.eye.z).toBeCloseTo(dir.z * ahead - dir.y * up, 6);
+    expect(pose.eye.y).toBeCloseTo(dir.y * ahead + dir.z * up, 6);
+    // 進行方向を向いているので、視線も同じだけ上を向く。
+    expect(pose.forward.y).toBeCloseTo(dir.y, 6);
+    // 先頭車の中心から測った高さは、鉛直に見ると勾配のぶんだけ縮む。
+    expect(pose.eye.y - ahead * dir.y).toBeCloseTo(up * dir.z, 6);
+  });
+
+  it('見回すと、車体を基準に左右・上下を向く', () => {
+    const vehicle = vehicleAt(new Vector3(0, 0, 0), new Vector3(0, 0, 1));
+    const right = cabPose(vehicle, { yaw: Math.PI / 2, pitch: 0 }).forward;
+    expect(right.x).toBeCloseTo(1, 6);
+    expect(right.z).toBeCloseTo(0, 6);
+    const back = cabPose(vehicle, { yaw: Math.PI, pitch: 0 }).forward;
+    expect(back.z).toBeCloseTo(-1, 6);
+    const upward = cabPose(vehicle, { yaw: 0, pitch: 0.5 }).forward;
+    expect(upward.y).toBeCloseTo(Math.sin(0.5), 6);
+    // 真上まで回すと姿勢が定まらないので、手前で止める。
+    const limit = cabPose(vehicle, { yaw: 0, pitch: 10 }).forward;
+    expect(limit.y).toBeLessThan(0.95);
+    // 目の位置は見回しでは動かない。
+    expect(cabPose(vehicle, { yaw: 2, pitch: 1 }).eye.distanceTo(cabPose(vehicle).eye)).toBe(0);
+  });
+
+  it('カントの付いた所では、目も車体と一緒に傾く', () => {
+    const roll = 0.07; // カント 0.1 m / 軌間 1.435 m ≒ 4°
+    const level = vehicleAt(new Vector3(0, 0, 0), new Vector3(0, 0, 1), 'train', 1, 0);
+    const canted = vehicleAt(new Vector3(0, 0, 0), new Vector3(0, 0, 1), 'train', 1, roll);
+    const angle = Math.atan(roll);
+
+    // 右が高い (正のカント) なら、頭は左へ倒れる。左カーブの外軌が右に
+    // あるときの姿勢で、車体は曲線の内側へ傾く。
+    expect(level.bodies[0].roll).toBe(0);
+    expect(cabPose(level).up.x).toBeCloseTo(0, 9);
+    expect(cabPose(canted).up.x).toBeCloseTo(-Math.sin(angle), 6);
+    expect(cabPose(canted).up.y).toBeCloseTo(Math.cos(angle), 6);
+    // 目は車体に固定されているので、傾いたぶん横にも動く。
+    const { up } = cabOffset(canted);
+    expect(cabPose(canted).eye.x).toBeCloseTo(-up * Math.sin(angle), 6);
+    expect(cabPose(canted).eye.y).toBeCloseTo(up * Math.cos(angle), 6);
+    // 進行方向は変わらない。
+    expect(cabPose(canted).forward.z).toBeCloseTo(1, 6);
+    // 見回しの向きも車体基準なので、傾いた基底の上で回る。右を向けば、
+    // その先は高い側なので視線がわずかに上を向く。
+    const right = cabPose(canted, { yaw: Math.PI / 2, pitch: 0 }).forward;
+    expect(right.y).toBeCloseTo(Math.sin(angle), 6);
+  });
+
+  it('横を向いた車両でも、視線が上下に転ばない', () => {
+    for (let deg = 0; deg < 360; deg += 7) {
+      const rad = (deg * Math.PI) / 180;
+      const dir = new Vector3(Math.sin(rad), 0.03, Math.cos(rad)).normalize();
+      const vehicle = vehicleAt(new Vector3(0, 0, 0), dir);
+      const pose = cabPose(vehicle, { yaw: 1.2, pitch: 0 });
+      // 左右を向いただけなら、上下の成分は勾配ぶんしか出ない。
+      expect(Math.abs(pose.forward.y)).toBeLessThan(0.05);
+      expect(pose.forward.length()).toBeCloseTo(1, 6);
+    }
+  });
+});
+
+describe('乗る車両の選び方', () => {
+  const scene = (): Vehicle[] => [
+    vehicleAt(new Vector3(0, 0, 0), new Vector3(0, 0, 1), 'train', 3),
+    vehicleAt(new Vector3(50, 0, 0), new Vector3(1, 0, 0), 'car', 1),
+    vehicleAt(new Vector3(200, 0, 0), new Vector3(0, 0, -1), 'car', 2),
+  ];
+
+  it('いちばん近い車両に乗る', () => {
+    const vehicles = scene();
+    expect(nearestVehicle(vehicles, new Vector3(45, 0, 0))?.id).toBe(1);
+    const ride = new Ride();
+    ride.board(vehicles, new Vector3(190, 0, 10));
+    expect(ride.active).toBe(true);
+    expect(ride.vehicleId).toBe(2);
+    const status = ride.update(vehicles, 1 / 60)!;
+    expect(status.vehicle?.id).toBe(2);
+    expect(status.kind).toBe('car');
+  });
+
+  it('番号順に乗り換えて一巡する', () => {
+    const vehicles = scene();
+    const ride = new Ride();
+    ride.board(vehicles, new Vector3(0, 0, 0));
+    expect(ride.vehicleId).toBe(3);
+    const seen: number[] = [];
+    for (let i = 0; i < 4; i++) {
+      ride.next(vehicles);
+      seen.push(ride.vehicleId!);
+    }
+    expect(seen).toEqual([1, 2, 3, 1]);
+  });
+
+  it('乗っていた車両が消えたら、近くの車両に移る', () => {
+    const vehicles = scene();
+    const ride = new Ride();
+    ride.board(vehicles, new Vector3(50, 0, 0));
+    expect(ride.vehicleId).toBe(1);
+    ride.update(vehicles, 1 / 60);
+
+    // 行き止まりに着いて消えた。
+    const left = vehicles.filter((v) => v.id !== 1);
+    const status = ride.update(left, 1 / 60)!;
+    expect(status.vehicle?.id).toBe(3);
+    expect(ride.active).toBe(true);
+  });
+
+  it('1 両も走っていなければ、その場で次を待つ', () => {
+    const ride = new Ride();
+    const near = new Vector3(12, 34, 56);
+    ride.board([], near);
+    const status = ride.update([], 1 / 60)!;
+    expect(status.vehicle).toBeNull();
+    expect(status.kind).toBeNull();
+    expect(status.speed).toBe(0);
+    // 目は乗り込もうとした所に留まる (原点へ飛ばない)。
+    expect(status.pose.eye.distanceTo(near)).toBe(0);
+
+    // あとから湧いた車両に乗る。
+    const vehicles = [vehicleAt(new Vector3(20, 34, 56), new Vector3(0, 0, 1), 'car', 7)];
+    expect(ride.update(vehicles, 1 / 60)!.vehicle?.id).toBe(7);
+
+    ride.leave();
+    expect(ride.active).toBe(false);
+    expect(ride.update(vehicles, 1 / 60)).toBeNull();
+  });
+});
+
+describe('目の動きの平滑化', () => {
+  /** 車両を `by` [m] だけ前へ動かす。 */
+  const shift = (vehicle: Vehicle, by: number): void => {
+    vehicle.bodies[0].pos.addScaledVector(vehicle.bodies[0].dir, by);
+  };
+
+  it('小さな段差は追いかけ、行き過ぎない', () => {
+    const vehicle = vehicleAt(new Vector3(0, 0, 0), new Vector3(0, 0, 1));
+    const ride = new Ride();
+    ride.board([vehicle], new Vector3(0, 0, 0));
+    const start = ride.update([vehicle], 1 / 60)!.pose.eye.clone();
+
+    // 1 フレームで 1 m 跳ねた (踏切の舗装の段差など)。
+    shift(vehicle, 1);
+    const after = ride.update([vehicle], 1 / 60)!.pose.eye.clone();
+    const jumped = after.distanceTo(start);
+    expect(jumped).toBeGreaterThan(0.1);
+    expect(jumped).toBeLessThan(0.9);
+
+    // 追いつく。
+    for (let i = 0; i < 20; i++) ride.update([vehicle], 1 / 60);
+    expect(ride.update([vehicle], 1 / 60)!.pose.eye.distanceTo(cabPose(vehicle).eye)).toBeLessThan(
+      0.01,
+    );
+  });
+
+  it('乗り換えのような大きな飛びは、追わずにそのまま置く', () => {
+    const vehicle = vehicleAt(new Vector3(0, 0, 0), new Vector3(0, 0, 1));
+    const ride = new Ride();
+    ride.board([vehicle], new Vector3(0, 0, 0));
+    ride.update([vehicle], 1 / 60);
+    shift(vehicle, 40);
+    const eye = ride.update([vehicle], 1 / 60)!.pose.eye;
+    expect(eye.distanceTo(cabPose(vehicle).eye)).toBeLessThan(1e-9);
+  });
+});
+
+describe('走っている列車に乗る', () => {
+  it('目はレールの上を、車体と一緒に進む', () => {
+    const network = railLine();
+    const traffic = new Traffic(laneGraphOf(network));
+    const dt = 1 / 20;
+    // 列車が湧くまで走らせる。
+    for (let i = 0; i < 200; i++) traffic.step(dt);
+    const train = traffic.vehicles.find((v) => v.kind === 'train');
+    expect(train).toBeDefined();
+
+    const ride = new Ride();
+    ride.board(traffic.vehicles, train!.bodies[0].pos.clone());
+    expect(ride.vehicleId).toBe(train!.id);
+
+    let frames = 0;
+    let worstHeight = 0;
+    let worstLateral = 0;
+    let worstStep = 0;
+    let previous: Vector3 | null = null;
+    let seat = ride.vehicleId;
+
+    for (let i = 0; i < 60 / dt; i++) {
+      traffic.step(dt);
+      const status = ride.update(traffic.vehicles, dt);
+      if (!status?.vehicle) continue;
+      const eye = status.pose.eye;
+
+      // 線路の上にいる。中心線から横に外れず、レール面の上にある。
+      const hit = network.findSegmentNear(eye, 30);
+      expect(hit).not.toBeNull();
+      const sample = network.alignmentOf(hit!.segment).sampleAt(hit!.s);
+      const lateral =
+        (eye.x - sample.pos.x) * sample.right.x + (eye.z - sample.pos.z) * sample.right.z;
+      worstLateral = Math.max(worstLateral, Math.abs(lateral));
+      worstHeight = Math.max(worstHeight, Math.abs(eye.y - sample.pos.y - 2.2));
+
+      // 1 フレームで進む距離は、車両の速度ぶん。跳ねたら気付く。
+      if (previous && seat === ride.vehicleId) {
+        worstStep = Math.max(worstStep, previous.distanceTo(eye) - status.speed * dt);
+      }
+      previous = eye.clone();
+      seat = ride.vehicleId;
+      // 視線は進行方向。勾配 (5 % まで) のぶんしか上下しない。
+      expect(Math.abs(status.pose.forward.y)).toBeLessThan(0.06);
+      frames++;
+    }
+
+    expect(frames).toBeGreaterThan(1000);
+    // 単線の中心を走るので、横のずれは軌間の半分もない。
+    expect(worstLateral).toBeLessThan(0.5);
+    // 目の高さはレール面から 2.2 m ほど。勾配ぶんの縮みしか出ない。
+    expect(worstHeight).toBeLessThan(0.12);
+    // 平滑化の遅れがあるぶん、進む距離が速度を上回ることはない。
+    expect(worstStep).toBeLessThan(0.01);
+  });
+});
+
+describe('乗る車両を選ぶ', () => {
+  const car = (x: number, z: number, id: number, dir = new Vector3(0, 0, 1)): Vehicle =>
+    vehicleAt(new Vector3(x, 0, z), dir, 'car', id);
+  /** 真上から見下ろすレイ。 */
+  const down = (x: number, z: number) => ({
+    origin: new Vector3(x, 40, z),
+    direction: new Vector3(0, -1, 0),
+  });
+
+  it('車体の箱に当たったら距離を返し、外れたら null', () => {
+    const body = car(0, 0, 1).bodies[0];
+    const size = { length: 4.4, width: 1.8, height: 1.45 };
+    // 屋根 (1.45 m) の少し上 = 余裕 0.35 m のぶん手前で当たる。
+    expect(hitBody(down(0, 0), body, size)).toBeCloseTo(40 - (1.45 + 0.35), 6);
+    // 車体の前後・左右の端の内側なら当たる。
+    expect(hitBody(down(0.8, 2.0), body, size)).not.toBeNull();
+    // 幅 1.8 m + 余裕 0.35 m の外は外れる。
+    expect(hitBody(down(1.3, 0), body, size)).toBeNull();
+    // 長さ 4.4 m + 余裕 0.35 m の外も外れる。
+    expect(hitBody(down(0, 2.7), body, size)).toBeNull();
+  });
+
+  it('当たり判定は車体の姿勢について回る', () => {
+    const size = { length: 4.4, width: 1.8, height: 1.45 };
+    // 東西を向いた車。長い方向が X になるので、前後左右が入れ替わる。
+    const across = vehicleAt(new Vector3(0, 0, 0), new Vector3(1, 0, 0), 'car', 1).bodies[0];
+    expect(hitBody(down(2.0, 0), across, size)).not.toBeNull();
+    expect(hitBody(down(0, 2.0), across, size)).toBeNull();
+  });
+
+  it('重なって見えるときは、手前の車両が選ばれる', () => {
+    // 縦に並んだ 2 両を、真横から浅く見る。レイは両方の箱を貫く。
+    const vehicles = [car(0, 0, 1), car(0, 20, 2)];
+    const ray = {
+      origin: new Vector3(0, 2, -40),
+      direction: new Vector3(0, -0.01, 1).normalize(),
+    };
+    expect(pickVehicle(vehicles, ray, null)?.id).toBe(1);
+    // 逆から見れば手前は id=2。
+    const back = {
+      origin: new Vector3(0, 2, 60),
+      direction: new Vector3(0, -0.01, -1).normalize(),
+    };
+    expect(pickVehicle(vehicles, back, null)?.id).toBe(2);
+  });
+
+  it('外したら、指した地点にいちばん近い車両', () => {
+    const vehicles = [car(0, 0, 1), car(0, 60, 2)];
+    // どの車両にも当たらないレイ。
+    const miss = down(100, 100);
+    expect(pickVehicle(vehicles, miss, new Vector3(0, 0, 52))?.id).toBe(2);
+    expect(pickVehicle(vehicles, miss, new Vector3(0, 0, 4))?.id).toBe(1);
+    // 指した先も分からなければ選べない。
+    expect(pickVehicle(vehicles, miss, null)).toBeNull();
+    expect(pickVehicle([], down(0, 0), new Vector3())).toBeNull();
+  });
+
+  it('選んでから乗る (選択中は一人称にならない)', () => {
+    const vehicles = [car(0, 0, 1), car(0, 60, 2)];
+    const ride = new Ride();
+    ride.aim();
+    expect(ride.aiming).toBe(true);
+    expect(ride.active).toBe(false);
+    // 指すだけでは乗らない。
+    expect(ride.hover(vehicles, down(0, 60), null)?.id).toBe(2);
+    expect(ride.targetId).toBe(2);
+    expect(ride.active).toBe(false);
+    const aiming = ride.update(vehicles, 0.016);
+    expect(aiming?.phase).toBe('aim');
+    expect(aiming?.vehicle?.id).toBe(2);
+
+    // クリックで乗る。
+    expect(ride.boardTarget(vehicles)).toBe(true);
+    expect(ride.aiming).toBe(false);
+    expect(ride.active).toBe(true);
+    expect(ride.vehicleId).toBe(2);
+    const riding = ride.update(vehicles, 0.016);
+    expect(riding?.phase).toBe('ride');
+    expect(riding?.pose.eye.z).toBeGreaterThan(55);
+  });
+
+  it('指していなければ乗らない。取り消せる', () => {
+    const vehicles = [car(0, 0, 1)];
+    const ride = new Ride();
+    ride.aim();
+    // 車両が 1 両も無いところを指した (地点も分からない) 状態。
+    expect(ride.hover([], down(0, 0), null)).toBeNull();
+    expect(ride.boardTarget([])).toBe(false);
+    expect(ride.active).toBe(false);
+    expect(ride.aiming).toBe(true);
+
+    ride.leave();
+    expect(ride.aiming).toBe(false);
+    expect(ride.update(vehicles, 0.016)).toBeNull();
+  });
+});

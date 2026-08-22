@@ -178,6 +178,52 @@
         line-height: 1.45;
       }
 
+      /* 確認モードのグラフ。区間全体の曲率と勾配を 2 段の帯で見せる。 */
+      .graph {
+        display: block;
+        width: 100%;
+        height: 128px;
+        margin: 8px 0 2px;
+      }
+
+      .graph .band {
+        fill: rgba(255, 255, 255, 0.04);
+      }
+
+      .graph .zero {
+        stroke: rgba(255, 255, 255, 0.22);
+        stroke-width: 1;
+      }
+
+      .graph .limit {
+        stroke: #f0776b;
+        stroke-width: 1;
+        stroke-dasharray: 3 3;
+        opacity: 0.6;
+      }
+
+      .graph polyline {
+        fill: none;
+        stroke: #5aa9e6;
+        stroke-width: 1.8;
+        stroke-linejoin: round;
+      }
+
+      .graph .grad {
+        stroke: #e8c135;
+      }
+
+      .graph .cursor {
+        stroke: #fff;
+        stroke-width: 1;
+        opacity: 0.85;
+      }
+
+      .graph .tick {
+        fill: var(--muted);
+        font-size: 9px;
+      }
+
       /* 敷設できないときの理由。一目で分かるように囲って強調する。 */
       .readout .blocked {
         margin-top: 8px;
@@ -210,6 +256,26 @@
 
       .help b {
         color: var(--text);
+      }
+
+      /*
+       * 乗車中は視界を空ける。左のパネルと操作の説明は敷設のためのもので、
+       * 一人称視点では邪魔にしかならない。触れば戻る。
+       */
+      .riding .panel-left,
+      .riding .help {
+        opacity: 0.16;
+        transition: opacity 0.15s ease;
+      }
+
+      .riding .panel-left:hover,
+      .riding .help:hover {
+        opacity: 1;
+      }
+
+      /* 乗る車両を選んでいる間は、指す操作だと分かるようにする。 */
+      body.aiming #view {
+        cursor: crosshair;
       }
     </style>
   </head>

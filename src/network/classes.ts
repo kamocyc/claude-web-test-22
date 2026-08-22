@@ -38,14 +38,50 @@ export interface NetworkClass {
   divided: boolean;
   /**
    * 軌道の中心オフセット [m]。道路では空。
-   * 線路はどの種別も 1 本 ([0]) で、複線は並列敷設で作る。
+   * 線路はどの種別も 1 本 ([0]) で、複線は平行に並べて作る。
    */
   tracks: number[];
 
   /** 規格最小曲線半径 [m]。 */
   minRadius: number;
-  /** 規格最大縦断勾配 (0.08 = 8%)。 */
+  /**
+   * 規格最大縦断勾配 (0.08 = 8%)。
+   *
+   * 実際の道路構造令・線路の規格より 5 割ほど緩めてある。地形の起伏に
+   * 対して敷地が狭く、実物どおりの勾配では思うように繋げられないため。
+   */
   maxGrade: number;
+  /**
+   * 規格最小縦曲線半径 [m]。勾配をどれだけ急に変えてよいかの上限。
+   *
+   * 実物の線路は 3000 m 以上だが、この縮尺 (区間長 40〜200 m) では
+   * 1 区間で勾配を 1% も変えられなくなり縦断が真っ平らになる。実質
+   * 「1 区間で変えてよい勾配の量」として較正した値を入れている。
+   * 標準の縦断 (終点勾配 = 平均勾配) では `|Δ勾配| ≤ L / (4·この値)`。
+   *
+   * 値は**縦方向の加速度の目安から**決める。曲率半径 R の縦曲線を速度 V で
+   * 通ると縦加速度は `V²/R` なので、`R = V²/VERTICAL_ACCEL` とすれば種別に
+   * よらず同じ乗り心地になる (V は実際に走らせる速度 = 設計速度の 85%)。
+   * 実物の道路は 0.05〜0.1 g で設計するが、ここは 1 区画が 40 m の縮尺で、
+   * そこまで緩くすると地形に沿った縦断が引けない。
+   */
+  minVerticalRadius: number;
+  /**
+   * 緩和曲線 (クロソイド) を入れるか。
+   *
+   * 線路だけ有効。直線からいきなり円曲線に入らず、曲率を弧長に比例して
+   * 立ち上げる区間を挟む。道路は最小半径が 12〜45 m と小さく、30 m の区間に
+   * 十数 m の緩和区間を入れても意味がないので入れない。
+   */
+  easement: boolean;
+  /**
+   * 規格最大カント [m] (曲線の外側のレールをどれだけ高くするか)。
+   *
+   * 規格最小半径の曲線でこの値になり、緩やかな曲線では半径に反比例して
+   * 小さくなる。曲率から導くので、緩和曲線の区間でそのまま立ち上がる。
+   * 道路は 0 (片勾配は付けない)。
+   */
+  maxCant: number;
   /** 交差点の隅角部の丸め半径 [m]。 */
   cornerRadius: number;
   /** 設計速度 [km/h]。HUD 表示と規格の目安。 */
@@ -62,6 +98,41 @@ export interface NetworkClass {
   surfaceColor: readonly [number, number, number];
 }
 
+/**
+ * 実際に走らせる速度 / 設計速度。
+ *
+ * 設計速度は「その線形で出してよい速度」なので、常にそれで走ると規格の
+ * 限界をなぞることになる。少し余裕を見た速度で走らせる。
+ */
+export const SPEED_FACTOR = 0.85;
+
+/**
+ * 縦曲線を通るときの縦加速度の目安 [m/s²]。
+ *
+ * 半径 R の縦曲線を速度 V で通ると縦加速度は `V²/R` なので、
+ * `R = V²/VERTICAL_ACCEL` とすれば種別によらず同じ乗り心地になる。
+ *
+ * 実物の道路は 0.05〜0.1 g (0.5〜1.0 m/s²) で設計するが、この縮尺では
+ * 1 区画が 40 m ほどしかなく、そこまで緩くすると地形に沿った縦断が引けない
+ * (勾配を変えるのに区画をいくつも使うことになる)。0.25 g まで許す。
+ */
+const VERTICAL_ACCEL = 2.4;
+
+/**
+ * 縦曲線半径の下限 [m]。
+ *
+ * 遅い種別 (生活道路・側線) では上の式が 20〜40 m まで下がるが、そこまで
+ * 行くと縦断の折れ目がはっきり見える。最大勾配のほうが先に効くので、
+ * 実質の締まり具合は変わらない。
+ */
+const MIN_VERTICAL_RADIUS = 50;
+
+/** 設計速度から縦曲線半径の規格を決める。5 m 刻みに丸める。 */
+export function verticalRadiusFor(designSpeed: number): number {
+  const v = (designSpeed / 3.6) * SPEED_FACTOR;
+  return Math.max(MIN_VERTICAL_RADIUS, Math.round((v * v) / VERTICAL_ACCEL / 5) * 5);
+}
+
 function road(opts: {
   id: string;
   label: string;
@@ -76,6 +147,7 @@ function road(opts: {
   divided?: boolean;
   minRadius: number;
   maxGrade: number;
+  minVerticalRadius?: number;
   cornerRadius: number;
   designSpeed: number;
   signalCapable: boolean;
@@ -109,6 +181,9 @@ function road(opts: {
     tracks: [],
     minRadius: opts.minRadius,
     maxGrade: opts.maxGrade,
+    minVerticalRadius: opts.minVerticalRadius ?? verticalRadiusFor(opts.designSpeed),
+    easement: false,
+    maxCant: 0,
     cornerRadius: opts.cornerRadius,
     designSpeed: opts.designSpeed,
     signalCapable: opts.signalCapable,
@@ -119,9 +194,9 @@ function road(opts: {
 }
 
 /**
- * 線路の種別。軌道は 1 本だけで、複線・三線は並列敷設 (`network/parallel.ts`)
- * で作る。1 本ずつ独立した線形なので、片側だけ分岐させる・片側だけ橋にする
- * といったことが特別扱いなしにできる。
+ * 線路の種別。軌道は 1 本だけで、複線・三線は既存の線路に平行して敷いて
+ * 作る (`network/parallel.ts`)。1 本ずつ独立した線形なので、片側だけ
+ * 分岐させる・片側だけ橋にするといったことが特別扱いなしにできる。
  */
 function rail(opts: {
   id: string;
@@ -129,6 +204,9 @@ function rail(opts: {
   shoulder: number;
   minRadius: number;
   maxGrade: number;
+  minVerticalRadius?: number;
+  easement?: boolean;
+  maxCant?: number;
   designSpeed: number;
   costPerMeter: number;
 }): NetworkClass {
@@ -146,6 +224,9 @@ function rail(opts: {
     tracks: [0],
     minRadius: opts.minRadius,
     maxGrade: opts.maxGrade,
+    minVerticalRadius: opts.minVerticalRadius ?? verticalRadiusFor(opts.designSpeed),
+    easement: opts.easement ?? true,
+    maxCant: opts.maxCant ?? 0.1,
     cornerRadius: 0,
     designSpeed: opts.designSpeed,
     signalCapable: false,
@@ -166,7 +247,7 @@ export const NETWORK_CLASSES: NetworkClass[] = [
     laneWidth: 3.0,
     sidewalkWidth: 1.6,
     minRadius: 12,
-    maxGrade: 0.12,
+    maxGrade: 0.18,
     cornerRadius: 5,
     designSpeed: 30,
     signalCapable: false,
@@ -181,7 +262,7 @@ export const NETWORK_CLASSES: NetworkClass[] = [
     laneWidth: 3.25,
     sidewalkWidth: 2.4,
     minRadius: 30,
-    maxGrade: 0.09,
+    maxGrade: 0.135,
     cornerRadius: 8,
     designSpeed: 50,
     signalCapable: true,
@@ -196,7 +277,7 @@ export const NETWORK_CLASSES: NetworkClass[] = [
     laneWidth: 3.4,
     sidewalkWidth: 3.0,
     minRadius: 45,
-    maxGrade: 0.07,
+    maxGrade: 0.105,
     cornerRadius: 11,
     designSpeed: 60,
     signalCapable: true,
@@ -212,7 +293,7 @@ export const NETWORK_CLASSES: NetworkClass[] = [
     sidewalkWidth: 0,
     divided: true,
     minRadius: 120,
-    maxGrade: 0.05,
+    maxGrade: 0.075,
     cornerRadius: 15,
     designSpeed: 100,
     signalCapable: false,
@@ -229,7 +310,7 @@ export const NETWORK_CLASSES: NetworkClass[] = [
     shoulderWidth: 1.5,
     oneWay: true,
     minRadius: 45,
-    maxGrade: 0.08,
+    maxGrade: 0.12,
     cornerRadius: 8,
     designSpeed: 50,
     signalCapable: false,
@@ -242,7 +323,7 @@ export const NETWORK_CLASSES: NetworkClass[] = [
     label: '線路',
     shoulder: 2.2,
     minRadius: 120,
-    maxGrade: 0.035,
+    maxGrade: 0.05,
     designSpeed: 100,
     costPerMeter: 150,
   }),
@@ -251,7 +332,8 @@ export const NETWORK_CLASSES: NetworkClass[] = [
     label: '側線 (低規格)',
     shoulder: 1.8,
     minRadius: 50,
-    maxGrade: 0.02,
+    maxGrade: 0.03,
+    maxCant: 0.05,
     designSpeed: 40,
     costPerMeter: 90,
   }),

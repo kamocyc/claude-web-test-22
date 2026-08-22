@@ -190,3 +190,44 @@ export function extrudeSkirtTo(
 export function earcutXZ(flatXZ: number[]): number[] {
   return earcut(flatXZ, undefined, 2);
 }
+
+/**
+ * 多角形 (リング) を塗り潰した面の高さを引く関数を作る。
+ *
+ * 描画とまったく同じ三角形分割を使うので、「その面より上か下か」を
+ * 確実に判定できる。分割は 1 度だけ行い、あとは引くだけにする。
+ * リングの外では null を返す。
+ */
+export function polygonHeightSampler(
+  ring: readonly Vector3[],
+): (x: number, z: number) => number | null {
+  if (ring.length < 3) return () => null;
+  const flat: number[] = [];
+  for (const p of ring) flat.push(p.x, p.z);
+  const tris = earcutXZ(flat);
+  return (x: number, z: number): number | null => {
+    for (let i = 0; i + 2 < tris.length; i += 3) {
+      const y = heightInTriangleXZ(ring[tris[i]], ring[tris[i + 1]], ring[tris[i + 2]], x, z);
+      if (y !== null) return y;
+    }
+    return null;
+  };
+}
+
+/** 三角形の内側なら重心座標で高さを返す。外側なら null。 */
+export function heightInTriangleXZ(
+  a: Vector3,
+  b: Vector3,
+  c: Vector3,
+  x: number,
+  z: number,
+): number | null {
+  const d = (b.z - c.z) * (a.x - c.x) + (c.x - b.x) * (a.z - c.z);
+  if (Math.abs(d) < 1e-12) return null;
+  const u = ((b.z - c.z) * (x - c.x) + (c.x - b.x) * (z - c.z)) / d;
+  const v = ((c.z - a.z) * (x - c.x) + (a.x - c.x) * (z - c.z)) / d;
+  const w = 1 - u - v;
+  const eps = -1e-6;
+  if (u < eps || v < eps || w < eps) return null;
+  return u * a.y + v * b.y + w * c.y;
+}

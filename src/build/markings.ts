@@ -1,7 +1,15 @@
 import { Vector3 } from 'three';
 import type { AlignmentSample } from '../core/alignment';
 import { MeshBuilder, UP, signedAreaXZ } from '../core/meshbuilder';
-import { DRIVE_ON_LEFT, MARKING_LIFT, SURFACE_LIFT, clamp } from '../core/units';
+import {
+  CROSSWALK_DEPTH,
+  CROSSWALK_OFFSET,
+  DRIVE_ON_LEFT,
+  MARKING_LIFT,
+  STOP_LINE_OFFSET,
+  SURFACE_LIFT,
+  clamp,
+} from '../core/units';
 import type { NetworkClass } from '../network/classes';
 import type { Movement } from '../network/lanes';
 import type { RGB } from './surface';
@@ -13,11 +21,8 @@ const YELLOW: RGB = [0.86, 0.72, 0.2];
 const ZEBRA_BAR = 0.45;
 const ZEBRA_PITCH = 1.0;
 
-/** 交差点端から横断歩道までの離隔と、横断歩道の奥行き [m]。 */
-export const CROSSWALK_OFFSET = 0.6;
-export const CROSSWALK_DEPTH = 3.6;
-/** 交差点端から停止線までの距離 [m]。 */
-export const STOP_LINE_OFFSET = CROSSWALK_OFFSET + CROSSWALK_DEPTH + 0.6;
+// 横断歩道・停止線の位置は走行側 (`sim/`) も見るので `core/units.ts` にある。
+export { CROSSWALK_OFFSET, CROSSWALK_DEPTH, STOP_LINE_OFFSET };
 const STOP_LINE_WIDTH = 0.45;
 
 /** 標示を描くのに必要な取り付け長 [m]。 */

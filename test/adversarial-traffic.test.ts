@@ -94,7 +94,7 @@ const SCENES: (() => Scene)[] = [
   () => sceneOf('ダイヤ型 IC', (n, f) => buildInterchange(n, f), DEFAULT_TERRAIN.seed),
   () => sceneOf('トランペット IC', (n, f) => buildTrumpetInterchange(n, f), DEFAULT_TERRAIN.seed),
   () =>
-    sceneOf('複線 (並列敷設)', (n, f) => {
+    sceneOf('複線 (平行)', (n, f) => {
       drawParallel(n, f, 'rail_single', [
         { x: -300, z: 0, y: 0 },
         { x: 0, z: 0, y: 0 },

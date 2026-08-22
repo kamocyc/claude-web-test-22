@@ -125,13 +125,38 @@ export class Alignment {
   }
 }
 
-/** 3 次ベジエの媒介変数区間 [t0, t1] を切り出す (de Casteljau)。 */
+/**
+ * 連結ベジエの媒介変数区間 [t0, t1] (どちらも 0…1) を切り出す (de Casteljau)。
+ *
+ * ピースをまたぐ場合は、端のピースだけを切って間のピースはそのまま繋ぐ。
+ * 緩和曲線を含む線形を分割しても、形が 1 本のベジエに潰れない。
+ */
 export function splitBezier(curve: HorizontalCurve, t0: number, t1: number): HorizontalCurve {
-  const right = subdivideRight(curve.p0, curve.c0, curve.c1, curve.p1, t0);
-  // t0 で切った後半における t1 の位置に対応する媒介変数。
-  const u = t1 >= 1 - 1e-9 ? 1 : (t1 - t0) / Math.max(1e-9, 1 - t0);
-  const both = subdivideLeft(right[0], right[1], right[2], right[3], clamp(u, 0, 1));
-  return new HorizontalCurve(both[0], both[1], both[2], both[3]);
+  const n = curve.pieceCount;
+  const T0 = clamp(t0, 0, 1) * n;
+  const T1 = Math.max(T0, clamp(t1, 0, 1) * n);
+  const first = Math.min(n - 1, Math.floor(T0));
+  const last = Math.max(first, Math.min(n - 1, Math.ceil(T1) - 1));
+
+  const points: XZ[] = [];
+  for (let i = first; i <= last; i++) {
+    const k = i * 3;
+    let seg: [XZ, XZ, XZ, XZ] = [
+      curve.points[k],
+      curve.points[k + 1],
+      curve.points[k + 2],
+      curve.points[k + 3],
+    ];
+    const lo = i === first ? T0 - i : 0;
+    const hi = i === last ? T1 - i : 1;
+    if (lo > 1e-9) seg = subdivideRight(seg[0], seg[1], seg[2], seg[3], lo);
+    // 前を切り落とした後の区間における hi の位置。
+    const u = hi >= 1 - 1e-9 ? 1 : (hi - lo) / Math.max(1e-9, 1 - lo);
+    if (u < 1 - 1e-9) seg = subdivideLeft(seg[0], seg[1], seg[2], seg[3], clamp(u, 0, 1));
+    if (i === first) points.push(seg[0]);
+    points.push(seg[1], seg[2], seg[3]);
+  }
+  return new HorizontalCurve(points);
 }
 
 function subdivideRight(p0: XZ, c0: XZ, c1: XZ, p1: XZ, t: number): [XZ, XZ, XZ, XZ] {
