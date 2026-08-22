@@ -257,6 +257,21 @@
       .help b {
         color: var(--text);
       }
+
+      /*
+       * 乗車中は視界を空ける。左のパネルと操作の説明は敷設のためのもので、
+       * 一人称視点では邪魔にしかならない。触れば戻る。
+       */
+      .riding .panel-left,
+      .riding .help {
+        opacity: 0.16;
+        transition: opacity 0.15s ease;
+      }
+
+      .riding .panel-left:hover,
+      .riding .help:hover {
+        opacity: 1;
+      }
     </style>
   </head>
   <body>

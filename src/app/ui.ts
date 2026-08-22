@@ -2,6 +2,7 @@ import { NETWORK_CLASSES, getClass } from '../network/classes';
 import { riskColor, viewUniforms } from '../render/materials';
 import type { BuildResult } from '../render/worldBuilder';
 import type { ToolMode, ToolStatus } from './buildTool';
+import type { RideStatus } from './ride';
 import {
   GRAPH_W,
   formatCant,
@@ -21,6 +22,10 @@ export interface UiCallbacks {
   onConnectivityColors: (on: boolean) => void;
   /** 車両の走行表示を切り替える。 */
   onVehicles: (on: boolean) => void;
+  /** 乗車モード (一人称視点) の出入り。 */
+  onRide: () => void;
+  /** 乗る車両を次に変える。 */
+  onRideNext: () => void;
   onClass: (classId: string) => void;
   onElevation: (steps: number) => void;
   /** 平行スナップの入り切りを変える。 */
@@ -48,6 +53,8 @@ export class Ui {
   private readonly classButtons = new Map<string, HTMLButtonElement>();
   private readonly parallelButtons = new Map<boolean, HTMLButtonElement>();
   private readonly elevationLabel: HTMLElement;
+  private readonly rideButton: HTMLButtonElement;
+  private readonly vehiclesToggle: HTMLInputElement;
   private readonly statusBody: HTMLElement;
   private readonly graphBody: HTMLElement;
   private readonly warningBody: HTMLElement;
@@ -58,7 +65,10 @@ export class Ui {
   private graphProfile: InspectProfile | null = null;
   private graphCursor: SVGLineElement | null = null;
 
-  constructor(root: HTMLElement, callbacks: UiCallbacks) {
+  constructor(
+    private readonly root: HTMLElement,
+    callbacks: UiCallbacks,
+  ) {
     const left = el('div', 'panel panel-left');
 
     left.append(sectionTitle('ツール'));
@@ -150,10 +160,21 @@ export class Ui {
         apply: (on) => callbacks.onVehicles(on),
       },
     ];
+    const inputs = new Map<string, HTMLInputElement>();
     for (const toggle of toggles) {
-      left.append(checkbox(toggle.label, toggle.initial, toggle.apply));
+      const box = checkbox(toggle.label, toggle.initial, toggle.apply);
+      inputs.set(toggle.id, box.input);
+      left.append(box.node);
       toggle.apply(toggle.initial);
     }
+    this.vehiclesToggle = inputs.get('vehicles')!;
+
+    left.append(sectionTitle('視点'));
+    const rideRow = el('div', 'row');
+    this.rideButton = button('乗車 (F)', callbacks.onRide);
+    rideRow.append(this.rideButton, button('次の車両 (N)', callbacks.onRideNext));
+    left.append(rideRow);
+    left.append(hint('走っている列車・車の運転台に乗ります。ドラッグで見回し、Esc / F で降ります'));
 
     left.append(sectionTitle('マップ'));
     const mapRow = el('div', 'row');
@@ -186,6 +207,7 @@ export class Ui {
       '<b>Shift</b> 直線・15° スナップ / <b>Ctrl</b> スナップ解除',
       '<b>C</b> 平行線路へシーサスクロッシングを一括敷設',
       '<b>右ドラッグ</b> 視点移動 / <b>ホイール</b> 拡大縮小',
+      '<b>F</b> 乗車 (一人称視点) / <b>N</b> 次の車両 / 乗車中はドラッグで見回す',
     ]
       .map((line) => `<div>${line}</div>`)
       .join('');
@@ -205,18 +227,33 @@ export class Ui {
     }
   }
 
+  /** 乗車モードの入り切りを反映する。 */
+  setRiding(on: boolean): void {
+    // 乗車中は敷設のパネルを薄くして、視界を空ける。
+    this.root.classList.toggle('riding', on);
+    this.rideButton.classList.toggle('active', on);
+    this.rideButton.textContent = on ? '降りる (F)' : '乗車 (F)';
+  }
+
+  /** 車両の走行表示のチェックを合わせる (乗車のために自動で入れたとき)。 */
+  setVehicles(on: boolean): void {
+    this.vehiclesToggle.checked = on;
+  }
+
   setParallelSnap(on: boolean): void {
     for (const [key, button] of this.parallelButtons) {
       button.classList.toggle('active', key === on);
     }
   }
 
-  updateStatus(status: ToolStatus): void {
+  updateStatus(status: ToolStatus, ride: RideStatus | null = null): void {
     this.elevationLabel.textContent = `${status.elevation >= 0 ? '+' : ''}${status.elevation} m`;
 
     /** [見出し, 値, 値の色] */
     const rows: [string, string, string?][] = [];
-    if (status.drawing) {
+    if (ride) {
+      rows.push(...rideRows(ride));
+    } else if (status.drawing) {
       rows.push(['延長', `${status.length.toFixed(1)} m`]);
       rows.push([
         '曲線半径',
@@ -234,9 +271,9 @@ export class Ui {
           : '対象をクリック',
       ]);
     }
-    if (status.parallelTo !== null) rows.push(['平行', `線形 #${status.parallelTo} に沿う`]);
+    if (!ride && status.parallelTo !== null) rows.push(['平行', `線形 #${status.parallelTo} に沿う`]);
     // 撤去・確認モードではスナップしないので、この行は出さない。
-    if (status.mode === 'build' || status.mode === 'scissors') {
+    if (!ride && (status.mode === 'build' || status.mode === 'scissors')) {
       rows.push([
         'スナップ',
         status.snap === 'node'
@@ -261,7 +298,9 @@ export class Ui {
       .join('');
 
     // 敷設できない理由は、規格の警告より優先して大きく出す。
-    if (status.blockers.length > 0) {
+    if (ride) {
+      // 乗車中はツールを止めているので、敷設の警告は出さない。
+    } else if (status.blockers.length > 0) {
       html +=
         '<div class="blocked"><b>ここには敷設できません</b>' +
         status.blockers.map((m) => `<div>${escapeHtml(m)}</div>`).join('') +
@@ -278,7 +317,7 @@ export class Ui {
       this.statusHtml = html;
       this.statusBody.innerHTML = html;
     }
-    this.updateGraph(status.mode === 'inspect' ? status.inspect : null);
+    this.updateGraph(!ride && status.mode === 'inspect' ? status.inspect : null);
   }
 
   /**
@@ -372,7 +411,11 @@ function button(label: string, onClick: () => void): HTMLButtonElement {
   return node;
 }
 
-function checkbox(label: string, initial: boolean, apply: (on: boolean) => void): HTMLElement {
+function checkbox(
+  label: string,
+  initial: boolean,
+  apply: (on: boolean) => void,
+): { node: HTMLElement; input: HTMLInputElement } {
   const wrapper = el('label', 'check');
   const input = document.createElement('input');
   input.type = 'checkbox';
@@ -381,7 +424,35 @@ function checkbox(label: string, initial: boolean, apply: (on: boolean) => void)
   const span = document.createElement('span');
   span.textContent = label;
   wrapper.append(input, span);
-  return wrapper;
+  return { node: wrapper, input };
+}
+
+/**
+ * 乗車モードの行。
+ *
+ * 車両が 1 両も走っていないことがある (敷き直した直後・車両表示を切った
+ * とき)。そのときは待っていることが分かるようにする。
+ */
+function rideRows(ride: RideStatus): [string, string, string?][] {
+  if (!ride.vehicle) {
+    return [
+      ['視点', '一人称 (乗車)'],
+      ['車両', '走っている車両を待っています'],
+      ['操作', 'F / Esc で降りる'],
+    ];
+  }
+  const kind = ride.kind === 'train' ? '列車' : '自動車';
+  const rows: [string, string, string?][] = [
+    ['視点', `一人称 (${kind} #${ride.vehicle.id})`],
+    ['速度', `${(ride.speed * 3.6).toFixed(0)} km/h`],
+    ['高さ', `${ride.pose.eye.y.toFixed(1)} m`],
+  ];
+  if (ride.cars > 1) rows.push(['編成', `${ride.cars} 両`]);
+  if (Math.abs(ride.look.yaw) > 0.02 || Math.abs(ride.look.pitch) > 0.02) {
+    rows.push(['見回し', `${((ride.look.yaw * 180) / Math.PI).toFixed(0)}° / ${((ride.look.pitch * 180) / Math.PI).toFixed(0)}°`]);
+  }
+  rows.push(['操作', 'ドラッグで見回す / N で次の車両 / F で降りる']);
+  return rows;
 }
 
 function escapeHtml(text: string): string {

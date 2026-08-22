@@ -1,6 +1,7 @@
 import { Vector3 } from 'three';
 import { BuildTool, type ToolMode } from './app/buildTool';
 import { buildDemoNetwork, buildInterchangeDemo } from './app/demo';
+import { Ride } from './app/ride';
 import { Ui } from './app/ui';
 import { Viewport } from './app/viewport';
 import { Network } from './network/network';
@@ -39,6 +40,9 @@ const tool = new BuildTool(
 );
 viewport.scene.add(tool.previewGroup);
 
+// 乗車モード (一人称視点)。走っている車両の運転台にカメラを置く。
+const ride = new Ride();
+
 const ui = new Ui(uiRoot, {
   onMode: (mode) => setMode(mode),
   onClass: (classId) => {
@@ -53,6 +57,13 @@ const ui = new Ui(uiRoot, {
   },
   onVehicles: (on) => {
     world.showVehicles = on;
+    // 走らせるのをやめたら、乗る車両もいなくなる。
+    if (!on) stopRide();
+  },
+  onRide: () => (ride.active ? stopRide() : startRide()),
+  onRideNext: () => {
+    if (ride.active) ride.next(world.traffic.vehicles);
+    else startRide();
   },
   onRegenerate: () => {
     terrainSeed = (terrainSeed * 1664525 + 1013904223) >>> 0;
@@ -77,8 +88,32 @@ const ui = new Ui(uiRoot, {
 });
 
 function setMode(mode: ToolMode): void {
+  // ツールを使うなら乗車モードから降りる (敷設中は俯瞰でないと使えない)。
+  stopRide();
   tool.setMode(mode);
   ui.setMode(mode);
+}
+
+/** 乗車モードに入る。いま見ている辺りの車両に乗る。 */
+function startRide(): void {
+  if (ride.active) return;
+  tool.cancel();
+  // 車両を走らせていないと乗れない。切ってあったら入れる。
+  if (!world.showVehicles) {
+    world.showVehicles = true;
+    ui.setVehicles(true);
+  }
+  ride.board(world.traffic.vehicles, viewport.controls.target);
+  viewport.beginRide();
+  ui.setRiding(true);
+}
+
+/** 乗車モードから降り、元の視点に戻す。 */
+function stopRide(): void {
+  if (!ride.active) return;
+  ride.leave();
+  viewport.endRide();
+  ui.setRiding(false);
 }
 
 setMode('build');
@@ -95,6 +130,7 @@ declare global {
       world: WorldBuilder;
       field: Heightfield;
       tool: BuildTool;
+      ride: Ride;
       /** 指定した地点を、指定した距離・方位から見る。 */
       lookAt: (x: number, z: number, distance?: number, azimuth?: number) => void;
     };
@@ -107,6 +143,7 @@ window.trackBuilder = {
   world,
   field,
   tool,
+  ride,
   lookAt: (x, z, distance = 120, azimuth = Math.PI * 0.25) => {
     const y = field.heightAt(x, z);
     viewport.controls.target.set(x, y, z);
@@ -133,8 +170,22 @@ let cursor: Vector3 | null = null;
 const pick = (): Vector3 | null => viewport.pick([...terrainMesh.meshes, world.surfaceMesh]);
 const modifiers = { straight: false, noSnap: false };
 let pointerDownAt: { x: number; y: number; time: number } | null = null;
+/** 乗車中に見回すときの感度 [rad/px]。 */
+const LOOK_SENSITIVITY = 0.004;
+/** 乗車中のドラッグの前回位置。 */
+let lookFrom: { x: number; y: number } | null = null;
 
 canvas.addEventListener('pointermove', (event) => {
+  if (ride.active) {
+    if (!lookFrom) return;
+    // 画面をつかんで回す向き (地図の視点操作と同じ感覚)。
+    ride.turn(
+      -(event.clientX - lookFrom.x) * LOOK_SENSITIVITY,
+      (event.clientY - lookFrom.y) * LOOK_SENSITIVITY,
+    );
+    lookFrom = { x: event.clientX, y: event.clientY };
+    return;
+  }
   viewport.setPointer(event.clientX, event.clientY);
   modifiers.straight = event.shiftKey;
   modifiers.noSnap = event.ctrlKey || event.metaKey;
@@ -142,12 +193,22 @@ canvas.addEventListener('pointermove', (event) => {
 });
 
 canvas.addEventListener('pointerdown', (event) => {
+  if (ride.active) {
+    lookFrom = { x: event.clientX, y: event.clientY };
+    canvas.setPointerCapture(event.pointerId);
+    return;
+  }
   if (event.button === 0) {
     pointerDownAt = { x: event.clientX, y: event.clientY, time: performance.now() };
   }
 });
 
 canvas.addEventListener('pointerup', (event) => {
+  if (ride.active) {
+    lookFrom = null;
+    if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
+    return;
+  }
   if (event.button !== 0 || !pointerDownAt) return;
   const moved = Math.hypot(event.clientX - pointerDownAt.x, event.clientY - pointerDownAt.y);
   const elapsed = performance.now() - pointerDownAt.time;
@@ -165,7 +226,17 @@ canvas.addEventListener('contextmenu', (event) => event.preventDefault());
 window.addEventListener('keydown', (event) => {
   switch (event.key) {
     case 'Escape':
-      tool.cancel();
+      if (ride.active) stopRide();
+      else tool.cancel();
+      break;
+    case 'f':
+    case 'F':
+      if (ride.active) stopRide();
+      else startRide();
+      break;
+    case 'n':
+    case 'N':
+      if (ride.active) ride.next(world.traffic.vehicles);
       break;
     case 'PageUp':
       tool.adjustElevation(1);
@@ -219,9 +290,14 @@ function frame(): void {
     ui.updateBuild(result);
   }
 
-  tool.update(cursor, modifiers);
-  ui.updateStatus(tool.status());
   world.animate(time, dt);
+  // 乗車モードのカメラは、車両を進めたあとに置く (1 フレーム遅れないように)。
+  const riding = ride.update(world.traffic.vehicles, dt);
+  if (riding) viewport.placeEye(riding.pose.eye, riding.pose.forward);
+
+  // 乗車中は敷設のプレビューを出さない (カーソルは画面外を指している)。
+  tool.update(riding ? null : cursor, modifiers);
+  ui.updateStatus(tool.status(), riding);
   viewport.render();
   requestAnimationFrame(frame);
 }

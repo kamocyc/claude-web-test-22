@@ -10,6 +10,7 @@ import {
   Vector3,
 } from 'three';
 import type { RGB } from '../build/surface';
+import type { VehicleKind } from '../sim/lanegraph';
 import type { Vehicle } from '../sim/traffic';
 
 /**
@@ -18,6 +19,25 @@ import type { Vehicle } from '../sim/traffic';
  * 車両は毎フレーム位置が変わるだけなので、メッシュは使い回す。1 両ぶんの
  * 箱を必要な数だけ用意しておき、シミュレーションの姿勢を写す。
  */
+
+/**
+ * 車体の箱の比率 (車高に対する割合)。
+ *
+ * 一人称視点の目の高さもここから決めるので、外から読めるようにしておく。
+ * 目が屋根より上に出ると、自分の車の屋根を見下ろすことになる (箱の外側の
+ * 面を上から見る形になり、視界の下半分が車体色で埋まる)。
+ */
+export const BODY_SHAPE = {
+  /** 足回り (路面に接する暗い箱) の上端。 */
+  skirt: 0.18,
+  /** 車体の高さ。足回りの上端から積む。 */
+  shell: { car: 0.5, train: 0.62 } as Record<VehicleKind, number>,
+} as const;
+
+/** 車体 (屋根) の上端。車高に対する割合。 */
+export function roofOf(kind: VehicleKind): number {
+  return BODY_SHAPE.skirt + BODY_SHAPE.shell[kind];
+}
 
 const BODY = new BoxGeometry(1, 1, 1);
 const FORWARD = new Vector3(0, 0, 1);
@@ -120,14 +140,14 @@ function place(
 
   // 足回り。路面に接する暗い箱で、車体が浮いて見えないようにする。
   body.skirt.material = tyre;
-  body.skirt.scale.set(width * 0.9, height * 0.18, length * 0.94);
-  body.skirt.position.set(0, height * 0.09, 0);
+  body.skirt.scale.set(width * 0.9, height * BODY_SHAPE.skirt, length * 0.94);
+  body.skirt.position.set(0, (height * BODY_SHAPE.skirt) / 2, 0);
 
   // 車体。
   body.shell.material = paint;
-  const shellHeight = train ? height * 0.62 : height * 0.5;
+  const shellHeight = height * BODY_SHAPE.shell[vehicle.kind];
   body.shell.scale.set(width, shellHeight, length * (train ? 0.99 : 0.96));
-  body.shell.position.set(0, height * 0.18 + shellHeight / 2, 0);
+  body.shell.position.set(0, height * BODY_SHAPE.skirt + shellHeight / 2, 0);
 
   // 窓まわり。車は一段細く短い箱、列車は帯状にする。
   body.cabin.material = glass;
