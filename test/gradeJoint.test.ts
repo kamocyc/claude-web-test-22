@@ -175,8 +175,8 @@ describe('継ぎ目の勾配', () => {
  */
 describe('勾配の折れの警告', () => {
   it('均しきれない継ぎ目を見つけて、大きさを述べる', () => {
-    // 前半は規格 5% ちょうどの登り。後半は短い下りで、縦曲線の半径のぶん
-    // しか受け取れない。どちらも動かせないので折れが残る。
+    // 前半は規格 5% ちょうどの登り。後半は短い下りで、最大勾配のぶんしか
+    // 受け取れない。どちらも動かせないので折れが残る。
     const network = chain('rail_single', [
       new Vector3(0, 20, 0),
       new Vector3(100, 25, 0),
@@ -184,8 +184,10 @@ describe('勾配の折れの警告', () => {
     ]);
     const breaks = findGradeBreaks(network);
     expect(breaks.length).toBe(1);
-    expect(breaks[0].gap).toBeGreaterThan(0.03);
-    expect(gradeBreakMessage(breaks[0])).toContain('3.5% 折れています');
+    expect(breaks[0].gap).toBeGreaterThan(0.015);
+    expect(gradeBreakMessage(breaks[0])).toContain(
+      `${(breaks[0].gap * 100).toFixed(1)}% 折れています`,
+    );
   });
 
   it('繋がっている線形では鳴らない', () => {

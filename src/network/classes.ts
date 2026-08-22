@@ -58,6 +58,12 @@ export interface NetworkClass {
    * 1 区間で勾配を 1% も変えられなくなり縦断が真っ平らになる。実質
    * 「1 区間で変えてよい勾配の量」として較正した値を入れている。
    * 標準の縦断 (終点勾配 = 平均勾配) では `|Δ勾配| ≤ L / (4·この値)`。
+   *
+   * 値は**縦方向の加速度の目安から**決める。曲率半径 R の縦曲線を速度 V で
+   * 通ると縦加速度は `V²/R` なので、`R = V²/VERTICAL_ACCEL` とすれば種別に
+   * よらず同じ乗り心地になる (V は実際に走らせる速度 = 設計速度の 85%)。
+   * 実物の道路は 0.05〜0.1 g で設計するが、ここは 1 区画が 40 m の縮尺で、
+   * そこまで緩くすると地形に沿った縦断が引けない。
    */
   minVerticalRadius: number;
   /**
@@ -90,6 +96,41 @@ export interface NetworkClass {
 
   /** 路面 (バラスト) の基本色。 */
   surfaceColor: readonly [number, number, number];
+}
+
+/**
+ * 実際に走らせる速度 / 設計速度。
+ *
+ * 設計速度は「その線形で出してよい速度」なので、常にそれで走ると規格の
+ * 限界をなぞることになる。少し余裕を見た速度で走らせる。
+ */
+export const SPEED_FACTOR = 0.85;
+
+/**
+ * 縦曲線を通るときの縦加速度の目安 [m/s²]。
+ *
+ * 半径 R の縦曲線を速度 V で通ると縦加速度は `V²/R` なので、
+ * `R = V²/VERTICAL_ACCEL` とすれば種別によらず同じ乗り心地になる。
+ *
+ * 実物の道路は 0.05〜0.1 g (0.5〜1.0 m/s²) で設計するが、この縮尺では
+ * 1 区画が 40 m ほどしかなく、そこまで緩くすると地形に沿った縦断が引けない
+ * (勾配を変えるのに区画をいくつも使うことになる)。0.25 g まで許す。
+ */
+const VERTICAL_ACCEL = 2.4;
+
+/**
+ * 縦曲線半径の下限 [m]。
+ *
+ * 遅い種別 (生活道路・側線) では上の式が 20〜40 m まで下がるが、そこまで
+ * 行くと縦断の折れ目がはっきり見える。最大勾配のほうが先に効くので、
+ * 実質の締まり具合は変わらない。
+ */
+const MIN_VERTICAL_RADIUS = 50;
+
+/** 設計速度から縦曲線半径の規格を決める。5 m 刻みに丸める。 */
+export function verticalRadiusFor(designSpeed: number): number {
+  const v = (designSpeed / 3.6) * SPEED_FACTOR;
+  return Math.max(MIN_VERTICAL_RADIUS, Math.round((v * v) / VERTICAL_ACCEL / 5) * 5);
 }
 
 function road(opts: {
@@ -140,7 +181,7 @@ function road(opts: {
     tracks: [],
     minRadius: opts.minRadius,
     maxGrade: opts.maxGrade,
-    minVerticalRadius: opts.minVerticalRadius ?? Infinity,
+    minVerticalRadius: opts.minVerticalRadius ?? verticalRadiusFor(opts.designSpeed),
     easement: false,
     maxCant: 0,
     cornerRadius: opts.cornerRadius,
@@ -183,7 +224,7 @@ function rail(opts: {
     tracks: [0],
     minRadius: opts.minRadius,
     maxGrade: opts.maxGrade,
-    minVerticalRadius: opts.minVerticalRadius ?? Infinity,
+    minVerticalRadius: opts.minVerticalRadius ?? verticalRadiusFor(opts.designSpeed),
     easement: opts.easement ?? true,
     maxCant: opts.maxCant ?? 0.1,
     cornerRadius: 0,
@@ -207,7 +248,6 @@ export const NETWORK_CLASSES: NetworkClass[] = [
     sidewalkWidth: 1.6,
     minRadius: 12,
     maxGrade: 0.18,
-    minVerticalRadius: 100,
     cornerRadius: 5,
     designSpeed: 30,
     signalCapable: false,
@@ -223,7 +263,6 @@ export const NETWORK_CLASSES: NetworkClass[] = [
     sidewalkWidth: 2.4,
     minRadius: 30,
     maxGrade: 0.135,
-    minVerticalRadius: 120,
     cornerRadius: 8,
     designSpeed: 50,
     signalCapable: true,
@@ -239,7 +278,6 @@ export const NETWORK_CLASSES: NetworkClass[] = [
     sidewalkWidth: 3.0,
     minRadius: 45,
     maxGrade: 0.105,
-    minVerticalRadius: 120,
     cornerRadius: 11,
     designSpeed: 60,
     signalCapable: true,
@@ -256,7 +294,6 @@ export const NETWORK_CLASSES: NetworkClass[] = [
     divided: true,
     minRadius: 120,
     maxGrade: 0.075,
-    minVerticalRadius: 300,
     cornerRadius: 15,
     designSpeed: 100,
     signalCapable: false,
@@ -274,7 +311,6 @@ export const NETWORK_CLASSES: NetworkClass[] = [
     oneWay: true,
     minRadius: 45,
     maxGrade: 0.12,
-    minVerticalRadius: 120,
     cornerRadius: 8,
     designSpeed: 50,
     signalCapable: false,
@@ -288,7 +324,6 @@ export const NETWORK_CLASSES: NetworkClass[] = [
     shoulder: 2.2,
     minRadius: 120,
     maxGrade: 0.05,
-    minVerticalRadius: 400,
     designSpeed: 100,
     costPerMeter: 150,
   }),
@@ -298,7 +333,6 @@ export const NETWORK_CLASSES: NetworkClass[] = [
     shoulder: 1.8,
     minRadius: 50,
     maxGrade: 0.03,
-    minVerticalRadius: 250,
     maxCant: 0.05,
     designSpeed: 40,
     costPerMeter: 90,

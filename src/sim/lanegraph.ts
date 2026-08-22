@@ -3,7 +3,7 @@ import { Alignment } from '../core/alignment';
 import { curveFromTangents } from '../core/curve';
 import { polygonHeightSampler } from '../core/meshbuilder';
 import { STOP_LINE_OFFSET, SURFACE_LIFT, clamp } from '../core/units';
-import type { NetworkClass } from '../network/classes';
+import { SPEED_FACTOR, type NetworkClass } from '../network/classes';
 import type { Junction } from '../network/junction';
 import { exitLaneFor, lanesOf, solveApproachLanes, type Lane } from '../network/lanes';
 import type { Network, NodeId, SegmentId } from '../network/network';
@@ -78,7 +78,7 @@ export function signalPhaseOf(index: number): number {
 
 /** 車線の中心を走るときの走行速度 [m/s]。 */
 function speedOf(cls: NetworkClass): number {
-  return (cls.designSpeed / 3.6) * 0.85;
+  return (cls.designSpeed / 3.6) * SPEED_FACTOR;
 }
 
 /**
