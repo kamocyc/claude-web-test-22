@@ -262,6 +262,8 @@ export class WorldBuilder {
   private readonly vehicleView = new VehicleView();
   /** 車両を走らせるか。 */
   showVehicles = true;
+  /** 選択色で塗る車両の番号 (乗る車両を選んでいるとき)。 */
+  highlightVehicle: number | null = null;
 
   constructor(
     private readonly network: Network,
@@ -1741,7 +1743,7 @@ export class WorldBuilder {
     // 信号の現示は描画側と同じ時刻・同じ関数で見るので、青なのに止まった
     // ままになることがない。
     this.traffic.step(dt, time);
-    this.vehicleView.sync(this.traffic.vehicles);
+    this.vehicleView.sync(this.traffic.vehicles, this.highlightVehicle);
   }
 }
 

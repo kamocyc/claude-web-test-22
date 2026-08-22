@@ -272,6 +272,11 @@
       .riding .help:hover {
         opacity: 1;
       }
+
+      /* 乗る車両を選んでいる間は、指す操作だと分かるようにする。 */
+      body.aiming #view {
+        cursor: crosshair;
+      }
     </style>
   </head>
   <body>

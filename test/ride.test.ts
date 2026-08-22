@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { Vector3 } from 'three';
-import { Ride, cabOffset, cabPose, nearestVehicle } from '../src/app/ride';
+import { Ride, cabOffset, cabPose, hitBody, nearestVehicle, pickVehicle } from '../src/app/ride';
 import { roofOf } from '../src/render/vehicles';
 import { draw } from '../src/app/sketch';
 import { solveJunctions } from '../src/network/junction';
@@ -331,5 +331,102 @@ describe('走っている列車に乗る', () => {
     expect(worstHeight).toBeLessThan(0.12);
     // 平滑化の遅れがあるぶん、進む距離が速度を上回ることはない。
     expect(worstStep).toBeLessThan(0.01);
+  });
+});
+
+describe('乗る車両を選ぶ', () => {
+  const car = (x: number, z: number, id: number, dir = new Vector3(0, 0, 1)): Vehicle =>
+    vehicleAt(new Vector3(x, 0, z), dir, 'car', id);
+  /** 真上から見下ろすレイ。 */
+  const down = (x: number, z: number) => ({
+    origin: new Vector3(x, 40, z),
+    direction: new Vector3(0, -1, 0),
+  });
+
+  it('車体の箱に当たったら距離を返し、外れたら null', () => {
+    const body = car(0, 0, 1).bodies[0];
+    const size = { length: 4.4, width: 1.8, height: 1.45 };
+    // 屋根 (1.45 m) の少し上 = 余裕 0.35 m のぶん手前で当たる。
+    expect(hitBody(down(0, 0), body, size)).toBeCloseTo(40 - (1.45 + 0.35), 6);
+    // 車体の前後・左右の端の内側なら当たる。
+    expect(hitBody(down(0.8, 2.0), body, size)).not.toBeNull();
+    // 幅 1.8 m + 余裕 0.35 m の外は外れる。
+    expect(hitBody(down(1.3, 0), body, size)).toBeNull();
+    // 長さ 4.4 m + 余裕 0.35 m の外も外れる。
+    expect(hitBody(down(0, 2.7), body, size)).toBeNull();
+  });
+
+  it('当たり判定は車体の姿勢について回る', () => {
+    const size = { length: 4.4, width: 1.8, height: 1.45 };
+    // 東西を向いた車。長い方向が X になるので、前後左右が入れ替わる。
+    const across = vehicleAt(new Vector3(0, 0, 0), new Vector3(1, 0, 0), 'car', 1).bodies[0];
+    expect(hitBody(down(2.0, 0), across, size)).not.toBeNull();
+    expect(hitBody(down(0, 2.0), across, size)).toBeNull();
+  });
+
+  it('重なって見えるときは、手前の車両が選ばれる', () => {
+    // 縦に並んだ 2 両を、真横から浅く見る。レイは両方の箱を貫く。
+    const vehicles = [car(0, 0, 1), car(0, 20, 2)];
+    const ray = {
+      origin: new Vector3(0, 2, -40),
+      direction: new Vector3(0, -0.01, 1).normalize(),
+    };
+    expect(pickVehicle(vehicles, ray, null)?.id).toBe(1);
+    // 逆から見れば手前は id=2。
+    const back = {
+      origin: new Vector3(0, 2, 60),
+      direction: new Vector3(0, -0.01, -1).normalize(),
+    };
+    expect(pickVehicle(vehicles, back, null)?.id).toBe(2);
+  });
+
+  it('外したら、指した地点にいちばん近い車両', () => {
+    const vehicles = [car(0, 0, 1), car(0, 60, 2)];
+    // どの車両にも当たらないレイ。
+    const miss = down(100, 100);
+    expect(pickVehicle(vehicles, miss, new Vector3(0, 0, 52))?.id).toBe(2);
+    expect(pickVehicle(vehicles, miss, new Vector3(0, 0, 4))?.id).toBe(1);
+    // 指した先も分からなければ選べない。
+    expect(pickVehicle(vehicles, miss, null)).toBeNull();
+    expect(pickVehicle([], down(0, 0), new Vector3())).toBeNull();
+  });
+
+  it('選んでから乗る (選択中は一人称にならない)', () => {
+    const vehicles = [car(0, 0, 1), car(0, 60, 2)];
+    const ride = new Ride();
+    ride.aim();
+    expect(ride.aiming).toBe(true);
+    expect(ride.active).toBe(false);
+    // 指すだけでは乗らない。
+    expect(ride.hover(vehicles, down(0, 60), null)?.id).toBe(2);
+    expect(ride.targetId).toBe(2);
+    expect(ride.active).toBe(false);
+    const aiming = ride.update(vehicles, 0.016);
+    expect(aiming?.phase).toBe('aim');
+    expect(aiming?.vehicle?.id).toBe(2);
+
+    // クリックで乗る。
+    expect(ride.boardTarget(vehicles)).toBe(true);
+    expect(ride.aiming).toBe(false);
+    expect(ride.active).toBe(true);
+    expect(ride.vehicleId).toBe(2);
+    const riding = ride.update(vehicles, 0.016);
+    expect(riding?.phase).toBe('ride');
+    expect(riding?.pose.eye.z).toBeGreaterThan(55);
+  });
+
+  it('指していなければ乗らない。取り消せる', () => {
+    const vehicles = [car(0, 0, 1)];
+    const ride = new Ride();
+    ride.aim();
+    // 車両が 1 両も無いところを指した (地点も分からない) 状態。
+    expect(ride.hover([], down(0, 0), null)).toBeNull();
+    expect(ride.boardTarget([])).toBe(false);
+    expect(ride.active).toBe(false);
+    expect(ride.aiming).toBe(true);
+
+    ride.leave();
+    expect(ride.aiming).toBe(false);
+    expect(ride.update(vehicles, 0.016)).toBeNull();
   });
 });

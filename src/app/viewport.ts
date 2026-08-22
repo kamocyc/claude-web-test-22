@@ -168,6 +168,20 @@ export class Viewport {
     );
   }
 
+  /**
+   * 現在のポインタ位置から伸びるレイ (ワールド座標)。
+   *
+   * 地形や路面ではなく**車両**を指すのに使う。車両は毎フレーム動くので
+   * シーングラフに問い合わせず、姿勢から直に当たり判定する (`hitBody`)。
+   */
+  ray(): { origin: Vector3; direction: Vector3 } {
+    this.raycaster.setFromCamera(this.pointer, this.camera);
+    return {
+      origin: this.raycaster.ray.origin.clone(),
+      direction: this.raycaster.ray.direction.clone(),
+    };
+  }
+
   /** 現在のポインタ位置から対象メッシュへレイキャストする。 */
   pick(targets: Mesh[]): Vector3 | null {
     this.raycaster.setFromCamera(this.pointer, this.camera);

@@ -11,6 +11,7 @@ import {
   type Anchor,
 } from '../src/network/editing';
 import { Network, type SegmentId } from '../src/network/network';
+import type { LanePose } from '../src/sim/lanegraph';
 import { WorldBuilder } from '../src/render/worldBuilder';
 import { Heightfield } from '../src/terrain/heightfield';
 import { TerrainMesh } from '../src/terrain/terrainMesh';
@@ -1165,4 +1166,122 @@ describe('踏切でレールが舗装の上に出ている', () => {
     expect(checked, '舗装の上の検査点が少なすぎる').toBeGreaterThan(2000);
     expect(problems.join('\n')).toBe('');
   }, 300000);
+});
+
+/**
+ * 踏切を渡る車両の姿勢を、**実メッシュの舗装**と突き合わせる。
+ *
+ * 踏切のまわりの舗装は線路の面に合わせて上下・傾斜している。位置だけを
+ * その面に載せて姿勢を線形のまま (水平のまま) にすると、車体は坂を平らな
+ * まま登り、山の頂上では鼻先が路面に刺さる。
+ *
+ * 見るのは 2 つ:
+ *   - 縦断: すり付けの届く範囲すべてで、車体の勾配が舗装の勾配に沿うこと。
+ *   - 横断: 踏切の板の上で、車体の傾きが舗装の傾きに沿うこと。
+ *
+ * 横断を板の上だけで見るのは、舗装が本来持っている排水のための勾配 (拝み
+ * 勾配) を車両が見ていないため。板の上ではその勾配が潰されて線路の面に
+ * 揃うので、そこでは舗装の傾き = 踏切の傾きになり、直に比べられる。
+ */
+function vehicleAttitudeViolations(
+  scene: Scene,
+  reach = 45,
+): { violations: Violation[]; checked: number; tilted: number; humped: number } {
+  const crossing = levelCrossings(scene)[0];
+  const surfaces = new SurfaceIndex(scene);
+  const violations: Violation[] = [];
+  let checked = 0;
+  let tilted = 0;
+  let humped = 0;
+  /** 車輪の当たる所 (前後・左右 `arm` [m]) を見る。 */
+  const arm = 2;
+  const top = (x: number, z: number, y: number): number | null => surfaces.topAt(x, z, y + 1.5);
+
+  /** その姿勢の所で、実メッシュの舗装がどれだけ傾いているか。 */
+  const slopesAt = (
+    pose: LanePose,
+  ): { along: number; across: number } | null => {
+    const flat = Math.hypot(pose.dir.x, pose.dir.z);
+    if (flat < 1e-6) return null;
+    const fx = pose.dir.x / flat;
+    const fz = pose.dir.z / flat;
+    // 車体の「右」。`bodyQuaternion` と同じ (up × forward)。
+    const rx = fz;
+    const rz = -fx;
+    const ahead = top(pose.pos.x + fx * arm, pose.pos.z + fz * arm, pose.pos.y);
+    const back = top(pose.pos.x - fx * arm, pose.pos.z - fz * arm, pose.pos.y);
+    const right = top(pose.pos.x + rx * arm, pose.pos.z + rz * arm, pose.pos.y);
+    const left = top(pose.pos.x - rx * arm, pose.pos.z - rz * arm, pose.pos.y);
+    if (ahead === null || back === null || right === null || left === null) return null;
+    return { along: (ahead - back) / (2 * arm), across: (right - left) / (2 * arm) };
+  };
+
+  const near = (p: Vector3): number =>
+    Math.hypot(p.x - crossing.point.x, p.z - crossing.point.z);
+
+  /** 交点から道路に沿って測った距離 [m]。車線の横距を含めない。 */
+  const roadDir = scene.network.alignmentOf(crossing.roadSegment).sampleAt(crossing.sRoad).forwardXZ;
+  const alongOf = (p: Vector3): number =>
+    Math.abs((p.x - crossing.point.x) * roadDir.x + (p.z - crossing.point.z) * roadDir.y);
+
+  for (const lane of scene.world.laneGraph.lanes) {
+    if (lane.kind !== 'segment' || lane.vehicleKind !== 'car') continue;
+    const n = Math.max(2, Math.ceil(lane.path.length / 2));
+    for (let i = 0; i <= n; i++) {
+      const pose = lane.path.poseAt((i / n) * lane.path.length);
+      const away = near(pose.pos);
+      if (away > reach) continue;
+      const slopes = slopesAt(pose);
+      if (!slopes) continue;
+      checked++;
+
+      const gotGrade = pose.dir.y / Math.hypot(pose.dir.x, pose.dir.z);
+      if (Math.abs(slopes.along) > 0.004) humped++;
+      if (Math.abs(gotGrade - slopes.along) > 0.012) {
+        violations.push({
+          amount: Math.abs(gotGrade - slopes.along),
+          where: pose.pos.clone(),
+          what: `縦断: 舗装 ${(slopes.along * 100).toFixed(1)}% に対し車体 ${(gotGrade * 100).toFixed(1)}%`,
+        });
+      }
+
+      // 板の上だけ。左右の腕 (2 m) も板から出ないよう、中心の近くで見る。
+      if (alongOf(pose.pos) > 1.5) continue;
+      if (Math.abs(slopes.across) > 0.004) tilted++;
+      if (Math.abs(pose.roll - slopes.across) > 0.012) {
+        violations.push({
+          amount: Math.abs(pose.roll - slopes.across),
+          where: pose.pos.clone(),
+          what: `横断: 舗装 ${(slopes.across * 100).toFixed(1)}% に対し車体 ${(pose.roll * 100).toFixed(1)}%`,
+        });
+      }
+    }
+  }
+  return { violations, checked, tilted, humped };
+}
+
+describe('踏切を渡る車両', () => {
+  const cases: [string, () => Scene][] = [
+    ['直交・線路 3%', () => crossingScene({ railGrade: 0.03 })],
+    ['斜め 60°・線路 3%', () => crossingScene({ angle: 60, railGrade: 0.03 })],
+    ['斜め 45°・線路 2%・道路 4%', () => crossingScene({ angle: 45, railGrade: 0.02, roadGrade: 0.04 })],
+    ['線路が縦曲線 (頂部)', () => crossingScene({ angle: 70, railCrest: 2.5 })],
+  ];
+
+  it('車体が、その点に描かれている舗装の勾配・横断勾配に沿う', () => {
+    let tilted = 0;
+    let humped = 0;
+    for (const [name, make] of cases) {
+      const scene = make();
+      expect(levelCrossings(scene).length, `${name}: 踏切ができていない`).toBe(1);
+      const r = vehicleAttitudeViolations(scene);
+      expect(r.checked, `${name}: 検査点が少なすぎる`).toBeGreaterThan(40);
+      expect(summarize(name, r.violations)).toBe(`${name}: 違反なし`);
+      tilted += r.tilted;
+      humped += r.humped;
+    }
+    // 空振り防止: 実際に上下している所・傾いている所を通っていること。
+    expect(humped).toBeGreaterThan(40);
+    expect(tilted).toBeGreaterThan(8);
+  }, 120000);
 });

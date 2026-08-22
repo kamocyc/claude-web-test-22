@@ -18,11 +18,18 @@ import type { Network, NodeId, SegmentId } from '../network/network';
 
 export type VehicleKind = 'car' | 'train';
 
-/** 走行経路上の 1 点。位置・進行方向と、路面の横断勾配 (右が高いと正)。 */
+/** 走行経路上の 1 点。位置・進行方向と、路面の横断勾配。 */
 export interface LanePose {
   pos: Vector3;
   dir: Vector3;
-  /** 路面の横断勾配 (右へ 1 m あたりの上がり)。カント・踏切の傾き。 */
+  /**
+   * 路面の横断勾配 (**車体から見て右**へ 1 m あたりの上がり)。カントや
+   * 踏切の傾きがそのまま入る。
+   *
+   * 線形の `sample.right` (= `perp(t)` = (-z, x)) は、進行方向を向いた
+   * ときの**左**を指す。線形・路面のデータはその向きで揃っているので、
+   * 車体の姿勢へ渡すここで符号を返す。
+   */
   roll: number;
 }
 
@@ -83,6 +90,15 @@ export type SurfaceQuery = (segment: SegmentId, s: number, y: number) => {
   roll: number;
 };
 
+/**
+ * 縦断勾配を読むときに、前後を見る距離 [m]。
+ *
+ * 踏切のすり付けは十数 m で上下するので、点の勾配をそのまま使うと車体が
+ * 折れ線をなぞる。前後 2 m ほど (車の軸距ぐらい) を見れば、路面の凹凸を
+ * 車輪でまたぐのと同じように均される。
+ */
+const GRADE_STEP = 2;
+
 /** セグメント上の車線 (トリムした範囲だけ)。 */
 class SegmentLanePath implements LanePath {
   readonly length: number;
@@ -104,16 +120,46 @@ class SegmentLanePath implements LanePath {
     const sample = this.alignment.sampleAt(s);
     // 路面と同じ補正を通す。踏切の前後で舗装は上下し、曲線ではカントで傾く。
     const blend = this.surface?.(this.segment, s, sample.pos.y) ?? { dy: 0, roll: 0 };
+    const dir = this.forward ? sample.forward.clone() : sample.forward.clone().negate();
     return {
       pos: new Vector3(
         sample.pos.x + sample.right.x * this.offset,
         sample.pos.y + blend.dy + this.offset * blend.roll + SURFACE_LIFT,
         sample.pos.z + sample.right.z * this.offset,
       ),
-      dir: this.forward ? sample.forward.clone() : sample.forward.clone().negate(),
-      // 弧長の向きが逆なら「右」も逆になるので、横断勾配の符号も反転する。
-      roll: this.forward ? blend.roll : -blend.roll,
+      dir: this.surface ? this.pitch(dir, s) : dir,
+      // 線形の「右」は車体から見た左なので、ここで符号を返す。弧長の向きが
+      // 逆に走る車線では、車体の右がさらに逆になるのでもう一度返る。
+      roll: this.forward ? -blend.roll : blend.roll,
     };
+  }
+
+  /**
+   * 進行方向を、**補正後の路面**の縦断勾配に合わせて起こす。
+   *
+   * `sample.forward` は線形そのものの勾配なので、踏切のすり付けで舗装が
+   * 上下している所では車体が路面と平行にならない。位置だけ持ち上げて姿勢を
+   * そのままにすると、坂を水平のまま登る (踏切の山を鼻先で突っ切る) 形に
+   * なるので、実際に走る線の勾配を測り直して向きを差し替える。
+   */
+  private pitch(dir: Vector3, s: number): Vector3 {
+    const back = clamp(s - GRADE_STEP, 0, this.alignment.length);
+    const ahead = clamp(s + GRADE_STEP, 0, this.alignment.length);
+    const span = ahead - back;
+    const flat = Math.hypot(dir.x, dir.z);
+    if (span < 1e-6 || flat < 1e-9) return dir;
+    // 弧長 (水平距離) あたりの上がり。線形自身の勾配も含んだ値になる。
+    const rise = (this.heightAt(ahead) - this.heightAt(back)) / span;
+    const grade = this.forward ? rise : -rise;
+    const scale = 1 / Math.sqrt(1 + grade * grade);
+    return dir.set((dir.x / flat) * scale, grade * scale, (dir.z / flat) * scale);
+  }
+
+  /** その弧長で、この車線が実際に通る高さ [m]。 */
+  private heightAt(s: number): number {
+    const sample = this.alignment.sampleAt(s);
+    const blend = this.surface?.(this.segment, s, sample.pos.y) ?? { dy: 0, roll: 0 };
+    return sample.pos.y + blend.dy + this.offset * blend.roll;
   }
 }
 

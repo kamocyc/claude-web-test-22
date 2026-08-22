@@ -60,7 +60,7 @@ const ui = new Ui(uiRoot, {
     // 走らせるのをやめたら、乗る車両もいなくなる。
     if (!on) stopRide();
   },
-  onRide: () => (ride.active ? stopRide() : startRide()),
+  onRide: () => (ride.active || ride.aiming ? stopRide() : startRide()),
   onRideNext: () => {
     if (ride.active) ride.next(world.traffic.vehicles);
     else startRide();
@@ -94,7 +94,12 @@ function setMode(mode: ToolMode): void {
   ui.setMode(mode);
 }
 
-/** 乗車モードに入る。いま見ている辺りの車両に乗る。 */
+/**
+ * 乗る車両を選ぶ状態に入る。
+ *
+ * すぐ一人称にせず、俯瞰のまま指した車両を光らせる。走っている車両の
+ * どれに乗るかは、外から見て選べたほうが分かりやすい。
+ */
 function startRide(): void {
   if (ride.active) return;
   tool.cancel();
@@ -103,17 +108,38 @@ function startRide(): void {
     world.showVehicles = true;
     ui.setVehicles(true);
   }
-  ride.board(world.traffic.vehicles, viewport.controls.target);
-  viewport.beginRide();
-  ui.setRiding(true);
+  ride.aim();
+  document.body.classList.add('aiming');
+  ui.setRideState('aim');
 }
 
-/** 乗車モードから降り、元の視点に戻す。 */
+/**
+ * 選択中の車両に乗り込む。
+ *
+ * 乗るのは**画面で光っている車両**。押してから離すまでの間にも車両は走って
+ * いるので、ここで指し直すと「狙ったのと違う車両に乗る」ことになる。
+ */
+function boardRide(): void {
+  if (!ride.boardTarget(world.traffic.vehicles)) {
+    // 光っていた車両が消えていた (行き止まりに着いた)。選び直す。
+    ride.hover(world.traffic.vehicles, viewport.ray(), cursor);
+    if (!ride.boardTarget(world.traffic.vehicles)) return;
+  }
+  world.highlightVehicle = null;
+  document.body.classList.remove('aiming');
+  viewport.beginRide();
+  ui.setRideState('ride');
+}
+
+/** 乗車モードから降り (選択中ならやめ)、元の視点に戻す。 */
 function stopRide(): void {
-  if (!ride.active) return;
+  if (!ride.active && !ride.aiming) return;
+  const rode = ride.active;
   ride.leave();
-  viewport.endRide();
-  ui.setRiding(false);
+  world.highlightVehicle = null;
+  document.body.classList.remove('aiming');
+  if (rode) viewport.endRide();
+  ui.setRideState('off');
 }
 
 setMode('build');
@@ -217,6 +243,10 @@ canvas.addEventListener('pointerup', (event) => {
   if (moved > 5 || elapsed > 400) return;
   viewport.setPointer(event.clientX, event.clientY);
   cursor = pick();
+  if (ride.aiming) {
+    boardRide();
+    return;
+  }
   tool.update(cursor, modifiers);
   tool.click();
 });
@@ -226,12 +256,12 @@ canvas.addEventListener('contextmenu', (event) => event.preventDefault());
 window.addEventListener('keydown', (event) => {
   switch (event.key) {
     case 'Escape':
-      if (ride.active) stopRide();
+      if (ride.active || ride.aiming) stopRide();
       else tool.cancel();
       break;
     case 'f':
     case 'F':
-      if (ride.active) stopRide();
+      if (ride.active || ride.aiming) stopRide();
       else startRide();
       break;
     case 'n':
@@ -290,13 +320,21 @@ function frame(): void {
     ui.updateBuild(result);
   }
 
+  // 選択中は、指している車両を毎フレーム選び直す (車両は走っている)。
+  if (ride.aiming) {
+    world.highlightVehicle =
+      ride.hover(world.traffic.vehicles, viewport.ray(), cursor)?.id ?? null;
+  }
+
   world.animate(time, dt);
   // 乗車モードのカメラは、車両を進めたあとに置く (1 フレーム遅れないように)。
   const riding = ride.update(world.traffic.vehicles, dt);
-  if (riding) viewport.placeEye(riding.pose.eye, riding.pose.forward, riding.pose.up);
+  if (riding?.phase === 'ride') {
+    viewport.placeEye(riding.pose.eye, riding.pose.forward, riding.pose.up);
+  }
 
-  // 乗車中は敷設のプレビューを出さない (カーソルは画面外を指している)。
-  tool.update(riding ? null : cursor, modifiers);
+  // 乗車中・選択中は敷設のプレビューを出さない。
+  tool.update(ride.active || ride.aiming ? null : cursor, modifiers);
   ui.updateStatus(tool.status(), riding);
   viewport.render();
   requestAnimationFrame(frame);

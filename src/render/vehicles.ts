@@ -48,6 +48,18 @@ const ROLL = new Quaternion();
 
 const glass = new MeshStandardMaterial({ color: 0x1b2228, roughness: 0.25, metalness: 0.4 });
 const tyre = new MeshStandardMaterial({ color: 0x15171a, roughness: 0.9 });
+/**
+ * 乗る車両を選んでいるときに、指している車両を塗る色。
+ *
+ * 車体色は配置ごとにばらばらなので、輪郭ではなく**塗り替え**で示す。
+ * 遠くから見下ろしていると車両は数ピクセルしかないので、自ら光る色にする。
+ */
+const marked = new MeshStandardMaterial({
+  color: 0xffd34a,
+  emissive: new Color(0.55, 0.32, 0.02),
+  roughness: 0.35,
+  metalness: 0.1,
+});
 
 /** 車体色ごとのマテリアルを使い回す。 */
 const paints = new Map<string, MeshStandardMaterial>();
@@ -92,11 +104,16 @@ export class VehicleView {
     this.group.name = 'vehicles';
   }
 
-  /** シミュレーションの状態を写す。 */
-  sync(vehicles: readonly Vehicle[]): void {
+  /**
+   * シミュレーションの状態を写す。
+   *
+   * `highlight` に番号を渡すと、その車両だけ選択色で塗る (乗る車両を
+   * 選んでいるとき)。
+   */
+  sync(vehicles: readonly Vehicle[], highlight: number | null = null): void {
     let used = 0;
     for (const vehicle of vehicles) {
-      const paint = paintFor(vehicle.color);
+      const paint = vehicle.id === highlight ? marked : paintFor(vehicle.color);
       for (const pose of vehicle.bodies) {
         const body = this.bodyAt(used++);
         place(body, vehicle, pose, paint);

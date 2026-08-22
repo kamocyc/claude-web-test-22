@@ -174,7 +174,9 @@ export class Ui {
     this.rideButton = button('乗車 (F)', callbacks.onRide);
     rideRow.append(this.rideButton, button('次の車両 (N)', callbacks.onRideNext));
     left.append(rideRow);
-    left.append(hint('走っている列車・車の運転台に乗ります。ドラッグで見回し、Esc / F で降ります'));
+    left.append(
+      hint('乗る車両をクリックで選びます。運転台に乗ったら、ドラッグで見回し、Esc / F で降ります'),
+    );
 
     left.append(sectionTitle('マップ'));
     const mapRow = el('div', 'row');
@@ -207,7 +209,7 @@ export class Ui {
       '<b>Shift</b> 直線・15° スナップ / <b>Ctrl</b> スナップ解除',
       '<b>C</b> 平行線路へシーサスクロッシングを一括敷設',
       '<b>右ドラッグ</b> 視点移動 / <b>ホイール</b> 拡大縮小',
-      '<b>F</b> 乗車 (一人称視点) / <b>N</b> 次の車両 / 乗車中はドラッグで見回す',
+      '<b>F</b> 乗車 (車両をクリックで選ぶ) / <b>N</b> 次の車両 / 乗車中はドラッグで見回す',
     ]
       .map((line) => `<div>${line}</div>`)
       .join('');
@@ -227,12 +229,14 @@ export class Ui {
     }
   }
 
-  /** 乗車モードの入り切りを反映する。 */
-  setRiding(on: boolean): void {
-    // 乗車中は敷設のパネルを薄くして、視界を空ける。
-    this.root.classList.toggle('riding', on);
-    this.rideButton.classList.toggle('active', on);
-    this.rideButton.textContent = on ? '降りる (F)' : '乗車 (F)';
+  /** 乗車まわりの状態を反映する。 */
+  setRideState(state: 'off' | 'aim' | 'ride'): void {
+    // 乗車中は敷設のパネルを薄くして、視界を空ける。選択中は俯瞰のままなので
+    // 薄くしない (どの車両を光らせているか、パネルと見比べられるように)。
+    this.root.classList.toggle('riding', state === 'ride');
+    this.rideButton.classList.toggle('active', state !== 'off');
+    this.rideButton.textContent =
+      state === 'ride' ? '降りる (F)' : state === 'aim' ? '選択中 (Esc)' : '乗車 (F)';
   }
 
   /** 車両の走行表示のチェックを合わせる (乗車のために自動で入れたとき)。 */
@@ -436,6 +440,19 @@ function checkbox(
  * とき)。そのときは待っていることが分かるようにする。
  */
 function rideRows(ride: RideStatus): [string, string, string?][] {
+  if (ride.phase === 'aim') {
+    const target = ride.vehicle;
+    const kind = ride.kind === 'train' ? '列車' : '自動車';
+    return [
+      ['視点', '乗る車両を選ぶ'],
+      [
+        '対象',
+        target ? `${kind} #${target.id} (${(ride.speed * 3.6).toFixed(0)} km/h)` : '走っている車両がありません',
+        target ? undefined : '#d98f6b',
+      ],
+      ['操作', 'クリックで乗車 / Esc で取消'],
+    ];
+  }
   if (!ride.vehicle) {
     return [
       ['視点', '一人称 (乗車)'],

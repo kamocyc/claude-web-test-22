@@ -207,9 +207,11 @@ describe('車両とカント', () => {
         const hit = network.findSegmentNear(pose.pos, 8);
         if (!hit) continue;
         const sample = network.alignmentOf(hit.segment).sampleAt(hit.s);
-        // 弧長の向きが逆の車線では、「右」も逆なので符号が反転する。
+        // 線形の「右」(`perp(t)` = (-z, x)) は、進行方向を向いたときの左を
+        // 指す。車線の姿勢は車体から見た向きで返すので符号が逆になり、弧長の
+        // 向きが逆の車線ではもう一度返る。
         const forward = sample.forward.dot(pose.dir) > 0;
-        const want = world.cantAt(hit.segment, hit.s) * (forward ? 1 : -1);
+        const want = -world.cantAt(hit.segment, hit.s) * (forward ? 1 : -1);
         worst = Math.max(worst, Math.abs(pose.roll - want));
         if (Math.abs(pose.roll) > 0.01) tilted++;
         checked++;
@@ -219,6 +221,34 @@ describe('車両とカント', () => {
     expect(checked).toBeGreaterThan(100);
     expect(tilted).toBeGreaterThan(20);
     expect(worst).toBeLessThan(3e-3);
+  });
+
+  /**
+   * 符号の取り違えは、値が合っているぶんだけ見つけにくい。カントの向きは
+   * 「曲線の内側へ傾く」で決まる — 遠心力に釣り合う向きに床を傾けるのが
+   * カントなので、外側が高い。線形データの `right` がどちら向きかに依らず
+   * 確かめられるよう、**進行方向の曲がり方**から直に見る。
+   */
+  it('車体は曲線の内側へ傾く (外側のレールが高い)', () => {
+    const scene = turnoutOnCurve();
+    let curving = 0;
+    let outward = 0;
+    for (const lane of scene.world.laneGraph.lanes) {
+      if (lane.kind !== 'segment' || lane.vehicleKind !== 'train') continue;
+      const n = 60;
+      for (let i = 0; i < n; i++) {
+        const a = lane.path.poseAt((i / n) * lane.path.length);
+        const b = lane.path.poseAt(((i + 1) / n) * lane.path.length);
+        // 進行方向が車体の右へ振れていれば正 (右カーブ)。
+        const turn = b.dir.x * a.dir.z - b.dir.z * a.dir.x;
+        if (Math.abs(turn) < 1e-3 || Math.abs(a.roll) < 0.01) continue;
+        curving++;
+        // 右カーブなら左が高い = 車体から見た横断勾配は負。
+        if (turn * a.roll > 0) outward++;
+      }
+    }
+    expect(curving).toBeGreaterThan(30);
+    expect(outward).toBe(0);
   });
 
   it('交差点の中の進路は水平 (面がねじれない所を走る)', () => {
