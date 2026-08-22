@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { Vector2, Vector3 } from 'three';
 import { Alignment } from '../src/core/alignment';
 import { HorizontalCurve, xz } from '../src/core/curve';
+import { heightInTriangleXZ } from '../src/core/meshbuilder';
 import { VerticalProfile } from '../src/core/profile';
 import { LEVEL_CROSSING_TOLERANCE, RAIL_GAUGE } from '../src/core/units';
 import { cantRoll } from '../src/build/cant';
@@ -9,8 +10,15 @@ import { computeCrossingBlend } from '../src/build/crossing';
 import { getClass } from '../src/network/classes';
 import { findCrossings } from '../src/network/crossings';
 import { anchorFromSegment, computePlacement, placeSegment } from '../src/network/editing';
-import type { Branch } from '../src/network/network';
-import { buildScene, draw, drawBranch, flat, type Scene } from './support/adversarial';
+import type { Branch, SegmentId } from '../src/network/network';
+import {
+  buildScene,
+  draw,
+  drawBranch,
+  flat,
+  trianglesOf,
+  type Scene,
+} from './support/adversarial';
 import * as C from './support/checks';
 import { summarize } from './support/adversarial';
 
@@ -262,6 +270,94 @@ describe('車両とカント', () => {
       connectors++;
     }
     expect(connectors).toBeGreaterThan(0);
+  });
+});
+
+/**
+ * カントの付いた曲線が橋・トンネルに入ったときの見え方。
+ *
+ * 帯 (道床・舗装) とレール・まくらぎは横断勾配で傾くのに、橋の桁や床版が
+ * 水平のままだと、両者が交わります。床版の上面が軌道面を切るので、低い側の
+ * まくらぎが床版に飲み込まれて途中で切れて見えます。実メッシュから測ります。
+ */
+describe('カントと構造物', () => {
+  /** 谷を渡る曲線の線路 (曲線半径を詰めてカントを大きくする)。 */
+  function cantedBridge(): Scene {
+    return buildScene('カント付きの橋', (_x, z) => 40 - 22 * Math.exp(-((z / 90) ** 2)), (net, field) =>
+      draw(net, field, 'rail_single', [
+        { x: -260, z: -160, y: 40 },
+        { x: -120, z: -60, y: 40 },
+        { x: 40, z: 10, y: 40 },
+        { x: 190, z: -40, y: 40 },
+      ]),
+    );
+  }
+
+  /** いちばんカントの大きい、橋の上の点。 */
+  function steepestOnBridge(scene: Scene): { segment: SegmentId; s: number; roll: number } {
+    let best: { segment: SegmentId; s: number; roll: number } | null = null;
+    for (const seg of scene.network.segments.values()) {
+      const runs = scene.world.structureRunsOf(seg.id);
+      for (const run of runs) {
+        if (run.mode !== 'bridge') continue;
+        for (let i = 0; i <= 60; i++) {
+          const s = run.s0 + ((run.s1 - run.s0) * i) / 60;
+          const roll = scene.world.cantAt(seg.id, s);
+          if (!best || Math.abs(roll) > Math.abs(best.roll)) best = { segment: seg.id, s, roll };
+        }
+      }
+    }
+    if (!best) throw new Error('橋の区間が無い');
+    return best;
+  }
+
+  it('橋の床版・高欄が軌道面と一緒に傾く (まくらぎが飲み込まれない)', () => {
+    const scene = cantedBridge();
+    const at = steepestOnBridge(scene);
+    // 空振り防止: 実際にカントが付いた所を見ていること。
+    expect(Math.abs(at.roll)).toBeGreaterThan(0.03);
+
+    const triangles = trianglesOf(scene, 'structures');
+    /** その XZ を覆う構造物のうち、いちばん高い面。 */
+    const topAt = (x: number, z: number, ceiling: number): number | null => {
+      let best: number | null = null;
+      for (const { a, b, c } of triangles) {
+        const y = heightInTriangleXZ(a, b, c, x, z);
+        if (y === null || y > ceiling) continue;
+        if (best === null || y > best) best = y;
+      }
+      return best;
+    };
+
+    // レール (軌間の外側 ±0.75) と高欄 (±1.9 より外) を避けた所で測る。
+    const offsets = [-1.85, -1.5, -1.1, -0.3, 0, 0.3, 1.1, 1.5, 1.85];
+    const alignment = scene.network.alignmentOf(at.segment);
+    let worst = 0;
+    let checked = 0;
+    for (let k = -4; k <= 4; k++) {
+      const s = at.s + k * 0.31;
+      if (s < 2 || s > alignment.length - 2) continue;
+      const sample = alignment.sampleAt(s);
+      const roll = scene.world.cantAt(at.segment, s);
+      const tops = offsets.map((o) =>
+        topAt(
+          sample.pos.x + sample.right.x * o,
+          sample.pos.z + sample.right.z * o,
+          sample.pos.y + 1,
+        ),
+      );
+      const centre = tops[offsets.indexOf(0)];
+      if (centre === null) continue;
+      for (let i = 0; i < offsets.length; i++) {
+        const top = tops[i];
+        if (top === null) continue;
+        // 上面はどこでも、軌道面と同じ横断勾配の 1 枚の面に乗っていること。
+        worst = Math.max(worst, Math.abs(top - centre - offsets[i] * roll));
+        checked++;
+      }
+    }
+    expect(checked).toBeGreaterThan(40);
+    expect(worst).toBeLessThan(0.015);
   });
 });
 

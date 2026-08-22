@@ -33,7 +33,12 @@ const MIN_PIER_HEIGHT = 2.0;
 
 /**
  * 断面が一定の閉じた角柱を線形に沿って掃引する。
- * 橋桁・高欄・トンネル側壁など、直方体断面の構造物に使う。
+ * 橋桁・高欄など、直方体断面の構造物に使う。
+ *
+ * 断面は路面と同じ横断勾配 (`sample.roll`) で傾けます。カントの付いた曲線で
+ * 桁だけ水平のままにすると、床版が軌道面と交わり、内側 (低い側) のまくらぎが
+ * 床版に飲み込まれて途中で切れて見えます (最大カントで 0.06 m ほど潜る)。
+ * 実物でも、カントは床版ごと傾けるか道床の厚みで付けます。
  */
 function sweepBox(
   mb: MeshBuilder,
@@ -50,13 +55,16 @@ function sweepBox(
     const cz = sample.pos.z + sample.right.z * offset;
     const rx = sample.right.x * halfWidth;
     const rz = sample.right.z * halfWidth;
-    const top = sample.pos.y + yTop;
-    const bottom = sample.pos.y + yBottom;
+    const roll = sample.roll ?? 0;
+    // 横断勾配のぶん、断面の左右で高さが変わる。
+    const lift = (o: number): number => sample.pos.y + o * roll;
+    const left = lift(offset - halfWidth);
+    const right = lift(offset + halfWidth);
     return [
-      new Vector3(cx - rx, top, cz - rz),
-      new Vector3(cx + rx, top, cz + rz),
-      new Vector3(cx + rx, bottom, cz + rz),
-      new Vector3(cx - rx, bottom, cz - rz),
+      new Vector3(cx - rx, left + yTop, cz - rz),
+      new Vector3(cx + rx, right + yTop, cz + rz),
+      new Vector3(cx + rx, right + yBottom, cz + rz),
+      new Vector3(cx - rx, left + yBottom, cz - rz),
     ];
   });
   addTube(mb, sections, color, true);
@@ -152,7 +160,10 @@ function buildPiers(
       break;
     }
     if (!sample) continue;
-    const top = sample.pos.y + deckBottom;
+    // 桁の底はカントで傾いているので、柱の頭は傾いた底の**低い側**より
+    // さらに上まで伸ばす。水平に切ると、片側に桁との隙間が開く。
+    const top =
+      sample.pos.y + deckBottom + Math.abs(sample.roll ?? 0) * cls.halfWidth * 0.42;
     const height = top - ground;
     if (height < MIN_PIER_HEIGHT) continue;
 
