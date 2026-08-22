@@ -1,9 +1,22 @@
+import type { Vector3 } from 'three';
 import type { Alignment } from '../core/alignment';
 import { clamp } from '../core/units';
 import type { NetworkClass } from './classes';
+import type { Network, NodeId } from './network';
 
 /** 縦曲線を見はじめる区間長 [m]。 */
 const MIN_VERTICAL_SPAN = 5;
+
+/**
+ * 継ぎ目の勾配の折れを報せる閾値。
+ *
+ * 敷設時の均し (`smoothGradeJoint`) は、規格が許すかぎり折れを 0.05% 未満まで
+ * 詰めます。ここまで残るのは「両側とも規格いっぱいで、これ以上動かせない」
+ * ときだけなので、それは黙って作らずに報せます。
+ */
+const GRADE_BREAK_WARNING = 0.01;
+
+
 
 export interface SegmentDiagnostics {
   length: number;
@@ -82,4 +95,53 @@ export function pointRisk(curvature: number, grade: number, cls: NetworkClass): 
     gradeRisk: Math.abs(grade) / cls.maxGrade,
     curveRisk: radius > 1e6 ? 0 : cls.minRadius / radius,
   };
+}
+
+
+/** 継ぎ目で勾配が折れている所。 */
+export interface GradeBreak {
+  node: NodeId;
+  pos: Vector3;
+  /** 折れの大きさ (勾配の差)。 */
+  gap: number;
+  cls: NetworkClass;
+}
+
+/**
+ * 縦断が折れている継ぎ目を探す。
+ *
+ * ノードの枝は**外向き**の勾配を持つので、同じ道が真っ直ぐ続いていれば
+ * 2 本の外向き勾配は符号違いで揃います (`g0 + g1 = 0`)。揃っていない分が
+ * そのまま折れの大きさです。
+ *
+ * 見るのは**枝が 2 本のノード** — 1 本の道がそのまま続いている所だけです。
+ * 3 本以上のノードでは枝ごとに勾配が違うのがふつうで (坂の途中の丁字路、
+ * 分かれ方の違う分岐器)、その差は交差点の面が繋ぎます。どの 2 本を「同じ道
+ * の続き」とみなすかは枝の並び方に依るので、機械的に組にすると丁字路の枝道
+ * まで折れとして数えてしまいます。
+ */
+export function findGradeBreaks(
+  network: Network,
+  threshold = GRADE_BREAK_WARNING,
+): GradeBreak[] {
+  const out: GradeBreak[] = [];
+  for (const node of network.nodes.values()) {
+    const branches = network.branchesAt(node.id);
+    if (branches.length !== 2) continue;
+    const [a, b] = branches;
+    if (a.cls.kind !== b.cls.kind) continue;
+    const gap = Math.abs(a.grade + b.grade);
+    if (gap < threshold) continue;
+    out.push({ node: node.id, pos: node.pos.clone(), gap, cls: a.cls });
+  }
+  return out;
+}
+
+/** 折れた継ぎ目の説明文。 */
+export function gradeBreakMessage(brk: GradeBreak): string {
+  return (
+    `継ぎ目で勾配が ${(brk.gap * 100).toFixed(1)}% 折れています ` +
+    `(両側とも ${brk.cls.label} の規格いっぱいで、均しきれません)。` +
+    '前後の勾配を緩めるか、区間を長く取り直してください。'
+  );
 }

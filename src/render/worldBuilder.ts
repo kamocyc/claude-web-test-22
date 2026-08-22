@@ -90,7 +90,12 @@ import {
   stationOf,
   type ParallelGroup,
 } from '../network/parallel';
-import { evaluateAlignment, type SegmentDiagnostics } from '../network/validation';
+import {
+  evaluateAlignment,
+  findGradeBreaks,
+  gradeBreakMessage,
+  type SegmentDiagnostics,
+} from '../network/validation';
 import { TerrainGrading } from '../terrain/grading';
 import type { Heightfield } from '../terrain/heightfield';
 import type { TerrainMesh } from '../terrain/terrainMesh';
@@ -498,6 +503,16 @@ export class WorldBuilder {
       if (cls.kind === 'road') {
         buildLaneMarkings(overlay, this.surfacePath(seg.id), range, cls);
       }
+    }
+
+    // 継ぎ目で縦断が折れている所。均しは規格の範囲でしか動かせないので、
+    // 詰めきれずに残ることがある。黙って作らずに報せる。
+    for (const brk of findGradeBreaks(network)) {
+      warnings.push({
+        message: gradeBreakMessage(brk),
+        position: brk.pos.clone(),
+        severity: 'warning',
+      });
     }
 
     for (const junction of junctions.values()) {

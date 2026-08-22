@@ -379,6 +379,11 @@ export function smoothJoint(network: Network, node: NodeId): boolean {
   return false;
 }
 
+/** 折れをこれ以下にできたら十分とみなす (0.05%)。 */
+const GRADE_JOINT_TOLERANCE = 5e-4;
+/** 寄せ直す回数の上限。 */
+const GRADE_JOINT_PASSES = 6;
+
 /**
  * ノードでの勾配の折れをなめらかにする。
  *
@@ -392,18 +397,33 @@ export function smoothJoint(network: Network, node: NodeId): boolean {
  * 効かないと繋ぎ目の勾配差がそのまま残ってしまう。
  */
 export function smoothGradeJoint(network: Network, node: NodeId): boolean {
-  const branches = network.branchesAt(node);
-  if (branches.length !== 2) return false;
-  const [b0, b1] = branches;
-  if (b0.cls.kind !== b1.cls.kind) return false;
-  // 外向き勾配が符号違いで揃っていれば、そこは折れていない。
-  if (Math.abs(b0.grade + b1.grade) < 1e-6) return false;
+  const first = network.branchesAt(node);
+  if (first.length !== 2) return false;
+  if (first[0].cls.kind !== first[1].cls.kind) return false;
 
-  // 外向き勾配が ±target で揃えば折れが消える。両側から同じだけ寄せる。
-  const target = (b0.grade - b1.grade) / 2;
-  return branches
-    .map((b, i) => approachGrade(network, b, i === 0 ? target : -target))
-    .some(Boolean);
+  let moved = false;
+  // 片側が規格で動けないことがある。そのときは残りをもう片側に寄せるので、
+  // 「中点で分ける」を 1 回だけ掛けても折れは半分しか消えない。動かなく
+  // なるまで繰り返す。
+  for (let pass = 0; pass < GRADE_JOINT_PASSES; pass++) {
+    const [b0, b1] = network.branchesAt(node);
+    // 外向き勾配が符号違いで揃っていれば、そこは折れていない。
+    const gap = b0.grade + b1.grade;
+    if (Math.abs(gap) < GRADE_JOINT_TOLERANCE) break;
+
+    // 1 巡目は両側から同じだけ寄せる (既に敷いてある線形を大きく変えない)。
+    // 2 巡目からは、動けなかったぶんを動ける側に全部寄せる。
+    const target = pass === 0 ? (b0.grade - b1.grade) / 2 : -b1.grade;
+    if (approachGrade(network, b0, target)) moved = true;
+    // b0 が実際に動いた所に合わせるので、両側とも動ける場合は 1 巡で揃う。
+    const [after0, after1] = network.branchesAt(node);
+    if (approachGrade(network, after1, -after0.grade)) moved = true;
+
+    const [end0, end1] = network.branchesAt(node);
+    // どちらも動かなくなったら、それ以上は規格が許さない。
+    if (Math.abs(end0.grade + end1.grade - gap) < 1e-9) break;
+  }
+  return moved;
 }
 
 /**

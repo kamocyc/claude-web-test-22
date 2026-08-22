@@ -9,6 +9,7 @@ import {
   smoothGradeJoint,
   solveVerticalTangents,
 } from '../src/network/editing';
+import { findGradeBreaks, gradeBreakMessage } from '../src/network/validation';
 import { Network } from '../src/network/network';
 import { Heightfield } from '../src/terrain/heightfield';
 import { DEFAULT_TERRAIN, generateTerrain } from '../src/terrain/generator';
@@ -114,14 +115,39 @@ describe('継ぎ目の勾配', () => {
       new Vector3(200, 24, 0),
       new Vector3(240, 23.6, 0),
     ]);
-    const joint = jointGaps(network).find((g) => g.gap > 0)!;
-    // 片側だけを削ったときの食い違い (0.5%) より、はっきり小さい。
-    expect(joint.gap).toBeLessThan(0.003);
+    for (const joint of jointGaps(network)) expect(joint.gap).toBeLessThan(6e-4);
 
     // 分け合った結果でも、両方とも規格を割らない。
     for (const seg of network.segments.values()) {
       const vertical = network.alignmentOf(seg.id).vertical;
       expect(vertical.maxGrade(64)).toBeLessThanOrEqual(RAIL.maxGrade + 1e-6);
+      expect(vertical.minVerticalRadius()).toBeGreaterThan(RAIL.minVerticalRadius - 1e-6);
+    }
+  });
+
+  /**
+   * 片側が規格でびくとも動かない継ぎ目。
+   *
+   * 「両側から中点へ寄せる」を 1 回掛けるだけだと、動けるのは片側だけなので
+   * 折れは半分しか消えない。動ける側が残り全部を呑むまで寄せ直す。
+   */
+  it('片側が規格いっぱいなら、動ける側が残りを全部呑む', () => {
+    // 平均 +2% の先に平均 -4% の区間。後半は規格 5% を使い切るので、
+    // 引き継いだ勾配を受け取りきれず、そこからは 1 mm も動かせない。
+    const network = chain('rail_single', [
+      new Vector3(0, 20, 0),
+      new Vector3(120, 22.4, 0),
+      new Vector3(200, 19.2, 0),
+    ]);
+    const gaps = jointGaps(network);
+    expect(gaps.length).toBeGreaterThan(0);
+    for (const joint of gaps) expect(joint.gap).toBeLessThan(6e-4);
+
+    // 動かした側も規格を割らない (寄せ幅の判定は 32 点で測っているので、
+    // より細かく測ると 0.001% ほど出ることがある)。
+    for (const seg of network.segments.values()) {
+      const vertical = network.alignmentOf(seg.id).vertical;
+      expect(vertical.maxGrade(64)).toBeLessThanOrEqual(RAIL.maxGrade + 1e-4);
       expect(vertical.minVerticalRadius()).toBeGreaterThan(RAIL.minVerticalRadius - 1e-6);
     }
   });
@@ -137,6 +163,96 @@ describe('継ぎ目の勾配', () => {
       expect(smoothGradeJoint(network, node.id)).toBe(false);
     }
     expect([...network.segments.values()].map((s) => [s.gradeA, s.gradeB])).toEqual(before);
+  });
+});
+
+/**
+ * 折れが残ったときの警告。
+ *
+ * 均しは規格の範囲でしか動かせないので、両側とも規格いっぱいだと折れが
+ * 残ります。黙って作らずに報せます。丁字路のように**枝ごとに勾配が違うのが
+ * ふつう**の所は交差点の面が繋ぐので、折れとは呼びません。
+ */
+describe('勾配の折れの警告', () => {
+  it('均しきれない継ぎ目を見つけて、大きさを述べる', () => {
+    // 前半は規格 5% ちょうどの登り。後半は短い下りで、縦曲線の半径のぶん
+    // しか受け取れない。どちらも動かせないので折れが残る。
+    const network = chain('rail_single', [
+      new Vector3(0, 20, 0),
+      new Vector3(100, 25, 0),
+      new Vector3(140, 24.6, 0),
+    ]);
+    const breaks = findGradeBreaks(network);
+    expect(breaks.length).toBe(1);
+    expect(breaks[0].gap).toBeGreaterThan(0.03);
+    expect(gradeBreakMessage(breaks[0])).toContain('3.5% 折れています');
+  });
+
+  it('繋がっている線形では鳴らない', () => {
+    const network = chain('rail_single', [
+      new Vector3(0, 20, 0),
+      new Vector3(120, 24.8, 0),
+      new Vector3(240, 23.6, 0),
+    ]);
+    expect(findGradeBreaks(network)).toEqual([]);
+
+    const field = new Heightfield();
+    generateTerrain(field, DEFAULT_TERRAIN);
+    const demo = new Network();
+    buildDemoNetwork(demo, field);
+    expect(findGradeBreaks(demo)).toEqual([]);
+  });
+
+  it('丁字路の枝道が本線と違う勾配で取り付いても鳴らない (面が繋ぐ)', () => {
+    // 3% で登る本線の途中から、下り勾配の枝道を出す。
+    const network = chain('road_small', [
+      new Vector3(-150, 20, 0),
+      new Vector3(0, 24.5, 0),
+      new Vector3(150, 29, 0),
+    ]);
+    const cls = getClass('road_small');
+    const node = network.findNodeNear(new Vector3(0, 24.5, 0), 3)!;
+    const anchor = anchorFromNode(network, node, cls);
+    // 規格 18% ぎりぎりの急な下り。引き継いだ勾配を保てないので、枝道は
+    // 本線とまったく違う勾配で出ていく。
+    const target = new Vector3(0, 14.3, 60);
+    const preview = computePlacement(anchor, target, { straight: true, cls });
+    placeSegment(network, 'road_small', anchor, { pos: target }, preview);
+
+    // 枝道と本線の勾配差は 15% 以上 (空振り防止)。
+    const branches = network.branchesAt(node.id);
+    expect(branches.length).toBe(3);
+    const side = branches.find((b) => Math.abs(b.dir.y) > 0.5)!;
+    const main = branches.find((b) => b.dir.x > 0.5)!;
+    expect(Math.abs(side.grade - main.grade)).toBeGreaterThan(0.15);
+    // それでも「同じ道が続いている組」は繋がっているので鳴らない。
+    expect(findGradeBreaks(network)).toEqual([]);
+  });
+
+  it('三叉路で枝ごとに勾配が違っても、折れとは呼ばない', () => {
+    // 中心から 120° ずつ 3 方向へ、それぞれ違う高さへ引く。
+    const cls = getClass('road_small');
+    const network = new Network();
+    const centre = new Vector3(0, 20, 0);
+    for (const [deg, dy] of [
+      [0, 6],
+      [120, -9],
+      [240, 1],
+    ]) {
+      const rad = (deg * Math.PI) / 180;
+      const target = new Vector3(Math.cos(rad) * 100, 20 + dy, Math.sin(rad) * 100);
+      const node = network.findNodeNear(centre, 3);
+      const anchor = node ? anchorFromNode(network, node, cls) : { pos: centre.clone() };
+      const preview = computePlacement(anchor, target, { straight: true, cls });
+      placeSegment(network, 'road_small', anchor, { pos: target }, preview);
+    }
+    const node = network.findNodeNear(centre, 3)!;
+    const grades = network.branchesAt(node.id).map((b) => b.grade);
+    expect(grades.length).toBe(3);
+    // 枝ごとの勾配は 5% 以上ばらついている (空振り防止)。
+    expect(Math.max(...grades) - Math.min(...grades)).toBeGreaterThan(0.05);
+    // 交差点の面が繋ぐ所なので、折れとしては報せない。
+    expect(findGradeBreaks(network)).toEqual([]);
   });
 });
 
