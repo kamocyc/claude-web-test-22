@@ -164,3 +164,94 @@ describe('トンネルの中での道の延伸', () => {
     expect(segments).toBeGreaterThan(1);
   });
 });
+
+/**
+ * 中央が平らな台地。`flat` までは天端、そこから `fall` かけて裾へ落ちる。
+ * 坑口の位置と土被りを別々に決められるので、下がトンネルかどうかと
+ * 土被りが残るかどうかを切り分けて試せる。
+ */
+const plateauX =
+  (y0: number, height: number, flat: number, fall: number) =>
+  (x: number): number =>
+    y0 + height * Math.max(0, Math.min(1, (flat + fall - Math.abs(x)) / fall));
+
+describe('トンネルの上を越す線形', () => {
+  /** 台地を貫く道路と、その上の地表を横切る線路。 */
+  function overTunnel(
+    terrain: (x: number) => number,
+    railX: number,
+    railY?: number,
+  ): Scene {
+    return buildScene(`トンネルの上 x=${railX}`, terrain, (net, field) => {
+      const blockers = draw(net, field, 'road_medium', [
+        { x: -380, z: 0, y: 10 },
+        { x: -140, z: 0, y: 10 },
+        { x: 100, z: 0, y: 10 },
+        { x: 340, z: 0, y: 10 },
+      ], { straight: true });
+      blockers.push(
+        ...draw(net, field, 'rail_single', [
+          { x: railX, z: -300, y: railY },
+          { x: railX, z: -150, y: railY },
+          { x: railX, z: 0, y: railY },
+          { x: railX, z: 150, y: railY },
+          { x: railX, z: 300, y: railY },
+        ], { straight: true }),
+      );
+      return blockers;
+    });
+  }
+
+  /** 線路の区間に橋が含まれているか。 */
+  function railHasBridge(scene: Scene): boolean {
+    for (const seg of scene.network.segments.values()) {
+      if (seg.classId !== 'rail_single') continue;
+      for (const run of scene.world.structureRunsOf(seg.id)) {
+        if (run.mode === 'bridge') return true;
+      }
+    }
+    return false;
+  }
+
+  /** 道路の区間にトンネルが含まれているか。 */
+  function roadHasTunnel(scene: Scene): boolean {
+    for (const seg of scene.network.segments.values()) {
+      if (seg.classId !== 'road_medium') continue;
+      for (const run of scene.world.structureRunsOf(seg.id)) {
+        if (run.mode === 'tunnel') return true;
+      }
+    }
+    return false;
+  }
+
+  it('道路がトンネルなら、その上を通る線路は地表のまま', () => {
+    // 天端 50 m の台地。y=10 の道路は土被り 40 m のトンネルになる。
+    const scene = overTunnel(plateauX(10, 40, 150, 60), 0);
+    expect(scene.blocked).toEqual([]);
+    expect(roadHasTunnel(scene)).toBe(true);
+    // 線路は自然地形の上をそのまま通る。
+    expect(railHasBridge(scene)).toBe(false);
+  });
+
+  it('坑口にかかるところでは、今までどおり橋にする', () => {
+    // 坑口は |x| ≈ 192 m。そこを跨ぐと、露出した道路が線路の盛土に埋まる。
+    const scene = overTunnel(plateauX(10, 40, 150, 60), -186);
+    expect(scene.blocked).toEqual([]);
+    expect(railHasBridge(scene)).toBe(true);
+  });
+
+  it('土被りが残らないほど掘り下げた線路は、橋のままにする', () => {
+    // 天端 30 m の台地 (土被り 20 m)。線路を y=20 まで下げると、
+    // 整地したあとトンネルの上に 10 m しか残らない。
+    const terrain = plateauX(10, 20, 150, 60);
+    const deep = overTunnel(terrain, 0, 20);
+    expect(deep.blocked).toEqual([]);
+    expect(roadHasTunnel(deep)).toBe(true);
+    expect(railHasBridge(deep)).toBe(true);
+
+    // 同じ台地でも、浅い切土 (y=26) なら土被りが 16 m 残るので地表でよい。
+    const shallow = overTunnel(terrain, 0, 26);
+    expect(shallow.blocked).toEqual([]);
+    expect(railHasBridge(shallow)).toBe(false);
+  });
+});

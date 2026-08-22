@@ -2,7 +2,15 @@ import { Group, Mesh, Vector3, type Vector2 } from 'three';
 import type { Alignment, AlignmentSample } from '../core/alignment';
 import { MeshBuilder, signedAreaXZ } from '../core/meshbuilder';
 import { perp } from '../core/curve';
-import { DECK_THICKNESS, PROP_MAX_RISE, TERRAIN_CELL, lerp, smoothstep } from '../core/units';
+import {
+  DECK_THICKNESS,
+  PROP_MAX_RISE,
+  TERRAIN_CELL,
+  TUNNEL_THRESHOLD,
+  clamp,
+  lerp,
+  smoothstep,
+} from '../core/units';
 import {
   applySurfaceBlend,
   buildFlangeways,
@@ -199,6 +207,9 @@ const DECK_CLEARANCE = DECK_THICKNESS + 0.3;
 /** 架空線で飛ばせる径間の上限 (電柱の間隔の何倍まで)。 */
 const MAX_AERIAL_SPANS = 1.6;
 
+/** 上を越す線形が跨ぐ範囲に、さらに足す余裕 [m]。 */
+const CROSSING_TUNNEL_MARGIN = 8;
+
 /**
  * ネットワーク・地形・描画を繋ぐ組み立て役。
  *
@@ -358,9 +369,11 @@ export class WorldBuilder {
     }
 
     // 立体交差の上側は、盛土になる高さでも橋にする。そうしないと下をくぐる
-    // 線形が盛土に埋まってしまう。
+    // 線形が盛土に埋まってしまう。ただし下がトンネルの中なら埋まりようが
+    // ないので、上は素直に地表のままにする。
     for (const crossing of crossings) {
       if (crossing.kind !== 'separated' && crossing.kind !== 'insufficient') continue;
+      if (this.crossesOverTunnel(structures, crossing)) continue;
       const lowerClass = network.classOf(network.getSegment(crossing.lower));
       this.forceBridgeAround(
         structures,
@@ -830,6 +843,11 @@ export class WorldBuilder {
     return modeAt(this.structureRuns.get(segment) ?? [], s);
   }
 
+  /** その区間の構造形式の並び。まだ組み立てていなければ空。 */
+  structureRunsOf(segment: SegmentId): readonly StructureRun[] {
+    return this.structureRuns.get(segment) ?? [];
+  }
+
   /** サンプル列にカントを乗せる (踏切の補正の上に重ねる)。 */
   private withCant(samples: AlignmentSample[], segment: SegmentId): AlignmentSample[] {
     const profile = this.cant.get(segment);
@@ -857,6 +875,49 @@ export class WorldBuilder {
       length: alignment.length,
       sampleAt: (s) => applySurfaceBlend([alignment.sampleAt(s)], blends)[0],
     };
+  }
+
+  /**
+   * 立体交差の下側が、交点のところでトンネルの中を通っているか。
+   *
+   * 地中を通っているものは盛土に埋まらないので、上を橋にする理由がない。
+   * 橋にすると、地面の上に何も跨がない桁が残ってしまう (道路がトンネルに
+   * なっている丘の上を線路が越える、といった配置)。
+   *
+   * 見るのは 2 つ。
+   *
+   *  - **上側が跨ぐ範囲がすべてトンネル**であること。坑口が交点にかかって
+   *    いれば、露出している所が盛土で埋まるので橋のままにする。斜めに
+   *    交わるほど跨ぐ範囲は長くなるので、交差角も見る。
+   *  - 上側の整地が終わっても**土被りが残る**こと。上側が深い切土だと、
+   *    掘った先にトンネルが顔を出しかねない。
+   */
+  private crossesOverTunnel(
+    structures: Map<SegmentId, StructureRun[]>,
+    crossing: Crossing,
+  ): boolean {
+    const runs = structures.get(crossing.lower);
+    if (!runs || runs.length === 0) return false;
+    const lower = this.network.alignmentOf(crossing.lower);
+    const upper = this.network.alignmentOf(crossing.upper);
+    const lowerSample = lower.sampleAt(crossing.sLower);
+    const upperSample = upper.sampleAt(crossing.sUpper);
+
+    // 上側の整地が終わったあとに残る土被り。
+    if (upperSample.pos.y - lowerSample.pos.y < TUNNEL_THRESHOLD) return false;
+
+    const upperClass = this.network.classOf(this.network.getSegment(crossing.upper));
+    const sinTheta = Math.abs(
+      upperSample.forwardXZ.x * lowerSample.forwardXZ.y -
+        upperSample.forwardXZ.y * lowerSample.forwardXZ.x,
+    );
+    const reach = (upperClass.halfWidth / Math.max(0.26, sinTheta)) + CROSSING_TUNNEL_MARGIN;
+    const steps = 8;
+    for (let i = 0; i <= steps; i++) {
+      const s = clamp(crossing.sLower - reach + (2 * reach * i) / steps, 0, lower.length);
+      if (modeAt(runs, s) !== 'tunnel') return false;
+    }
+    return true;
   }
 
   /**
