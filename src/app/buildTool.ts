@@ -92,6 +92,21 @@ const ELEVATION_STEP = 3;
  * 1 段ずれていても既存の線形に繋がる。
  */
 const SNAP_HEIGHT = 4;
+/**
+ * 種別の違う線形 (踏切になる相手) を探す距離 [m]。
+ *
+ * 舗装の上ならどこを指しても中心線へ寄せたいので、相手の半幅を賄える
+ * だけ広く取る。実際に候補にするかは相手の半幅で決める。
+ */
+const CROSS_REACH = 20;
+/**
+ * 踏切として吸い付く高さの差 [m]。
+ *
+ * 踏切になるのは同じ高さで交わるときだけ。高さ設定を 1 段 (3 m) 上げて
+ * 立体交差にしようとしている人を、道路の高さへ引き戻さない値にする。
+ * 盛土・切土で路面が地形から少しずれている分は飲み込む。
+ */
+const CROSSING_SNAP_HEIGHT = 2.5;
 
 /** カーソルが構造物 (橋の路面) に当たっているとみなす、地形との差 [m]。 */
 const ON_STRUCTURE = 2;
@@ -304,16 +319,37 @@ export class BuildTool {
       });
     }
 
-    const onSegment = this.network.findSegmentNear(cursor, cls.halfWidth + 3, height);
+    const onSegment = this.network.findSegmentNear(
+      cursor,
+      Math.max(cls.halfWidth + 3, CROSS_REACH),
+      height,
+    );
     if (onSegment) {
       const other = this.network.classOf(this.network.getSegment(onSegment.segment));
+      const away = Math.hypot(onSegment.pos.x - cursor.x, onSegment.pos.z - cursor.z);
+      // 種別が違う相手には取り付かない。交差 (踏切・立体交差) にしたいので、
+      // 代わりに**中心線の上**へ寄せる。そこで止めれば、線路をいったん
+      // 交点まで引いて、そこから先へ伸ばす、という引き方ができる。中心線を
+      // 外した所で止めると、舗装と道床が重なって敷設できない。
+      if (
+        other.kind !== cls.kind &&
+        away <= other.halfWidth + cls.halfWidth &&
+        Math.abs(onSegment.pos.y - free.y) <= CROSSING_SNAP_HEIGHT
+      ) {
+        candidates.push({
+          anchor: { pos: onSegment.pos.clone() },
+          snap: 'crossing',
+          marker: this.crossingMarker(onSegment, other),
+          distance: away,
+        });
+      }
       // 種別が違う場合は交差 (踏切・立体交差) にしたいのでスナップしない。
-      if (other.kind === cls.kind) {
+      if (other.kind === cls.kind && away <= cls.halfWidth + 3) {
         // 交差点の面の中では、既存の線形を分割せずにその交差点へ繋ぐ。
         // 面の中で分割しても交差点の形が保てず (必ず「交差点が近すぎます」
         // になる)、T 字を十字にすることができない。
         const junction = this.junctionAt(onSegment.segment, onSegment.s);
-        const distance = Math.hypot(onSegment.pos.x - cursor.x, onSegment.pos.z - cursor.z);
+        const distance = away;
         candidates.push(
           junction
             ? {
@@ -381,6 +417,22 @@ export class BuildTool {
       pos: hit.pos.clone(),
       radius: Math.max(1.8, this.cls.halfWidth * 0.4),
       bar: new Vector2(-hit.dir.y, hit.dir.x).multiplyScalar(other.halfWidth + 0.8),
+    };
+  }
+
+  /**
+   * 踏切になる点の目印。
+   *
+   * 相手の中心線に沿った棒を引く。取り付き (`segmentMarker`) の棒は相手を
+   * **横切る**向きで「ここで分割する」ことを示すので、同じ向きにすると
+   * 繋がると誤解される。踏切では相手を分割も接続もしない。
+   */
+  private crossingMarker(hit: { pos: Vector3; dir: Vector2 }, other: NetworkClass): SnapMarker {
+    return {
+      kind: 'crossing',
+      pos: hit.pos.clone(),
+      radius: Math.max(1.8, this.cls.halfWidth * 0.6),
+      bar: hit.dir.clone().multiplyScalar(other.halfWidth + 2),
     };
   }
 

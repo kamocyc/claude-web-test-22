@@ -282,6 +282,8 @@ export class Ui {
             ? getClass(status.classId).kind === 'rail'
               ? '分岐接続 (接線)'
               : '既存線形に取り付き'
+            : status.snap === 'crossing'
+              ? '踏切 (交点で止める)'
             : status.snap === 'parallel'
               ? '平行'
               : status.snap === 'scissors'

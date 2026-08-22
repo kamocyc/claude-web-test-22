@@ -618,3 +618,91 @@ describe('確認モードの読み取り', () => {
     expect(inspect.structure).not.toBeNull();
   });
 });
+
+/**
+ * 踏切の作り方。
+ *
+ * 踏切は「作る」操作ではなく、同じ高さで交差させた結果です。ただし線路を
+ * **道路の上で止めて**、そこから先へ伸ばす、という引き方ができないと不便
+ * です (舗装の中で止めると道床と重なって敷設できない)。種別の違う線形の
+ * 上では中心線 = 交点になる点へ吸い付かせて、そこで止められるようにします。
+ */
+describe('踏切', () => {
+  /** 東西にまっすぐな道路 1 本。線路を引く用意までする。 */
+  function withRoad(): { tool: BuildTool; network: Network } {
+    const network = new Network();
+    const tool = new BuildTool(network, flatField(), () => {});
+    tool.setClass('road_medium');
+    clickAt(tool, -250, 0);
+    clickAt(tool, 250, 0);
+    tool.cancel();
+    tool.setClass('rail_single');
+    return { tool, network };
+  }
+
+  /** 交差角 `deg` で原点を通る向きの、原点から `t` [m] の点。 */
+  function along(deg: number, t: number): { x: number; z: number } {
+    const rad = (deg * Math.PI) / 180;
+    return { x: Math.cos(rad) * t, z: Math.sin(rad) * t };
+  }
+
+  it('道路の上ではどこを指しても、中心線 (交点) に吸い付く', () => {
+    const { tool } = withRoad();
+    const road = getClass('road_medium');
+    let snapped = 0;
+    for (let z = -12; z <= 12; z += 1.5) {
+      tool.update(new Vector3(0, 0, z), MODS);
+      const status = tool.status();
+      if (Math.abs(z) <= road.halfWidth) {
+        // 舗装の上なら必ず吸い付く。
+        expect(status.snap, `z=${z}`).toBe('crossing');
+        expect(status.markers[0].kind).toBe('crossing');
+        // 吸い付く先は道路の中心線 (= 踏切になる点)。
+        expect(status.markers[0].pos.z).toBeCloseTo(0, 6);
+        snapped++;
+      }
+    }
+    expect(snapped).toBeGreaterThan(8);
+    // 舗装から十分離れれば吸い付かない。
+    tool.update(new Vector3(0, 0, 30), MODS);
+    expect(tool.status().snap).toBe('none');
+  });
+
+  it('交点で止めてから伸ばすと、踏切ができる', () => {
+    for (const deg of [90, 60, 45, 25]) {
+      const { tool, network } = withRoad();
+      const field = flatField();
+      const start = along(deg, -150);
+      clickAt(tool, start.x, start.z);
+      // 舗装の上を、中心線から外して指す。吸い付いて交点に落ちる。
+      const on = along(deg, -5);
+      tool.update(new Vector3(on.x, 0, on.z), MODS);
+      expect(tool.status().snap, `${deg}°`).toBe('crossing');
+      expect(tool.status().blockers, `${deg}° 交点で止められない`).toEqual([]);
+      tool.click();
+      // そこから先へ伸ばす。
+      const end = along(deg, 150);
+      tool.update(new Vector3(end.x, 0, end.z), MODS);
+      expect(tool.status().blockers, `${deg}° 交点から伸ばせない`).toEqual([]);
+      tool.click();
+      tool.cancel();
+
+      // 線路は交点で 2 本に分かれ、道路はそのまま。踏切が 1 か所できる。
+      expect(network.segments.size, `${deg}°`).toBe(3);
+      const world = new WorldBuilder(network, field, new TerrainMesh(field, new MeshBasicMaterial()));
+      const result = world.rebuild();
+      expect(result.stats.levelCrossings, `${deg}°`).toBe(1);
+      expect(result.warnings.map((w) => w.message), `${deg}°`).toEqual([]);
+    }
+  });
+
+  it('高さを上げているときは吸い付かない (立体交差にする人の邪魔をしない)', () => {
+    const { tool } = withRoad();
+    tool.adjustElevation(1);
+    tool.update(new Vector3(0, 3, 3), MODS);
+    expect(tool.status().snap).toBe('none');
+    tool.adjustElevation(-1);
+    tool.update(new Vector3(0, 0, 3), MODS);
+    expect(tool.status().snap).toBe('crossing');
+  });
+});

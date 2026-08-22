@@ -19,10 +19,10 @@ import { MeshBuilder, UP } from '../core/meshbuilder';
  * 地形や舗装に隠れると意味がないので、深度テストを切って常に手前に描く。
  */
 
-export type SnapKind = 'none' | 'node' | 'segment' | 'parallel' | 'scissors';
+export type SnapKind = 'none' | 'node' | 'segment' | 'parallel' | 'scissors' | 'crossing';
 
 export interface SnapMarker {
-  kind: 'node' | 'segment' | 'parallel' | 'inspect';
+  kind: 'node' | 'segment' | 'parallel' | 'inspect' | 'crossing';
   /** 吸い付いた点。 */
   pos: Vector3;
   /** 目印の半径 [m] (交差点なら面の広がり)。 */
@@ -45,6 +45,8 @@ const COLORS: Record<SnapMarker['kind'], readonly [number, number, number]> = {
   segment: [1.0, 0.78, 0.28],
   parallel: [0.4, 1.0, 0.55],
   inspect: [0.85, 0.95, 1.0],
+  // 踏切。遮断機と同じ赤で、繋ぐ (水色・黄) のではないことを示す。
+  crossing: [1.0, 0.45, 0.38],
 };
 
 /** 目印を浮かせる高さ [m]。 */
