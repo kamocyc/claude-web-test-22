@@ -7,10 +7,11 @@ import { solveJunctions } from '../src/network/junction';
 import { Network } from '../src/network/network';
 import { placeScissorsCrossover, planScissorsCrossover } from '../src/network/scissors';
 import { Heightfield } from '../src/terrain/heightfield';
+import { testField } from './support/field';
 
 function parallelYard(): { network: Network; field: Heightfield; first: number } {
   const network = new Network();
-  const field = new Heightfield();
+  const field = testField();
   const [span] = drawParallel(
     network,
     field,

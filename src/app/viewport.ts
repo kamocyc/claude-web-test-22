@@ -18,7 +18,7 @@ import {
   WebGLRenderer,
 } from 'three';
 import { MapControls } from 'three/examples/jsm/controls/MapControls.js';
-import { MAP_SIZE } from '../core/units';
+import { FOG_FAR, FOG_NEAR } from '../core/units';
 
 /**
  * 一人称視点のときの近クリップ面 [m]。
@@ -53,16 +53,20 @@ export class Viewport {
     this.renderer.shadowMap.type = PCFShadowMap;
 
     this.scene.background = new Color(0x9fc4e0);
-    this.scene.fog = new Fog(0xa8c8e0, MAP_SIZE * 0.55, MAP_SIZE * 1.5);
+    // 霞む距離はマップの広さではなく見通しで決める (`FOG_NEAR`)。遠景は
+    // 霞に沈むので、遠クリップ面は霞み切る距離の少し先までで足りる。
+    this.scene.fog = new Fog(0xa8c8e0, FOG_NEAR, FOG_FAR);
 
-    this.camera = new PerspectiveCamera(52, 1, 1, MAP_SIZE * 3);
+    this.camera = new PerspectiveCamera(52, 1, 1, FOG_FAR * 1.6);
     this.camera.position.set(150, 180, 220);
 
     this.controls = new MapControls(this.camera, canvas);
     this.controls.enableDamping = true;
     this.controls.dampingFactor = 0.12;
     this.controls.minDistance = 20;
-    this.controls.maxDistance = MAP_SIZE * 0.9;
+    // 引ける上限は「霞み切る手前」まで。マップに比例させると、広いマップでは
+    // 何も見えない高さまで引けてしまう。
+    this.controls.maxDistance = FOG_FAR * 0.75;
     this.controls.maxPolarAngle = Math.PI * 0.49;
     this.controls.target.set(0, 0, 0);
 
@@ -192,7 +196,7 @@ export class Viewport {
 
 /** 天頂から地平にかけて色が変わる簡単な空。 */
 function createSky(): Mesh {
-  const geometry = new SphereGeometry(MAP_SIZE * 1.4, 24, 16);
+  const geometry = new SphereGeometry(FOG_FAR * 1.5, 24, 16);
   const material = new ShaderMaterial({
     side: BackSide,
     depthWrite: false,

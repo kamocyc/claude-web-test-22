@@ -7,7 +7,7 @@ import { solveJunctions } from '../src/network/junction';
 import { Network, type SegmentId } from '../src/network/network';
 import { buildLaneGraph, type LaneGraph, type VehicleKind } from '../src/sim/lanegraph';
 import { Traffic, type Vehicle } from '../src/sim/traffic';
-import { Heightfield } from '../src/terrain/heightfield';
+import { testField } from './support/field';
 
 /**
  * 乗車モード (一人称視点)。
@@ -58,7 +58,7 @@ function laneGraphOf(network: Network): LaneGraph {
 /** 曲線と勾配のある 1 本の線路。 */
 function railLine(): Network {
   const network = new Network();
-  const field = new Heightfield();
+  const field = testField();
   draw(network, field, 'rail_single', [
     { x: -400, z: -120, y: 0 },
     { x: -100, z: -120, y: 4 },

@@ -4,6 +4,7 @@ import { Alignment } from '../src/core/alignment';
 import { heightInTriangleXZ } from '../src/core/meshbuilder';
 import { curveFromTangents } from '../src/core/curve';
 import { VerticalProfile } from '../src/core/profile';
+import { TERRAIN_CELL } from '../src/core/units';
 import { checkPlacement } from '../src/network/rules';
 import { buildDemoNetwork } from '../src/app/demo';
 import { profileFor } from '../src/build/surface';
@@ -14,15 +15,15 @@ import { Network } from '../src/network/network';
 import { findCrossings } from '../src/network/crossings';
 import { WorldBuilder } from '../src/render/worldBuilder';
 import { DEFAULT_TERRAIN, generateTerrain } from '../src/terrain/generator';
-import { Heightfield } from '../src/terrain/heightfield';
 import { TerrainMesh } from '../src/terrain/terrainMesh';
+import { testField } from './support/field';
 
 /**
  * 組み立てパイプライン全体を、描画なしで動かす。
  * three.js のジオメトリ生成は WebGL を必要としないので Node でも通る。
  */
 function buildWorld(seed = DEFAULT_TERRAIN.seed) {
-  const field = new Heightfield();
+  const field = testField();
   generateTerrain(field, { ...DEFAULT_TERRAIN, seed });
   const network = new Network();
   buildDemoNetwork(network, field);
@@ -147,7 +148,7 @@ class SurfaceIndex {
 
 describe('立体交差の上の交差点', () => {
   it('床版と橋脚が付き、路面だけが宙に浮かない', () => {
-    const field = new Heightfield();
+    const field = testField();
     generateTerrain(field, DEFAULT_TERRAIN);
     const network = new Network();
     const y = field.baseHeightAt(0, 0) + 14;
@@ -191,7 +192,7 @@ describe('橋の下', () => {
   }
 
   it('橋脚が下を通る道路の車道の上に建たない', () => {
-    const field = new Heightfield();
+    const field = testField();
     const network = new Network();
     // 桁下 13 m の高架。橋脚が何本も入る長さにする。
     draw(network, 'road_medium', [new Vector3(-200, 14, 0), new Vector3(200, 14, 0)]);
@@ -217,7 +218,7 @@ describe('橋の下', () => {
   });
 
   it('地形が桁の上に被さらない (掘割の中で橋にした所)', () => {
-    const field = new Heightfield();
+    const field = testField();
     const network = new Network();
     // 平らな地形 (高さ 0) を 1 m 掘った所を通る道路。下をくぐる道路の
     // ために強制的に橋になるので、整地が遮断されて地形が残る。
@@ -304,7 +305,8 @@ describe('サンプルネットワーク', () => {
           const scale = surfaceHeightScale(blends, s);
           const expected = sample.pos.y + dy + edgeHeight * scale;
           // 埋まる (地形が上に出る) ことも、浮く (地形が下に離れる) こともない。
-          expect(Math.abs(terrain - expected)).toBeLessThan(0.5);
+          // 地形は格子の間を線形補間するので、ずれはセル長に比例する。
+          expect(Math.abs(terrain - expected)).toBeLessThan(TERRAIN_CELL * 0.25);
           checked++;
         }
       }
@@ -432,7 +434,7 @@ describe('折れ点 (2 枝のノード)', () => {
     let probes = 0;
     for (const classId of ['road_small', 'road_medium', 'road_large']) {
       for (const bendDeg of [8, 14, 25, 40, 60]) {
-        const field = new Heightfield();
+        const field = testField();
         field.base.fill(40);
         field.resetWork();
         const network = new Network();
@@ -493,7 +495,7 @@ describe('敷設の制限', () => {
   });
 
   it('規格を外れた線形・建築限界不足は敷設できない', () => {
-    const field = new Heightfield();
+    const field = testField();
     field.base.fill(20);
     field.resetWork();
     const network = new Network();

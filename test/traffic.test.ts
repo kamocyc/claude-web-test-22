@@ -9,10 +9,11 @@ import { buildLaneGraph, type LaneGraph } from '../src/sim/lanegraph';
 import { signalStateAt } from '../src/sim/signals';
 import { Traffic, type Vehicle } from '../src/sim/traffic';
 import { Heightfield } from '../src/terrain/heightfield';
+import { testField } from './support/field';
 
 /** 平らな地形。地形の起伏で結果が揺れないようにする。 */
 function flatField(): Heightfield {
-  return new Heightfield();
+  return testField();
 }
 
 /** 交差点を解き、描画と同じトリム範囲つきの車線グラフを組み立てる。 */

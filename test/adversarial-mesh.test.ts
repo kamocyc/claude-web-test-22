@@ -22,6 +22,8 @@ import { WorldBuilder } from '../src/render/worldBuilder';
 import { DEFAULT_TERRAIN, generateTerrain } from '../src/terrain/generator';
 import { Heightfield } from '../src/terrain/heightfield';
 import { TerrainMesh } from '../src/terrain/terrainMesh';
+import { testField } from './support/field';
+import { TERRAIN_CELL } from '../src/core/units';
 
 /**
  * 敵対的検証: 高低差のあるところで「メッシュが離れる」「線路が埋まる」が
@@ -88,7 +90,7 @@ function buildScene(
   terrain: (x: number, z: number) => number,
   place: (net: Network, field: Heightfield) => void,
 ): Scene {
-  const field = new Heightfield();
+  const field = testField();
   for (let iz = 0; iz <= field.cells; iz++) {
     for (let ix = 0; ix <= field.cells; ix++) {
       field.base[field.index(ix, iz)] = terrain(field.worldX(ix), field.worldZ(iz));
@@ -156,7 +158,19 @@ function ribbonEndSection(scene: Scene, segment: SegmentId, atStart: boolean): V
  * 路面より上に出るのが正常だから (world.test.ts の地表判定も同じ理由で
  * 4 m 内側を見ている)。
  */
-function groundStations(scene: Scene, segment: SegmentId, step = 2, inset = 4): number[] {
+/**
+ * 地表区間の検査点。
+ *
+ * 区間の端 (坑口・橋台) では地形が垂直に切り立つので、格子の補間はその
+ * 段差を 1 マスぶん引きずる。整地の目標そのものを見たいので、端から
+ * 格子 2 マス分は避ける。
+ */
+function groundStations(
+  scene: Scene,
+  segment: SegmentId,
+  step = 2,
+  inset = Math.max(4, TERRAIN_CELL * 2),
+): number[] {
   const out: number[] = [];
   for (const run of scene.result.structures.get(segment) ?? []) {
     if (run.mode !== 'ground') continue;
@@ -1256,7 +1270,7 @@ function roughTerrainScene() {
 
 /** デモ配置 (回帰の基準)。 */
 function demoScene(): Scene {
-  const field = new Heightfield();
+  const field = testField();
   generateTerrain(field, DEFAULT_TERRAIN);
   const network = new Network();
   buildDemoNetwork(network, field);

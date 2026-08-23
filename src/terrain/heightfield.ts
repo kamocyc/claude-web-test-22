@@ -95,9 +95,48 @@ export class Heightfield {
     return Math.acos(clamp(n.y, -1, 1));
   }
 
-  /** `work` を `base` の内容で初期化する。 */
+  /**
+   * `work` を `base` の内容で初期化する。
+   *
+   * 自然地形を書き換えたときは必ずここを通す (`generateTerrain` も呼ぶ)。
+   * 高さの範囲の控えもここで捨てるので、書き換えたのに呼ばないと
+   * 整地が古い範囲を見ることになる。
+   */
   resetWork(): void {
     this.work.set(this.base);
+    this.cachedBaseRange = null;
+    this.baseVersion++;
+  }
+
+  /**
+   * 自然地形を作り直した回数。
+   *
+   * 地形メッシュは整地で触った範囲だけを書き換えるので、自然地形そのものが
+   * 変わったこと (地形の再生成) は範囲では伝わらない。この番号が変われば
+   * 全チャンクを作り直す。
+   */
+  baseVersion = 0;
+
+  private cachedBaseRange: { min: number; max: number } | null = null;
+
+  /**
+   * 自然地形の高さの範囲。
+   *
+   * 整地が「法面をどこまで伝播させれば足りるか」を見積もるのに使う。
+   * 格子全体の走査は 1 回で済むよう控えておく。
+   */
+  get baseRange(): { min: number; max: number } {
+    if (!this.cachedBaseRange) {
+      let min = Infinity;
+      let max = -Infinity;
+      for (let i = 0; i < this.base.length; i++) {
+        const v = this.base[i];
+        if (v < min) min = v;
+        if (v > max) max = v;
+      }
+      this.cachedBaseRange = { min: min === Infinity ? 0 : min, max: max === -Infinity ? 0 : max };
+    }
+    return this.cachedBaseRange;
   }
 
   get worldMin(): number {

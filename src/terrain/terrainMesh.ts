@@ -6,6 +6,7 @@ import {
   type Material,
 } from 'three';
 import { TERRAIN_CHUNK_CELLS } from '../core/units';
+import type { GridRegion } from './grading';
 import type { Heightfield } from './heightfield';
 
 interface Chunk {
@@ -32,6 +33,8 @@ export class TerrainMesh {
     opacity: number;
     depthWrite: boolean;
   };
+  /** 最後に反映した自然地形の版。変わっていたら全チャンクを作り直す。 */
+  private baseVersion = -1;
 
   constructor(
     private readonly field: Heightfield,
@@ -109,10 +112,21 @@ export class TerrainMesh {
     return { mesh, ix0, iz0, cells: cellsX, position, normal };
   }
 
-  /** 高さ場の現在値からすべてのチャンクを更新する。 */
-  update(): void {
+  /**
+   * 高さ場の現在値からチャンクを更新する。
+   *
+   * `region` を渡すと、その格子範囲に掛かるチャンクだけを書き換える。
+   * 整地で触ったのは線形のまわりだけなので、広いマップでも 1 回の編集で
+   * 全チャンクを舐め直さずに済む。法線は隣の格子点を見るので、範囲は
+   * 1 マス広げて判定する。
+   */
+  update(region?: GridRegion | null): void {
     const f = this.field;
+    // 自然地形そのものが変わったときは、範囲に関わらず全部を作り直す。
+    const all = region === undefined || region === null || this.baseVersion !== f.baseVersion;
+    this.baseVersion = f.baseVersion;
     for (const chunk of this.chunks) {
+      if (!all && !this.overlaps(chunk, region)) continue;
       const geometry = chunk.mesh.geometry;
       const nx = chunk.cells + 1;
       const total = chunk.position.count;
@@ -152,6 +166,19 @@ export class TerrainMesh {
       geometry.computeBoundingSphere();
       geometry.computeBoundingBox();
     }
+  }
+
+  /** チャンクが範囲に掛かるか。法線のぶん 1 マス広げて見る。 */
+  private overlaps(chunk: Chunk, region: GridRegion): boolean {
+    const rows = chunk.position.count / (chunk.cells + 1);
+    const ix1 = chunk.ix0 + chunk.cells;
+    const iz1 = chunk.iz0 + rows - 1;
+    return (
+      chunk.ix0 <= region.ix1 + 1 &&
+      ix1 >= region.ix0 - 1 &&
+      chunk.iz0 <= region.iz1 + 1 &&
+      iz1 >= region.iz0 - 1
+    );
   }
 
   /** レイキャスト対象のメッシュ一覧。 */

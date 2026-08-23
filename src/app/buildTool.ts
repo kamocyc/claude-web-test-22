@@ -34,6 +34,8 @@ import {
   type StationSpec,
 } from '../network/station';
 import { checkStationPlacement } from '../network/stationPlacement';
+import { ZONE_COLORS, ZONE_EMPTY_COLOR } from '../build/buildings';
+import type { ZoneMap, ZoneType } from '../network/zoning';
 import {
   placeScissorsCrossover,
   scissorsPlanAt,
@@ -56,7 +58,10 @@ import {
 } from './inspect';
 import type { Heightfield } from '../terrain/heightfield';
 
-export type ToolMode = 'build' | 'station' | 'scissors' | 'bulldoze' | 'inspect';
+export type ToolMode = 'build' | 'station' | 'zone' | 'scissors' | 'bulldoze' | 'inspect';
+
+/** 区画を塗る筆の半径 [m]。 */
+export const ZONE_BRUSH_RADIUS = 26;
 
 export interface StationToolSettings {
   name: string;
@@ -99,6 +104,8 @@ export interface ToolStatus {
   parallelTo: SegmentId | null;
   /** 空でなければ敷設できない。理由をそのまま表示する。 */
   blockers: string[];
+  /** 区画ツールでいま塗ろうとしている用途 (null なら消しゴム)。 */
+  zone: ZoneType | null;
 }
 
 /** カーソルの行き先 (吸い付いた点と、その目印)。 */
@@ -152,6 +159,8 @@ export class BuildTool {
   elevationOffset = 0;
   /** 既存の線形に平行してスナップするか。複線・側道はこれで作る。 */
   parallelSnap = true;
+  /** 区画ツールで塗る用途。null なら塗った用途を消す。 */
+  zoneType: ZoneType | null = 'residential';
 
   readonly previewGroup = new Group();
   private readonly snapView = new SnapView();
@@ -199,6 +208,8 @@ export class BuildTool {
      * 確認モードの読み取りに使う。無くても動く。
      */
     private readonly surface: SurfaceContext | null = null,
+    /** 区画の塗り分け。渡さなければ区画ツールは何もしない。 */
+    private readonly zones: ZoneMap | null = null,
   ) {
     this.previewGroup.name = 'preview';
     this.previewMaterial = createPreviewMaterial();
@@ -238,6 +249,11 @@ export class BuildTool {
 
   selectStation(id: StationId | null): void {
     this.selectedStationId = id !== null && this.network.stations.has(id) ? id : null;
+  }
+
+  /** 区画ツールで塗る用途を選ぶ。 */
+  setZone(zone: ZoneType | null): void {
+    this.zoneType = zone;
   }
 
   setClass(classId: string): void {
@@ -301,6 +317,16 @@ export class BuildTool {
 
     if (this.mode === 'station') {
       this.updateStationPreview();
+      return;
+    }
+
+    if (this.mode === 'zone') {
+      this.elevationGuideView.update([]);
+      this.snapKind = 'none';
+      this.preview = null;
+      this.blockers = [];
+      this.showMarkers([]);
+      this.updatePreviewMesh();
       return;
     }
 
@@ -802,7 +828,11 @@ export class BuildTool {
   private updatePreviewMesh(): void {
     const mb = new MeshBuilder();
     const preview = this.preview;
-    if (this.mode === 'station' && this.stationCandidate) {
+    if (this.mode === 'zone') {
+      if (this.cursor) buildZoneBrush(mb, this.cursor, this.field, this.zoneType);
+      this.lastDiagnostics = null;
+      this.blockers = [];
+    } else if (this.mode === 'station' && this.stationCandidate) {
       buildStationPreview(mb, this.stationCandidate);
       this.lastDiagnostics = null;
     } else if (this.scissorsPlan) {
@@ -853,6 +883,13 @@ export class BuildTool {
     }
     if (this.mode === 'inspect') {
       this.selectedStationId = this.inspection?.station?.id ?? null;
+      return;
+    }
+    if (this.mode === 'zone') {
+      if (!this.zones) return;
+      if (this.zones.paint(this.cursor.x, this.cursor.z, ZONE_BRUSH_RADIUS, this.zoneType)) {
+        this.onChanged();
+      }
       return;
     }
     if (this.mode === 'station') {
@@ -998,6 +1035,7 @@ export class BuildTool {
       diagnostics: this.lastDiagnostics,
       snap: this.snapKind,
       markers: this.markers,
+      zone: this.zoneType,
       hoverSegment: this.hoverSegment,
       inspect: this.inspection,
       selectedStation:
@@ -1017,5 +1055,41 @@ export class BuildTool {
     const used = new Set([...this.network.stations.values()].map((station) => station.name));
     while (used.has(`駅 ${index}`)) index++;
     return `駅 ${index}`;
+  }
+}
+
+/**
+ * 区画を塗る筆の輪。
+ *
+ * 円板で塗り潰すと、起伏のある地形では三角形が地面に潜って歯抜けに
+ * 見える。細い輪 (幅 1.6 m) なら地形に沿うので、どこまで塗れるかが
+ * どんな斜面でも分かる。
+ */
+function buildZoneBrush(
+  mb: MeshBuilder,
+  cursor: Vector3,
+  field: Heightfield,
+  zone: ZoneType | null,
+): void {
+  const color = zone ? ZONE_COLORS[zone] : ZONE_EMPTY_COLOR;
+  const up = new Vector3(0, 1, 0);
+  const steps = 64;
+  const lift = 0.3;
+  const width = 1.6;
+  const inner: number[] = [];
+  const outer: number[] = [];
+  const at = (angle: number, radius: number): number => {
+    const x = cursor.x + Math.cos(angle) * radius;
+    const z = cursor.z + Math.sin(angle) * radius;
+    return mb.vertex(new Vector3(x, field.heightAt(x, z) + lift, z), up, 0, 0, color);
+  };
+  for (let i = 0; i < steps; i++) {
+    const angle = (i / steps) * Math.PI * 2;
+    inner.push(at(angle, ZONE_BRUSH_RADIUS - width));
+    outer.push(at(angle, ZONE_BRUSH_RADIUS));
+  }
+  for (let i = 0; i < steps; i++) {
+    const j = (i + 1) % steps;
+    mb.quad(inner[i], inner[j], outer[j], outer[i]);
   }
 }

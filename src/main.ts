@@ -37,6 +37,7 @@ const tool = new BuildTool(
     dirty = true;
   },
   world,
+  world.zones,
 );
 viewport.scene.add(tool.previewGroup);
 
@@ -48,6 +49,7 @@ const ui = new Ui(uiRoot, {
   onMode: (mode) => setMode(mode),
   onStationSettings: (patch) => tool.setStationSettings(patch),
   onStationRotate: (steps) => tool.rotateStation(steps),
+  onZone: (zone) => tool.setZone(zone),
   onStationRename: (id, name) => {
     try {
       network.renameStation(id, name);
@@ -94,6 +96,7 @@ const ui = new Ui(uiRoot, {
   },
   onClear: () => {
     network.clear();
+    world.zones.clear();
     tool.cancel();
     dirty = true;
   },
@@ -104,6 +107,8 @@ function setMode(mode: ToolMode): void {
   stopRide();
   tool.setMode(mode);
   ui.setMode(mode);
+  // 区画のマス目は、区画を塗っている間だけ出す。
+  world.setZoneView(mode === 'zone');
 }
 
 function applyUndergroundView(on: boolean): void {
@@ -163,6 +168,7 @@ function stopRide(): void {
 
 setMode('build');
 ui.setClass(tool.classId);
+ui.setZone(tool.zoneType);
 ui.setParallelSnap(tool.parallelSnap);
 buildDemoNetwork(network, field);
 
@@ -308,6 +314,10 @@ window.addEventListener('keydown', (event) => {
     case 's':
     case 'S':
       setMode('station');
+      break;
+    case 'z':
+    case 'Z':
+      setMode('zone');
       break;
     case 'c':
     case 'C':

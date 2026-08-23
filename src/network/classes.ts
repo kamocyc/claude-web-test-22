@@ -87,6 +87,14 @@ export interface NetworkClass {
   /** 設計速度 [km/h]。HUD 表示と規格の目安。 */
   designSpeed: number;
 
+  /**
+   * 沿道に区画 (建物の敷地) を割り付けられるか。
+   *
+   * 歩道があり、中央分離帯で出入りを絶たれていない道路だけ。自動車専用道と
+   * ランプは、沿道から直接出入りできないので割り付けない。
+   */
+  zonable: boolean;
+
   /** 交差点で信号機を設置しうるか。 */
   signalCapable: boolean;
   /** 交差点に横断歩道を描くか。 */
@@ -186,6 +194,7 @@ function road(opts: {
     maxCant: 0,
     cornerRadius: opts.cornerRadius,
     designSpeed: opts.designSpeed,
+    zonable: opts.sidewalkWidth > 0 && !(opts.divided ?? false),
     signalCapable: opts.signalCapable,
     crosswalks: opts.crosswalks,
     costPerMeter: opts.costPerMeter,
@@ -229,6 +238,7 @@ function rail(opts: {
     maxCant: opts.maxCant ?? 0.1,
     cornerRadius: 0,
     designSpeed: opts.designSpeed,
+    zonable: false,
     signalCapable: false,
     crosswalks: false,
     costPerMeter: opts.costPerMeter,

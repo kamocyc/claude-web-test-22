@@ -4,6 +4,7 @@ import type { BuildResult } from '../render/worldBuilder';
 import type { ToolMode, ToolStatus } from './buildTool';
 import type { StationToolSettings } from './buildTool';
 import { stationPlatformRange, STATION_LENGTHS, type StationId } from '../network/station';
+import { ZONE_LABELS, ZONE_TYPES, type ZoneType } from '../network/zoning';
 import type { RideStatus } from './ride';
 import {
   GRAPH_W,
@@ -23,6 +24,8 @@ export interface UiCallbacks {
   onStationSettings: (patch: Partial<Omit<StationToolSettings, 'heading'>>) => void;
   onStationRotate: (steps: number) => void;
   onStationRename: (id: StationId, name: string) => void;
+  /** 区画ツールで塗る用途を選ぶ (null なら消しゴム)。 */
+  onZone: (zone: ZoneType | null) => void;
   /** 接続の色分け表示を切り替える。 */
   onConnectivityColors: (on: boolean) => void;
   /** 車両の走行表示を切り替える。 */
@@ -59,6 +62,7 @@ export class Ui {
   private readonly modeButtons = new Map<ToolMode, HTMLButtonElement>();
   private readonly classButtons = new Map<string, HTMLButtonElement>();
   private readonly parallelButtons = new Map<boolean, HTMLButtonElement>();
+  private readonly zoneButtons = new Map<ZoneType | null, HTMLButtonElement>();
   private readonly elevationLabel: HTMLElement;
   private readonly rideButton: HTMLButtonElement;
   private readonly vehiclesToggle: HTMLInputElement;
@@ -92,6 +96,7 @@ export class Ui {
     for (const [mode, label, hint] of [
       ['build', '敷設', 'B'],
       ['station', '駅', 'S'],
+      ['zone', '区画', 'Z'],
       ['scissors', 'シーサス', 'C'],
       ['bulldoze', '撤去', 'X'],
       ['inspect', '確認', 'V'],
@@ -147,6 +152,25 @@ export class Ui {
     stationLengthRow.append(this.stationLengthSelect, rotateLeft, rotateRight, this.stationHeadingLabel);
     left.append(stationLengthRow);
     left.append(hint('駅長を選び、N / M で回転して空き地をクリックします'));
+
+    left.append(sectionTitle('区画の用途'));
+    const zoneRow = el('div', 'row');
+    for (const [zone, label] of [
+      ...ZONE_TYPES.map((zone) => [zone, ZONE_LABELS[zone]] as [ZoneType | null, string]),
+      [null, '解除'] as [ZoneType | null, string],
+    ]) {
+      const button = el('button', 'chip') as HTMLButtonElement;
+      button.textContent = label;
+      if (zone) button.classList.add(`zone-${zone}`);
+      button.addEventListener('click', () => {
+        callbacks.onZone(zone);
+        this.setZone(zone);
+      });
+      this.zoneButtons.set(zone, button);
+      zoneRow.append(button);
+    }
+    left.append(zoneRow);
+    left.append(hint('道路沿いのマス目を塗ると建物が建ちます。道路を消すとその区画も無くなります'));
 
     left.append(sectionTitle('種別'));
     for (const cls of NETWORK_CLASSES) {
@@ -278,6 +302,7 @@ export class Ui {
       '<b>右クリック / Esc</b> 中断',
       '<b>Shift</b> 直線・15° スナップ / <b>Ctrl</b> スナップ解除',
       '<b>S</b> 駅配置 / <b>N・M</b> 駅を回転',
+      '<b>Z</b> 区画 (道路沿いを塗ると建物が建つ)',
       '<b>C</b> 平行線路へシーサスクロッシングを一括敷設',
       '<b>U</b> 地下ビュー (地形を透過)',
       '<b>右ドラッグ</b> 視点移動 / <b>ホイール</b> 拡大縮小',
@@ -324,6 +349,13 @@ export class Ui {
     this.undergroundToggle.checked = on;
   }
 
+  /** 選んでいる区画の用途を反映する。 */
+  setZone(zone: ZoneType | null): void {
+    for (const [key, button] of this.zoneButtons) {
+      button.classList.toggle('active', key === zone);
+    }
+  }
+
   setParallelSnap(on: boolean): void {
     for (const [key, button] of this.parallelButtons) {
       button.classList.toggle('active', key === on);
@@ -357,6 +389,8 @@ export class Ui {
         '操作',
         status.mode === 'build' ? 'クリックで始点を指定'
           : status.mode === 'station' ? '空き地をクリックして駅を配置'
+          : status.mode === 'zone'
+            ? `道路沿いをクリックして${status.zone ? ZONE_LABELS[status.zone] : '用途を解除'}`
           : status.mode === 'scissors' ? '平行線路上で位置を指定'
           : '対象をクリック',
       ]);
@@ -496,6 +530,7 @@ export class Ui {
       ['分岐器', `${s.turnouts}`],
       ['踏切', `${s.levelCrossings}`],
       ['駅', `${s.stations}`],
+      ['区画', `${s.buildings} / ${s.lots}`],
       ['高架', `${s.bridgeLength.toFixed(0)} m`],
       ['トンネル', `${s.tunnelLength.toFixed(0)} m`],
       ['総延長', `${s.totalLength.toFixed(0)} m`],

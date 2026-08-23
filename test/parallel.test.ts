@@ -18,15 +18,16 @@ import { computeStructureProfile } from '../src/network/structure';
 import { WorldBuilder } from '../src/render/worldBuilder';
 import { Heightfield } from '../src/terrain/heightfield';
 import { TerrainMesh } from '../src/terrain/terrainMesh';
+import { testField } from './support/field';
 
 /** 平らな地形。起伏で結果が揺れないようにする。 */
 function flatField(): Heightfield {
-  return new Heightfield();
+  return testField();
 }
 
 /** 谷を 1 本刻んだ地形。橋になる区間を作るのに使う。 */
 function valleyField(halfWidth = 60, depth = -20): Heightfield {
-  const field = new Heightfield();
+  const field = testField();
   for (let iz = 0; iz <= field.cells; iz++) {
     for (let ix = 0; ix <= field.cells; ix++) {
       const y = Math.abs(field.worldX(ix)) < halfWidth ? depth : 0;

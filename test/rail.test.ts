@@ -11,6 +11,7 @@ import { WorldBuilder } from '../src/render/worldBuilder';
 import { DEFAULT_TERRAIN, generateTerrain } from '../src/terrain/generator';
 import { Heightfield } from '../src/terrain/heightfield';
 import { TerrainMesh } from '../src/terrain/terrainMesh';
+import { testField } from './support/field';
 
 /** 建設ツールと同じ手順で線形を引く (経由点は絶対座標)。 */
 function draw(network: Network, classId: string, points: Vector3[]): void {
@@ -51,7 +52,7 @@ function addStraight(network: Network, classId: string, a: Vector3, b: Vector3):
 }
 
 function makeWorld(build: (network: Network, field: Heightfield) => void) {
-  const field = new Heightfield();
+  const field = testField();
   generateTerrain(field, DEFAULT_TERRAIN);
   const network = new Network();
   build(network, field);

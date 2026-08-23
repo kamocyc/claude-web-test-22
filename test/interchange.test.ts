@@ -8,7 +8,7 @@ import { evaluateAlignment } from '../src/network/validation';
 import { buildLaneGraph, type LaneGraph } from '../src/sim/lanegraph';
 import { Traffic } from '../src/sim/traffic';
 import { DEFAULT_TERRAIN, generateTerrain } from '../src/terrain/generator';
-import { Heightfield } from '../src/terrain/heightfield';
+import { testField } from './support/field';
 
 interface Scene {
   network: Network;
@@ -18,7 +18,7 @@ interface Scene {
 
 /** インターチェンジを 1 つ置いた場面を作る。 */
 function scene(options: { trumpet?: boolean } = {}): Scene {
-  const field = new Heightfield();
+  const field = testField();
   generateTerrain(field, DEFAULT_TERRAIN);
   const network = new Network();
   const build = options.trumpet ? buildTrumpetInterchange : buildInterchange;

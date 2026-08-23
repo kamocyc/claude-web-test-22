@@ -7,16 +7,33 @@
  */
 
 /** マップ一辺の長さ [m]。原点はマップ中心。 */
-export const MAP_SIZE = 1024;
+export const MAP_SIZE = 5120;
 
-/** ハイトマップ 1 セルの辺長 [m]。 */
-export const TERRAIN_CELL = 2;
+/**
+ * ハイトマップ 1 セルの辺長 [m]。
+ *
+ * 格子点は `(MAP_SIZE / TERRAIN_CELL + 1)^2` 個あり、地形メッシュ・整地の
+ * 計算量とメモリはこの 2 乗で効く。マップを広げた分だけ 1 セルを粗くして、
+ * 1 回の再構築で走査する点数を実用的な範囲に保っている。
+ * 粗くすると路端で地形が路面から離れる量が増えるので、整地の footprint
+ * (`gradingHalfWidth`) はセル長に追従して広げてある。
+ */
+export const TERRAIN_CELL = 4;
 
 /** ハイトマップの格子数 (セル数)。頂点数はこれ + 1。 */
 export const TERRAIN_CELLS = MAP_SIZE / TERRAIN_CELL;
 
 /** 地形メッシュを分割するチャンクの一辺のセル数。 */
 export const TERRAIN_CHUNK_CELLS = 64;
+
+/**
+ * 遠景を霞ませ始める距離と、完全に霞む距離 [m]。
+ *
+ * マップの広さではなく**見える距離**の話なので、`MAP_SIZE` からは切り離す。
+ * マップに比例させると、広いマップでは近くが霞まず、端まで見通せてしまう。
+ */
+export const FOG_NEAR = 620;
+export const FOG_FAR = 2400;
 
 /** 線形をサンプリングする既定間隔 [m]。 */
 export const SAMPLE_SPACING = 2.0;
@@ -49,6 +66,16 @@ export const GRADING_MARGIN = 2.0;
  * 小物だけが崖の上に取り残されるので、そういう場所は候補から外す。
  */
 export const PROP_MAX_RISE = 1.2;
+
+/**
+ * 小物の足元が、その道路の路面より低くてよい量 [m]。
+ *
+ * 路肩の地形は、格子の量子化を吸収するため路面よりわずかに低く均される
+ * (`gradingSectionPoints` の shift = 勾配 × セル長)。急勾配で格子が粗いと
+ * その差が 0.5 m 近くなり、遮断機や標識だけが路面から沈んで見える。
+ * 路肩として自然に見える範囲で止める。
+ */
+export const PROP_MAX_DROP = 0.3;
 
 /**
  * 高架と判定する盛土高さ [m]。

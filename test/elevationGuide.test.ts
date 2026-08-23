@@ -3,7 +3,7 @@ import { BufferAttribute, LineSegments, Vector3 } from 'three';
 import { ElevationGuideView } from '../src/render/elevationGuide';
 import { BuildTool } from '../src/app/buildTool';
 import { Network } from '../src/network/network';
-import { Heightfield } from '../src/terrain/heightfield';
+import { testField } from './support/field';
 
 function vertexCount(view: ElevationGuideView): number {
   const lines = view.group.getObjectByName('elevation-guide-lines') as LineSegments;
@@ -29,7 +29,7 @@ describe('高さガイド', () => {
   });
 
   it('敷設高さを変えるとカーソル位置に連動する', () => {
-    const field = new Heightfield();
+    const field = testField();
     field.base.fill(4);
     field.resetWork();
     const tool = new BuildTool(new Network(), field, () => {});

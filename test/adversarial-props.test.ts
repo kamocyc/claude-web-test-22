@@ -34,6 +34,7 @@ import {
 import { DEFAULT_TERRAIN, generateTerrain } from '../src/terrain/generator';
 import { Heightfield } from '../src/terrain/heightfield';
 import { TerrainMesh } from '../src/terrain/terrainMesh';
+import { testField } from './support/field';
 
 /**
  * 小物 (信号機・一時停止標識・遮断機・架線柱・電柱) の配置に対する敵対的検証。
@@ -108,7 +109,7 @@ function buildScene(
   seed?: number,
   terrain?: (f: Heightfield) => void,
 ): Scene {
-  const field = new Heightfield();
+  const field = testField();
   if (seed !== undefined) generateTerrain(field, { ...DEFAULT_TERRAIN, seed });
   if (terrain) terrain(field);
   const network = new Network();
@@ -1584,7 +1585,7 @@ function scanJunctions(): { name: string; junction: Junction }[] {
   ]) {
     for (let deg = 5; deg <= 90; deg += 5) {
       for (const span of [140, 600]) {
-        const f = new Heightfield();
+        const f = testField();
         const n = new Network();
         crossing(a, b, deg, { span })(n, f);
         for (const junction of solveJunctions(n).junctions.values()) {
@@ -1696,7 +1697,7 @@ describe('小物の配置 (敵対的検証)', () => {
     ]) {
       for (const span of [140, 600]) {
         for (let deg = 1; deg <= 90; deg += 1) {
-          const f = new Heightfield();
+          const f = testField();
           const n = new Network();
           crossing(a, b, deg, { span })(n, f);
           for (const j of solveJunctions(n).junctions.values()) {
@@ -2462,7 +2463,7 @@ describe('小物の配置 (敵対的検証)', () => {
     // 途中を塞いだ状態で直接組み立て、塞いだ帯の中に一切の形状 (= 電線) が
     // 出てこないことを見る。柱そのものは塞いだ帯には建たない。
     for (const which of ['catenary', 'utility'] as const) {
-      const f = new Heightfield();
+      const f = testField();
       const n = new Network();
       const id = which === 'catenary' ? 'rail_single' : 'road_medium';
       draw(n, f, id, [{ x: -150, z: 0 }, { x: 150, z: 0 }], { straight: true });
