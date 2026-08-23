@@ -2,6 +2,7 @@ import type { Alignment } from '../core/alignment';
 import { RAIL_GAUGE } from '../core/units';
 import { getClass } from '../network/classes';
 import type { Network, SegmentId } from '../network/network';
+import type { StationId } from '../network/station';
 import type { StructureMode } from '../network/structure';
 import { pointRisk } from '../network/validation';
 
@@ -61,6 +62,14 @@ export interface PointInspection {
   gradeRisk: number;
   /** 区間全体の変化。同じ線形を指している間は同一オブジェクト。 */
   profile: InspectProfile;
+  station: {
+    id: StationId;
+    name: string;
+    trackIndex: number;
+    trackCount: number;
+    platformCount: number;
+    length: number;
+  } | null;
 }
 
 /** グラフ用のサンプル数。 */
@@ -95,6 +104,7 @@ export function inspectPoint(
   const sample = alignment.sampleAt(s);
   const roll = surface?.cantAt(segment, s) ?? 0;
   const risk = pointRisk(sample.curvature, sample.grade, cls);
+  const station = network.stationForSegment(segment);
   return {
     segment,
     classId: cls.id,
@@ -111,6 +121,16 @@ export function inspectPoint(
     curveRisk: risk.curveRisk,
     gradeRisk: risk.gradeRisk,
     profile,
+    station: station && seg.stationTrack
+      ? {
+          id: station.id,
+          name: station.name,
+          trackIndex: seg.stationTrack.index,
+          trackCount: station.trackCount,
+          platformCount: station.platformCount,
+          length: station.length,
+        }
+      : null,
   };
 }
 

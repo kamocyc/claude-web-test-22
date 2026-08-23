@@ -2,6 +2,8 @@ import { NETWORK_CLASSES, getClass } from '../network/classes';
 import { riskColor, viewUniforms } from '../render/materials';
 import type { BuildResult } from '../render/worldBuilder';
 import type { ToolMode, ToolStatus } from './buildTool';
+import type { StationToolSettings } from './buildTool';
+import { stationPlatformRange, STATION_LENGTHS, type StationId } from '../network/station';
 import type { RideStatus } from './ride';
 import {
   GRAPH_W,
@@ -18,10 +20,15 @@ import {
 
 export interface UiCallbacks {
   onMode: (mode: ToolMode) => void;
+  onStationSettings: (patch: Partial<Omit<StationToolSettings, 'heading'>>) => void;
+  onStationRotate: (steps: number) => void;
+  onStationRename: (id: StationId, name: string) => void;
   /** 接続の色分け表示を切り替える。 */
   onConnectivityColors: (on: boolean) => void;
   /** 車両の走行表示を切り替える。 */
   onVehicles: (on: boolean) => void;
+  /** 地形を透かして地下線形を実深度で見る。 */
+  onUndergroundView: (on: boolean) => void;
   /** 乗車モード (一人称視点) の出入り。 */
   onRide: () => void;
   /** 乗る車両を次に変える。 */
@@ -55,7 +62,16 @@ export class Ui {
   private readonly elevationLabel: HTMLElement;
   private readonly rideButton: HTMLButtonElement;
   private readonly vehiclesToggle: HTMLInputElement;
+  private readonly undergroundToggle: HTMLInputElement;
   private readonly statusBody: HTMLElement;
+  private readonly stationNameInput: HTMLInputElement;
+  private readonly stationTrackSelect: HTMLSelectElement;
+  private readonly stationPlatformSelect: HTMLSelectElement;
+  private readonly stationLengthSelect: HTMLSelectElement;
+  private readonly stationHeadingLabel: HTMLElement;
+  private readonly stationEditBody: HTMLElement;
+  /** Platform options only depend on the selected track count. */
+  private stationOptionTracks = 0;
   private readonly graphBody: HTMLElement;
   private readonly warningBody: HTMLElement;
   private readonly statsBody: HTMLElement;
@@ -67,7 +83,7 @@ export class Ui {
 
   constructor(
     private readonly root: HTMLElement,
-    callbacks: UiCallbacks,
+    private readonly callbacks: UiCallbacks,
   ) {
     const left = el('div', 'panel panel-left');
 
@@ -75,6 +91,7 @@ export class Ui {
     const modes = el('div', 'row');
     for (const [mode, label, hint] of [
       ['build', '敷設', 'B'],
+      ['station', '駅', 'S'],
       ['scissors', 'シーサス', 'C'],
       ['bulldoze', '撤去', 'X'],
       ['inspect', '確認', 'V'],
@@ -86,6 +103,50 @@ export class Ui {
       modes.append(button);
     }
     left.append(modes);
+
+    left.append(sectionTitle('駅の設定'));
+    this.stationNameInput = document.createElement('input');
+    this.stationNameInput.className = 'text-input';
+    this.stationNameInput.value = '駅 1';
+    this.stationNameInput.maxLength = 40;
+    this.stationNameInput.placeholder = '駅名';
+    this.stationNameInput.addEventListener('input', () =>
+      callbacks.onStationSettings({ name: this.stationNameInput.value }),
+    );
+    left.append(this.stationNameInput);
+
+    const stationCounts = el('div', 'row');
+    this.stationTrackSelect = select(
+      Array.from({ length: 6 }, (_, i) => [String(i + 1), `${i + 1}線`] as const),
+      '2',
+      (value) => {
+        const trackCount = Number(value);
+        this.refreshPlatformOptions(trackCount);
+        callbacks.onStationSettings({
+          trackCount,
+          platformCount: Number(this.stationPlatformSelect.value),
+        });
+      },
+    );
+    this.stationPlatformSelect = select([], '2', (value) =>
+      callbacks.onStationSettings({ platformCount: Number(value) }),
+    );
+    this.refreshPlatformOptions(2);
+    stationCounts.append(this.stationTrackSelect, this.stationPlatformSelect);
+    left.append(stationCounts);
+
+    const stationLengthRow = el('div', 'row');
+    this.stationLengthSelect = select(
+      STATION_LENGTHS.map((length) => [String(length), `${length} m`] as const),
+      '120',
+      (value) => callbacks.onStationSettings({ length: Number(value) as (typeof STATION_LENGTHS)[number] }),
+    );
+    const rotateLeft = button('↺ (N)', () => callbacks.onStationRotate(-1));
+    const rotateRight = button('↻ (M)', () => callbacks.onStationRotate(1));
+    this.stationHeadingLabel = el('span', 'elevation');
+    stationLengthRow.append(this.stationLengthSelect, rotateLeft, rotateRight, this.stationHeadingLabel);
+    left.append(stationLengthRow);
+    left.append(hint('駅長を選び、N / M で回転して空き地をクリックします'));
 
     left.append(sectionTitle('種別'));
     for (const cls of NETWORK_CLASSES) {
@@ -154,6 +215,12 @@ export class Ui {
         apply: (on) => callbacks.onConnectivityColors(on),
       },
       {
+        id: 'underground',
+        label: '地下ビュー (U)',
+        initial: false,
+        apply: (on) => callbacks.onUndergroundView(on),
+      },
+      {
         id: 'vehicles',
         label: '車両を走らせる',
         initial: true,
@@ -168,6 +235,7 @@ export class Ui {
       toggle.apply(toggle.initial);
     }
     this.vehiclesToggle = inputs.get('vehicles')!;
+    this.undergroundToggle = inputs.get('underground')!;
 
     left.append(sectionTitle('視点'));
     const rideRow = el('div', 'row');
@@ -193,6 +261,8 @@ export class Ui {
     right.append(sectionTitle('状態'));
     this.statusBody = el('div', 'readout');
     right.append(this.statusBody);
+    this.stationEditBody = el('div', 'station-editor');
+    right.append(this.stationEditBody);
     this.graphBody = el('div', 'graph-body');
     right.append(this.graphBody);
     right.append(sectionTitle('集計'));
@@ -207,14 +277,19 @@ export class Ui {
       '<b>左クリック</b> 始点 → もう一度で確定 (続けて連結)',
       '<b>右クリック / Esc</b> 中断',
       '<b>Shift</b> 直線・15° スナップ / <b>Ctrl</b> スナップ解除',
+      '<b>S</b> 駅配置 / <b>N・M</b> 駅を回転',
       '<b>C</b> 平行線路へシーサスクロッシングを一括敷設',
+      '<b>U</b> 地下ビュー (地形を透過)',
       '<b>右ドラッグ</b> 視点移動 / <b>ホイール</b> 拡大縮小',
       '<b>F</b> 乗車 (車両をクリックで選ぶ) / <b>N</b> 次の車両 / 乗車中はドラッグで見回す',
     ]
       .map((line) => `<div>${line}</div>`)
       .join('');
 
-    root.append(left, right, help);
+    const undergroundBadge = el('div', 'underground-badge');
+    undergroundBadge.textContent = '地下ビュー · U で地上へ戻る';
+
+    root.append(left, right, help, undergroundBadge);
   }
 
   setMode(mode: ToolMode): void {
@@ -244,6 +319,11 @@ export class Ui {
     this.vehiclesToggle.checked = on;
   }
 
+  /** キーボードで切り替えたときもチェック表示を揃える。 */
+  setUndergroundView(on: boolean): void {
+    this.undergroundToggle.checked = on;
+  }
+
   setParallelSnap(on: boolean): void {
     for (const [key, button] of this.parallelButtons) {
       button.classList.toggle('active', key === on);
@@ -251,19 +331,24 @@ export class Ui {
   }
 
   updateStatus(status: ToolStatus, ride: RideStatus | null = null): void {
-    this.elevationLabel.textContent = `${status.elevation >= 0 ? '+' : ''}${status.elevation} m`;
+    const elevationKind = status.elevation > 0 ? '高架' : status.elevation < 0 ? '地下' : '地表';
+    this.elevationLabel.textContent = `${status.elevation >= 0 ? '+' : ''}${status.elevation} m · ${elevationKind}`;
 
     /** [見出し, 値, 値の色] */
     const rows: [string, string, string?][] = [];
     if (ride) {
       rows.push(...rideRows(ride));
     } else if (status.drawing) {
-      rows.push(['延長', `${status.length.toFixed(1)} m`]);
-      rows.push([
-        '曲線半径',
-        Number.isFinite(status.radius) ? `${status.radius.toFixed(0)} m` : '直線',
-      ]);
-      rows.push(['勾配', `${(status.grade * 100).toFixed(2)} %`]);
+      rows.push([status.mode === 'station' ? '線路総延長' : '延長', `${status.length.toFixed(1)} m`]);
+      if (status.mode === 'station') {
+        rows.push(['駅', `${status.station.trackCount}線 / ${status.station.platformCount}ホーム`]);
+      } else {
+        rows.push([
+          '曲線半径',
+          Number.isFinite(status.radius) ? `${status.radius.toFixed(0)} m` : '直線',
+        ]);
+        rows.push(['勾配', `${(status.grade * 100).toFixed(2)} %`]);
+      }
       rows.push(['概算', `¥${Math.round(status.cost).toLocaleString('ja-JP')}`]);
     } else if (status.mode === 'inspect') {
       rows.push(...inspectRows(status.inspect));
@@ -271,6 +356,7 @@ export class Ui {
       rows.push([
         '操作',
         status.mode === 'build' ? 'クリックで始点を指定'
+          : status.mode === 'station' ? '空き地をクリックして駅を配置'
           : status.mode === 'scissors' ? '平行線路上で位置を指定'
           : '対象をクリック',
       ]);
@@ -324,6 +410,58 @@ export class Ui {
       this.statusBody.innerHTML = html;
     }
     this.updateGraph(!ride && status.mode === 'inspect' ? status.inspect : null);
+    this.syncStationControls(status.station);
+    this.updateStationEditor(status);
+  }
+
+  private syncStationControls(settings: StationToolSettings): void {
+    if (document.activeElement !== this.stationNameInput) this.stationNameInput.value = settings.name;
+    this.stationTrackSelect.value = String(settings.trackCount);
+    this.refreshPlatformOptions(settings.trackCount, settings.platformCount);
+    this.stationLengthSelect.value = String(settings.length);
+    const degrees = ((settings.heading * 180) / Math.PI + 360) % 360;
+    this.stationHeadingLabel.textContent = `${degrees.toFixed(0)}°`;
+  }
+
+  private refreshPlatformOptions(trackCount: number, selected?: number): void {
+    const range = stationPlatformRange(trackCount);
+    const wanted = selected ?? Number(this.stationPlatformSelect?.value || 2);
+    if (this.stationOptionTracks === trackCount) {
+      this.stationPlatformSelect.value = String(Math.max(range.min, Math.min(range.max, wanted)));
+      return;
+    }
+    this.stationOptionTracks = trackCount;
+    this.stationPlatformSelect.innerHTML = '';
+    for (let i = range.min; i <= range.max; i++) {
+      const option = document.createElement('option');
+      option.value = String(i);
+      option.textContent = `${i}ホーム`;
+      this.stationPlatformSelect.append(option);
+    }
+    this.stationPlatformSelect.value = String(Math.max(range.min, Math.min(range.max, wanted)));
+  }
+
+  private updateStationEditor(status: ToolStatus): void {
+    const station = status.selectedStation;
+    const key = station ? `${station.id}:${station.name}` : '';
+    if (this.stationEditBody.dataset.key === key) return;
+    this.stationEditBody.dataset.key = key;
+    this.stationEditBody.innerHTML = '';
+    if (!station) return;
+    const title = el('div', 'hint');
+    title.textContent = `駅 #${station.id} の名前を変更`;
+    const row = el('div', 'row');
+    const input = document.createElement('input');
+    input.className = 'text-input';
+    input.value = station.name;
+    input.maxLength = 40;
+    const rename = (): void => this.callbacks.onStationRename(station.id, input.value);
+    const save = button('変更', rename);
+    input.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') rename();
+    });
+    row.append(input, save);
+    this.stationEditBody.append(title, row);
   }
 
   /**
@@ -357,6 +495,7 @@ export class Ui {
       ['交差点', `${s.intersections}`],
       ['分岐器', `${s.turnouts}`],
       ['踏切', `${s.levelCrossings}`],
+      ['駅', `${s.stations}`],
       ['高架', `${s.bridgeLength.toFixed(0)} m`],
       ['トンネル', `${s.tunnelLength.toFixed(0)} m`],
       ['総延長', `${s.totalLength.toFixed(0)} m`],
@@ -414,6 +553,24 @@ function button(label: string, onClick: () => void): HTMLButtonElement {
   const node = el('button', 'chip') as HTMLButtonElement;
   node.textContent = label;
   node.addEventListener('click', onClick);
+  return node;
+}
+
+function select(
+  options: readonly (readonly [string, string])[],
+  initial: string,
+  onChange: (value: string) => void,
+): HTMLSelectElement {
+  const node = document.createElement('select');
+  node.className = 'select-input';
+  for (const [value, label] of options) {
+    const option = document.createElement('option');
+    option.value = value;
+    option.textContent = label;
+    node.append(option);
+  }
+  node.value = initial;
+  node.addEventListener('change', () => onChange(node.value));
   return node;
 }
 
@@ -499,6 +656,15 @@ function inspectRows(inspect: PointInspection | null): [string, string, string?]
     ['勾配', formatGrade(inspect.grade), riskColor(inspect.gradeRisk)],
     ['縦曲線半径', formatVerticalRadius(inspect.verticalRadius, inspect.verticalSecond)],
   ];
+  if (inspect.station) {
+    rows.unshift(
+      ['駅', inspect.station.name],
+      [
+        '駅構内',
+        `${inspect.station.trackIndex + 1}番線 / ${inspect.station.trackCount}線・${inspect.station.platformCount}ホーム`,
+      ],
+    );
+  }
   // カントは線路だけ。道路では常に 0 なので出さない。
   if (inspect.cant !== null) {
     rows.push(['カント', formatCant(inspect.cant, inspect.cantRoll)]);

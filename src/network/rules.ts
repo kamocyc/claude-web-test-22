@@ -15,6 +15,7 @@ import type { Anchor } from './editing';
 import { CORNER_MARGIN, requiredTrims, type BranchLike } from './junction';
 import type { Branch, Network, NodeId, SegmentId } from './network';
 import { classify } from './structure';
+import { checkAlignmentAgainstStations } from './stationPlacement';
 import type { Heightfield } from '../terrain/heightfield';
 
 /**
@@ -109,6 +110,7 @@ export function checkPlacement(ctx: PlacementContext): PlacementCheck {
   blockers.push(...checkRunningAlong(ctx, sides[0], sides[1]));
   blockers.push(...checkJunctionSpacing(ctx));
   blockers.push(...checkTunnelJunctions(ctx, connected));
+  blockers.push(...checkAlignmentAgainstStations(network, ctx.alignment, ctx.cls.halfWidth + 1, ctx.ignore));
 
   return { blockers: dedupe(blockers) };
 }

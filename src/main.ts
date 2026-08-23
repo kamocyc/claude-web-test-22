@@ -42,9 +42,20 @@ viewport.scene.add(tool.previewGroup);
 
 // 乗車モード (一人称視点)。走っている車両の運転台にカメラを置く。
 const ride = new Ride();
+let undergroundView = false;
 
 const ui = new Ui(uiRoot, {
   onMode: (mode) => setMode(mode),
+  onStationSettings: (patch) => tool.setStationSettings(patch),
+  onStationRotate: (steps) => tool.rotateStation(steps),
+  onStationRename: (id, name) => {
+    try {
+      network.renameStation(id, name);
+      dirty = true;
+    } catch {
+      // Invalid names leave the existing value unchanged.
+    }
+  },
   onClass: (classId) => {
     tool.setClass(classId);
     ui.setClass(classId);
@@ -60,6 +71,7 @@ const ui = new Ui(uiRoot, {
     // 走らせるのをやめたら、乗る車両もいなくなる。
     if (!on) stopRide();
   },
+  onUndergroundView: (on) => applyUndergroundView(on),
   onRide: () => (ride.active || ride.aiming ? stopRide() : startRide()),
   onRideNext: () => {
     if (ride.active) ride.next(world.traffic.vehicles);
@@ -92,6 +104,13 @@ function setMode(mode: ToolMode): void {
   stopRide();
   tool.setMode(mode);
   ui.setMode(mode);
+}
+
+function applyUndergroundView(on: boolean): void {
+  if (on) stopRide();
+  undergroundView = on;
+  world.setUndergroundView(on);
+  document.body.classList.toggle('underground-view', on);
 }
 
 /**
@@ -254,6 +273,7 @@ canvas.addEventListener('pointerup', (event) => {
 canvas.addEventListener('contextmenu', (event) => event.preventDefault());
 
 window.addEventListener('keydown', (event) => {
+  if (isTextControl(event.target)) return;
   switch (event.key) {
     case 'Escape':
       if (ride.active || ride.aiming) stopRide();
@@ -267,6 +287,11 @@ window.addEventListener('keydown', (event) => {
     case 'n':
     case 'N':
       if (ride.active) ride.next(world.traffic.vehicles);
+      else if (tool.mode === 'station') tool.rotateStation(-1);
+      break;
+    case 'm':
+    case 'M':
+      if (tool.mode === 'station') tool.rotateStation(1);
       break;
     case 'PageUp':
       tool.adjustElevation(1);
@@ -280,6 +305,10 @@ window.addEventListener('keydown', (event) => {
     case 'B':
       setMode('build');
       break;
+    case 's':
+    case 'S':
+      setMode('station');
+      break;
     case 'c':
     case 'C':
       setMode('scissors');
@@ -292,6 +321,11 @@ window.addEventListener('keydown', (event) => {
     case 'V':
       setMode('inspect');
       break;
+    case 'u':
+    case 'U':
+      applyUndergroundView(!undergroundView);
+      ui.setUndergroundView(undergroundView);
+      break;
     default:
       break;
   }
@@ -300,9 +334,18 @@ window.addEventListener('keydown', (event) => {
 });
 
 window.addEventListener('keyup', (event) => {
+  if (isTextControl(event.target)) return;
   if (event.key === 'Shift') modifiers.straight = false;
   if (event.key === 'Control' || event.key === 'Meta') modifiers.noSnap = false;
 });
+
+function isTextControl(target: EventTarget | null): boolean {
+  return (
+    target instanceof HTMLInputElement ||
+    target instanceof HTMLSelectElement ||
+    target instanceof HTMLTextAreaElement
+  );
+}
 
 // ------------------------------------------------------------ メインループ
 

@@ -48,7 +48,13 @@ export interface Vehicle {
    * 交差点の中で止まることになる。越える前に決め、越えたらそのまま渡る。
    */
   commit?: number;
+  /** Station already served on the current pass. Cleared after leaving its lane. */
+  lastStation?: number;
+  /** Absolute simulation time at which doors close and the train may depart. */
+  dwellUntil?: number;
 }
+
+export const STATION_DWELL = 5;
 
 /** 加速度・減速度 [m/s^2]。 */
 const ACCEL = 1.9;
@@ -205,17 +211,40 @@ export class Traffic {
 
     // 前方の車線を順に見て、速度制限・信号・競合・前車を拾う。
     const at = this.locate(vehicle.route, vehicle.head);
+    const currentLane = this.graph.lanes[vehicle.route[at.index]];
+    if (vehicle.lastStation !== undefined && currentLane?.stationStop?.station !== vehicle.lastStation) {
+      vehicle.lastStation = undefined;
+      vehicle.dwellUntil = undefined;
+    }
+    if (vehicle.dwellUntil !== undefined && this.time < vehicle.dwellUntil) {
+      vehicle.speed = 0;
+      return;
+    }
+    if (vehicle.dwellUntil !== undefined) vehicle.dwellUntil = undefined;
     // 進入すると決めた進路に乗ったら、そこから先は位置で押さえられる。
     if (vehicle.commit !== undefined && vehicle.route.indexOf(vehicle.commit) <= at.index) {
       vehicle.commit = undefined;
     }
     let ahead = -at.s;
+    let upcomingStation: { station: number; distance: number } | null = null;
     for (let i = at.index; i < vehicle.route.length; i++) {
       const lane = this.graph.lanes[vehicle.route[i]];
       if (!lane) break;
       if (ahead > LOOKAHEAD) break;
       // 25 m 先までの制限速度を守る (曲がる進路の手前で落とす)。
       if (ahead <= 25) limit = Math.min(limit, lane.speedLimit);
+
+      if (
+        vehicle.kind === 'train' &&
+        lane.stationStop &&
+        lane.stationStop.station !== vehicle.lastStation
+      ) {
+        const distance = ahead + lane.stationStop.s + this.bodyLength(vehicle) / 2;
+        if (distance >= -0.5 && distance < stopIn) {
+          stopIn = distance;
+          upcomingStation = { station: lane.stationStop.station, distance };
+        }
+      }
 
       if (i > at.index && lane.kind === 'connector') {
         // 止まる位置は停止線。停止線を引いていない進路 (分岐器・転回) は
@@ -295,6 +324,15 @@ export class Traffic {
     const accel = ACCEL * (1 - (v / Math.max(0.5, v0)) ** 4 - crowding);
     vehicle.speed = Math.max(0, v + clamp(accel, -MAX_BRAKE, ACCEL) * dt);
     vehicle.head += vehicle.speed * dt;
+    if (upcomingStation) {
+      const remaining = upcomingStation.distance - vehicle.speed * dt;
+      if (remaining <= 0.75 && vehicle.speed <= 0.45) {
+        vehicle.head += Math.max(0, remaining);
+        vehicle.speed = 0;
+        vehicle.lastStation = upcomingStation.station;
+        vehicle.dwellUntil = this.time + STATION_DWELL;
+      }
+    }
     this.trimRoute(vehicle);
   }
 

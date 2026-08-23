@@ -1,4 +1,13 @@
-import { Group, Mesh, Vector3, type Vector2 } from 'three';
+import {
+  DoubleSide,
+  Group,
+  Mesh,
+  MeshBasicMaterial,
+  Vector3,
+  type Material,
+  type Texture,
+  type Vector2,
+} from 'three';
 import type { Alignment, AlignmentSample } from '../core/alignment';
 import { MeshBuilder, signedAreaXZ } from '../core/meshbuilder';
 import { perp } from '../core/curve';
@@ -34,6 +43,7 @@ import {
   type SurfacePath,
 } from '../build/markings';
 import { buildCatenary, buildTrack, buildTrackConnection } from '../build/rail';
+import { buildStation, createStationLabels, stationFootprint } from '../build/station';
 import { computeCant, type CantProfile } from '../build/cant';
 import {
   buildPowerLine,
@@ -63,7 +73,7 @@ import {
   surfaceHeightAt,
   type RGB,
 } from '../build/surface';
-import type { NetworkClass } from '../network/classes';
+import { getClass, type NetworkClass } from '../network/classes';
 import { findCrossings, type Crossing } from '../network/crossings';
 import { solveJunctions, type Approach, type Junction } from '../network/junction';
 import { solveApproachLanes } from '../network/lanes';
@@ -126,6 +136,7 @@ export interface WorldStats {
   intersections: number;
   turnouts: number;
   levelCrossings: number;
+  stations: number;
   bridgeLength: number;
   tunnelLength: number;
   totalLength: number;
@@ -235,6 +246,10 @@ export class WorldBuilder {
   readonly surfaceMesh: Mesh;
   private readonly overlayMesh: Mesh;
   private readonly structureMesh: Mesh;
+  /** 通常ビューで、地下区間を地表へ投影して見せる影。 */
+  private readonly undergroundShadowMesh: Mesh;
+  /** 地下ビューで実際の深さに重ねる X-ray 表示。 */
+  private readonly undergroundHighlightMesh: Mesh;
   private readonly propGroup = new Group();
   private readonly grading: TerrainGrading;
 
@@ -287,15 +302,59 @@ export class WorldBuilder {
     this.structureMesh.name = 'structures';
     this.structureMesh.castShadow = true;
     this.structureMesh.receiveShadow = true;
+    this.undergroundShadowMesh = new Mesh(
+      new MeshBuilder().build(),
+      new MeshBasicMaterial({
+        color: 0x173d59,
+        transparent: true,
+        opacity: 0.42,
+        depthWrite: false,
+        polygonOffset: true,
+        polygonOffsetFactor: 0,
+        polygonOffsetUnits: -12,
+        side: DoubleSide,
+      }),
+    );
+    this.undergroundShadowMesh.name = 'underground-shadows';
+    this.undergroundShadowMesh.renderOrder = 4;
+    this.undergroundHighlightMesh = new Mesh(
+      new MeshBuilder().build(),
+      new MeshBasicMaterial({
+        color: 0x5bd8ff,
+        transparent: true,
+        opacity: 0.72,
+        depthTest: false,
+        depthWrite: false,
+        side: DoubleSide,
+      }),
+    );
+    this.undergroundHighlightMesh.name = 'underground-xray';
+    this.undergroundHighlightMesh.renderOrder = 12;
+    this.undergroundHighlightMesh.visible = false;
     this.propGroup.name = 'props';
 
     this.group.add(
       this.surfaceMesh,
       this.overlayMesh,
       this.structureMesh,
+      this.undergroundShadowMesh,
+      this.undergroundHighlightMesh,
       this.propGroup,
       this.vehicleView.group,
     );
+  }
+
+  /** 地形を透かし、地下区間だけを実際の深さで強調する。 */
+  setUndergroundView(active: boolean): void {
+    this.terrainMesh.setUndergroundView(active);
+    this.undergroundShadowMesh.visible = !active;
+    this.undergroundHighlightMesh.visible = active;
+
+    setMeshFade(this.surfaceMesh, active ? 0.24 : 1, active);
+    setMeshFade(this.overlayMesh, active ? 0.18 : 1, active);
+    setMeshFade(this.structureMesh, active ? 0.28 : 1, active);
+    this.propGroup.visible = !active;
+    this.vehicleView.group.visible = !active;
   }
 
   rebuild(): BuildResult {
@@ -342,6 +401,18 @@ export class WorldBuilder {
       const range = { s0: trim.a, s1: Math.max(trim.a + 0.5, alignment.length - trim.b) };
       ranges.set(seg.id, range);
       structures.set(seg.id, computeStructureProfile(alignment, this.field, range));
+    }
+
+    // All tracks in a station share the selected ground/elevated structure.
+    for (const station of network.stations.values()) {
+      for (const track of station.tracks) {
+        const range = ranges.get(track.segment);
+        if (range) {
+          structures.set(track.segment, [
+            { mode: station.elevated ? 'bridge' : 'ground', s0: range.s0, s1: range.s1 },
+          ]);
+        }
+      }
     }
 
     // 平行に並んでいる線形どうしは、橋・トンネルの区間を揃える。並んだ
@@ -438,6 +509,8 @@ export class WorldBuilder {
     const surface = new MeshBuilder();
     const overlay = new MeshBuilder();
     const structure = new MeshBuilder();
+    const undergroundShadow = new MeshBuilder();
+    const undergroundHighlight = new MeshBuilder();
     this.clearProps();
 
     const stats: WorldStats = {
@@ -446,6 +519,7 @@ export class WorldBuilder {
       intersections: 0,
       turnouts: 0,
       levelCrossings: 0,
+      stations: network.stations.size,
       bridgeLength: 0,
       tunnelLength: 0,
       totalLength: 0,
@@ -500,9 +574,23 @@ export class WorldBuilder {
           openEnds: { start: underground.has(seg.a), end: underground.has(seg.b) },
         },
       );
+      this.buildUndergroundGuides(
+        undergroundShadow,
+        undergroundHighlight,
+        alignment,
+        cls,
+        runs,
+        blends.get(seg.id) ?? [],
+        seg.id,
+      );
       if (cls.kind === 'road') {
         buildLaneMarkings(overlay, this.surfacePath(seg.id), range, cls);
       }
+    }
+
+    for (const station of network.stations.values()) {
+      buildStation(surface, overlay, structure, station, (x, z) => this.field.heightAt(x, z));
+      this.propGroup.add(createStationLabels(station));
     }
 
     // 継ぎ目で縦断が折れている所。均しは規格の範囲でしか動かせないので、
@@ -540,6 +628,7 @@ export class WorldBuilder {
         });
       }
     }
+
     // 並んだ線路を渡る所は、1 か所の踏切としてまとめて作る。線路ごとに
     // 作ると、線路と線路の間に遮断機と停止線が入り込んでしまう。
     for (const group of groupLevelCrossings(crossings)) {
@@ -555,6 +644,8 @@ export class WorldBuilder {
     this.replaceGeometry(this.surfaceMesh, surface);
     this.replaceGeometry(this.overlayMesh, overlay);
     this.replaceGeometry(this.structureMesh, structure);
+    this.replaceGeometry(this.undergroundShadowMesh, undergroundShadow);
+    this.replaceGeometry(this.undergroundHighlightMesh, undergroundHighlight);
 
     // 車線グラフは形が変わるたびに作り直す。走っている車両は捨てる
     // (通れなくなった車線に取り残された車が残り続けるのを防ぐ)。
@@ -1123,6 +1214,23 @@ export class WorldBuilder {
       }
     }
 
+    // Ground stations flatten their whole footprint. Elevated stations preserve the
+    // terrain and only clear the volume directly below the shared deck.
+    for (const station of this.network.stations.values()) {
+      const ring = stationFootprint(
+        station,
+        0,
+        station.center.y - gradingDrop(getClass('rail_single')),
+      );
+      if (station.elevated) {
+        grading.blockQuad(ring[0], ring[1], ring[2], ring[3]);
+        const carved = ring.map((point) => point.clone().setY(station.center.y - DECK_CLEARANCE));
+        grading.carveQuad(carved[0], carved[1], carved[2], carved[3]);
+      } else {
+        grading.stampPolygon(ring, { distance: 0 });
+      }
+    }
+
     for (const margin of margins) {
       grading.stampQuad(margin.quad[0], margin.quad[1], margin.quad[2], margin.quad[3], {
         core: false,
@@ -1186,6 +1294,45 @@ export class WorldBuilder {
 
   // ------------------------------------------------------------ セグメント
 
+  /**
+   * トンネル区間を、通常ビュー用の地表の影と地下ビュー用の実深度表示へ分けて描く。
+   */
+  private buildUndergroundGuides(
+    shadow: MeshBuilder,
+    highlight: MeshBuilder,
+    alignment: Alignment,
+    cls: NetworkClass,
+    runs: StructureRun[],
+    blends: SurfaceBlend[],
+    segment: SegmentId,
+  ): void {
+    const flatProfile = [
+      { offset: -cls.halfWidth, height: 0, color: [1, 1, 1] as RGB },
+      { offset: cls.halfWidth, height: 0, color: [1, 1, 1] as RGB },
+    ];
+    for (const run of runs) {
+      if (run.mode !== 'tunnel') continue;
+      const raw = alignmentSamplesInRange(alignment, run.s0, run.s1, 2.5);
+      if (raw.length < 2) continue;
+
+      const actual = this.withCant(applySurfaceBlend(raw, blends), segment);
+      buildRibbon(highlight, actual, flatProfile, { skirt: false, cls });
+
+      const projected: AlignmentSample[] = raw.map((sample) => ({
+        ...sample,
+        pos: new Vector3(
+          sample.pos.x,
+          this.field.heightAt(sample.pos.x, sample.pos.z) + 0.22,
+          sample.pos.z,
+        ),
+        forward: new Vector3(sample.forwardXZ.x, 0, sample.forwardXZ.y),
+        grade: 0,
+        roll: 0,
+      }));
+      buildRibbon(shadow, projected, flatProfile, { skirt: false, cls });
+    }
+  }
+
   private buildSegment(
     surface: MeshBuilder,
     structure: MeshBuilder,
@@ -1219,7 +1366,7 @@ export class WorldBuilder {
 
       if (run.mode === 'bridge') {
         stats.bridgeLength += run.s1 - run.s0;
-        buildBridge(structure, samples, cls, this.field, {
+        if (!this.network.getSegment(segment).stationTrack) buildBridge(structure, samples, cls, this.field, {
           // 橋脚を下を通る道路・線路の真ん中に建てない。
           canPlace: (x, z, y) => this.canPlaceProp(x, z, y, [segment]),
         });
@@ -1287,6 +1434,8 @@ export class WorldBuilder {
     for (const seg of this.network.segments.values()) {
       const cls = this.network.classOf(seg);
       if (cls.kind !== 'rail') continue;
+      // 駅構内はホーム上屋と干渉しないよう、駅専用の支持物に任せる。
+      if (seg.stationTrack) continue;
       const members = groupOf.get(seg.id);
       // まとまりの代表以外は、代表が建てた門型に吊るので何もしない。
       if (members && members[0] !== seg.id) continue;
@@ -1729,6 +1878,16 @@ export class WorldBuilder {
 
   /** 小物はジオメトリ・マテリアルを共有しているので、外すだけでよい。 */
   private clearProps(): void {
+    for (const child of this.propGroup.children) {
+      if (!child.name.startsWith('station-')) continue;
+      child.traverse((object) => {
+        const material = (object as { material?: Material }).material;
+        if (!material) return;
+        const map = (material as Material & { map?: Texture }).map;
+        map?.dispose();
+        material.dispose();
+      });
+    }
     this.propGroup.clear();
     this.signals = [];
     this.gates = [];
@@ -1980,4 +2139,15 @@ function edgeNormal(a: Vector3, b: Vector3, sign: number): Vector3 {
   const len = Math.hypot(dx, dz);
   if (len < 1e-9) return new Vector3();
   return new Vector3((dz / len) * sign, 0, (-dx / len) * sign);
+}
+
+/** 地下ビュー中だけ既存メッシュを薄くし、強調線を読みやすくする。 */
+function setMeshFade(mesh: Mesh, opacity: number, active: boolean): void {
+  const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+  for (const material of materials) {
+    material.transparent = active;
+    material.opacity = opacity;
+    material.depthWrite = !active;
+    material.needsUpdate = true;
+  }
 }

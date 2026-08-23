@@ -7,6 +7,7 @@ import { SPEED_FACTOR, type NetworkClass } from '../network/classes';
 import type { Junction } from '../network/junction';
 import { exitLaneFor, lanesOf, solveApproachLanes, type Lane } from '../network/lanes';
 import type { Network, NodeId, SegmentId } from '../network/network';
+import type { StationId } from '../network/station';
 
 /**
  * 車線どうしの接続グラフ。
@@ -50,6 +51,8 @@ export interface GraphLane {
   /** 続けて走れる車線。 */
   next: number[];
   segment?: SegmentId;
+  /** Platform-centre stop measured from this lane path's start. */
+  stationStop?: { station: StationId; s: number };
   /** コネクタが属する交差点。 */
   node?: NodeId;
   /** 信号のある交差点の進路なら、その位相 (同じ位相が同時に青)。 */
@@ -243,6 +246,18 @@ export function buildLaneGraph(
     const range = { s0: drawn.s0 + back(seg.a), s1: drawn.s1 - back(seg.b) };
     const alignment = network.alignmentOf(seg.id);
     for (const lane of lanesOf(cls, seg.id)) {
+      const station = seg.stationTrack ? network.stations.get(seg.stationTrack.station) : undefined;
+      const stationCenter = alignment.length / 2;
+      const stationStop = station
+        ? {
+            station: station.id,
+            s: clamp(
+              lane.forward ? stationCenter - range.s0 : range.s1 - stationCenter,
+              0,
+              range.s1 - range.s0,
+            ),
+          }
+        : undefined;
       const created = add({
         kind: 'segment',
         vehicleKind: cls.kind === 'rail' ? 'train' : 'car',
@@ -257,6 +272,7 @@ export function buildLaneGraph(
         ),
         speedLimit: speedOf(cls),
         segment: seg.id,
+        stationStop,
       });
       bySegment.set(`${seg.id}:${lane.index}`, created.id);
     }
@@ -370,7 +386,9 @@ export function buildLaneGraph(
 
   return {
     lanes,
-    spawnable: lanes.filter((l) => l.kind === 'segment' && l.path.length > 15).map((l) => l.id),
+    spawnable: lanes
+      .filter((l) => l.kind === 'segment' && l.path.length > 15 && !l.stationStop)
+      .map((l) => l.id),
   };
 }
 

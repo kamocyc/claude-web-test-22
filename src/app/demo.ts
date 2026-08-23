@@ -1,4 +1,4 @@
-import { Vector3 } from 'three';
+import { Vector2, Vector3 } from 'three';
 import { buildInterchange, buildTrumpetInterchange } from './interchange';
 import { draw, drawParallel, smoothProfile, type Waypoint } from './sketch';
 import type { Network } from '../network/network';
@@ -95,6 +95,48 @@ export function buildDemoNetwork(network: Network, field: Heightfield): void {
     }),
     { straight: true, count: 2 },
   );
+
+  // 起動直後から停車を見られるよう、北端の先に独立駅を接続する。
+  const northEnds = [...network.nodes.values()]
+    .filter((node) => Math.abs(node.pos.z - 300) < 1 && node.segments.some((id) => network.classOf(network.getSegment(id)).kind === 'rail'))
+    .sort((a, b) => a.pos.x - b.pos.x);
+  const stationY = northEnds.reduce((sum, node) => sum + node.pos.y, 0) / Math.max(1, northEnds.length);
+  const station = network.addStation({
+    name: 'みどり台',
+    center: new Vector3(railX, stationY, 430),
+    heading: Math.PI / 2,
+    length: 120,
+    trackCount: 2,
+    platformCount: 2,
+    elevated: false,
+  });
+  const stationSouth = station.tracks
+    .map((track) => {
+      const seg = network.getSegment(track.segment);
+      const nodes = [network.getNode(seg.a), network.getNode(seg.b)].sort((a, b) => a.pos.z - b.pos.z);
+      return { track, node: nodes[0] };
+    })
+    .sort((a, b) => a.node.pos.x - b.node.pos.x);
+  for (let i = 0; i < Math.min(northEnds.length, stationSouth.length); i++) {
+    const main = northEnds[i];
+    const target = stationSouth[i];
+    const forward = target.track.forward;
+    const existing = network.getSegment(main.segments[0]);
+    const mainGrade = existing.a === main.id ? existing.gradeA : existing.gradeB;
+    const a = forward ? main : target.node;
+    const b = forward ? target.node : main;
+    const p0 = new Vector2(a.pos.x, a.pos.z);
+    const p1 = new Vector2(b.pos.x, b.pos.z);
+    network.addSegment({
+      classId: 'rail_single',
+      a: a.id,
+      b: b.id,
+      ctrlA: p0.clone().lerp(p1, 1 / 3),
+      ctrlB: p0.clone().lerp(p1, 2 / 3),
+      gradeA: forward ? mainGrade : 0,
+      gradeB: forward ? 0 : mainGrade,
+    });
+  }
 
   // 側線への分岐。分岐器ができる。
   const branchNode = network.findNodeNear(new Vector3(railX, railY, roadZ + 120), 40);

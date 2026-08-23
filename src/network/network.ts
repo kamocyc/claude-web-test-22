@@ -3,6 +3,13 @@ import { Alignment } from '../core/alignment';
 import { HorizontalCurve, perp, type XZ } from '../core/curve';
 import { VerticalProfile } from '../core/profile';
 import { getClass, type NetworkClass } from './classes';
+import {
+  planStationLayout,
+  validateStationSpec,
+  type Station,
+  type StationId,
+  type StationSpec,
+} from './station';
 
 export type NodeId = number;
 export type SegmentId = number;
@@ -43,6 +50,8 @@ export interface NetSegment {
   gradeA: number;
   /** b 端の縦断勾配 dy/ds。 */
   gradeB: number;
+  /** Station ownership for tracks generated as part of a station. */
+  stationTrack?: { station: StationId; index: number };
 }
 
 /** ノードから見た 1 本の接続枝。交差点の解析はこの形で行う。 */
@@ -70,8 +79,10 @@ export interface Branch {
 export class Network {
   private nextNodeId = 1;
   private nextSegmentId = 1;
+  private nextStationId = 1;
   readonly nodes = new Map<NodeId, NetNode>();
   readonly segments = new Map<SegmentId, NetSegment>();
+  readonly stations = new Map<StationId, Station>();
   private alignmentCache = new Map<SegmentId, Alignment>();
   version = 0;
 
@@ -112,6 +123,7 @@ export class Network {
     via?: Vector2[];
     gradeA: number;
     gradeB: number;
+    stationTrack?: { station: StationId; index: number };
   }): NetSegment {
     const seg: NetSegment = {
       id: this.nextSegmentId++,
@@ -122,6 +134,7 @@ export class Network {
       ctrlB: params.ctrlB.clone(),
       gradeA: params.gradeA,
       gradeB: params.gradeB,
+      stationTrack: params.stationTrack,
     };
     if (params.via && params.via.length > 0) seg.via = params.via.map((p) => p.clone());
     this.segments.set(seg.id, seg);
@@ -170,6 +183,16 @@ export class Network {
   }
 
   removeSegment(id: SegmentId): void {
+    const seg = this.segments.get(id);
+    if (!seg) return;
+    if (seg.stationTrack) {
+      this.removeStation(seg.stationTrack.station);
+      return;
+    }
+    this.removeSegmentOnly(id);
+  }
+
+  private removeSegmentOnly(id: SegmentId): void {
     const seg = this.segments.get(id);
     if (!seg) return;
     this.segments.delete(id);
@@ -252,6 +275,7 @@ export class Network {
    */
   splitSegment(id: SegmentId, s: number): NetNode {
     const seg = this.getSegment(id);
+    if (seg.stationTrack) throw new Error('駅構内の線路は分割できません');
     const al = this.alignmentOf(id);
     const L = al.length;
     const cut = Math.max(0.5, Math.min(L - 0.5, s));
@@ -423,9 +447,83 @@ export class Network {
   clear(): void {
     this.nodes.clear();
     this.segments.clear();
+    this.stations.clear();
     this.nextNodeId = 1;
     this.nextSegmentId = 1;
+    this.nextStationId = 1;
     this.touch();
+  }
+
+  /** Create a complete station and its independently connectable straight tracks. */
+  addStation(spec: StationSpec): Station {
+    const errors = validateStationSpec(spec);
+    if (errors.length > 0) throw new Error(errors.join(' / '));
+    const id = this.nextStationId++;
+    const layout = planStationLayout(spec.trackCount, spec.platformCount);
+    const forward = new Vector2(Math.cos(spec.heading), Math.sin(spec.heading));
+    const right = perp(forward);
+    const half = spec.length / 2;
+    const tracks = layout.tracks.map((track) => {
+      const center = new Vector2(spec.center.x, spec.center.z).addScaledVector(right, track.offset);
+      const low = center.clone().addScaledVector(forward, -half);
+      const high = center.clone().addScaledVector(forward, half);
+      const p0 = track.forward ? low : high;
+      const p1 = track.forward ? high : low;
+      const a = this.addNode(new Vector3(p0.x, spec.center.y, p0.y));
+      const b = this.addNode(new Vector3(p1.x, spec.center.y, p1.y));
+      const segment = this.addSegment({
+        classId: 'rail_single',
+        a: a.id,
+        b: b.id,
+        ctrlA: p0.clone().lerp(p1, 1 / 3),
+        ctrlB: p0.clone().lerp(p1, 2 / 3),
+        gradeA: 0,
+        gradeB: 0,
+        stationTrack: { station: id, index: track.index },
+      });
+      return { ...track, segment: segment.id };
+    });
+    const station: Station = {
+      id,
+      name: spec.name.trim(),
+      center: spec.center.clone(),
+      heading: spec.heading,
+      length: spec.length,
+      trackCount: spec.trackCount,
+      platformCount: spec.platformCount,
+      elevated: spec.elevated,
+      tracks,
+      platforms: layout.platforms,
+      minOffset: layout.minOffset,
+      maxOffset: layout.maxOffset,
+    };
+    this.stations.set(id, station);
+    this.touch();
+    return station;
+  }
+
+  renameStation(id: StationId, name: string): void {
+    const station = this.stations.get(id);
+    if (!station) throw new Error(`unknown station ${id}`);
+    const next = name.trim();
+    if (next.length === 0 || next.length > 40) throw new Error('駅名は1〜40文字で指定してください');
+    if (station.name === next) return;
+    station.name = next;
+    this.touch();
+  }
+
+  removeStation(id: StationId): void {
+    const station = this.stations.get(id);
+    if (!station) return;
+    this.stations.delete(id);
+    for (const track of station.tracks) this.removeSegmentOnly(track.segment);
+    this.pruneOrphanNodes();
+    this.touch();
+  }
+
+  stationForSegment(id: SegmentId): Station | null {
+    const ref = this.segments.get(id)?.stationTrack;
+    return ref ? this.stations.get(ref.station) ?? null : null;
   }
 
   /** 接続枝の外向き法線 (右手側)。 */

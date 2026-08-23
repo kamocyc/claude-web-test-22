@@ -130,6 +130,33 @@
         font-weight: 600;
       }
 
+      .text-input,
+      .select-input {
+        min-width: 0;
+        padding: 6px 8px;
+        border: 1px solid var(--border);
+        border-radius: 7px;
+        background: rgba(255, 255, 255, 0.07);
+        color: var(--text);
+        font: inherit;
+      }
+
+      .text-input {
+        width: 100%;
+      }
+
+      .select-input {
+        flex: 1 1 auto;
+      }
+
+      .station-editor {
+        margin-top: 8px;
+      }
+
+      .station-editor .text-input {
+        flex: 1 1 130px;
+      }
+
       .hint {
         margin: 6px 0 0;
         color: var(--muted);
@@ -252,6 +279,28 @@
         color: var(--muted);
         line-height: 1.6;
         pointer-events: auto;
+      }
+
+      .underground-badge {
+        position: absolute;
+        top: 14px;
+        left: 50%;
+        translate: -50% 0;
+        padding: 7px 13px;
+        border: 1px solid rgba(91, 216, 255, 0.65);
+        border-radius: 999px;
+        background: rgba(7, 31, 48, 0.88);
+        color: #9be8ff;
+        font-weight: 650;
+        letter-spacing: 0.04em;
+        opacity: 0;
+        transform: translateY(-8px);
+        transition: opacity 0.16s ease, transform 0.16s ease;
+      }
+
+      body.underground-view .underground-badge {
+        opacity: 1;
+        transform: translateY(0);
       }
 
       .help b {

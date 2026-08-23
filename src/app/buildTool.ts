@@ -4,6 +4,7 @@ import { MeshBuilder } from '../core/meshbuilder';
 import { VerticalProfile } from '../core/profile';
 import { DEG, clamp } from '../core/units';
 import { buildRibbon, profileFor } from '../build/surface';
+import { buildStationPreview } from '../build/station';
 import { getClass, type NetworkClass } from '../network/classes';
 import {
   anchorFromNode,
@@ -24,12 +25,27 @@ import {
 } from '../network/parallel';
 import { checkPlacement, junctionReach } from '../network/rules';
 import {
+  planStationLayout,
+  stationPlatformRange,
+  validateStationSpec,
+  type Station,
+  type StationId,
+  type StationLength,
+  type StationSpec,
+} from '../network/station';
+import { checkStationPlacement } from '../network/stationPlacement';
+import {
   placeScissorsCrossover,
   scissorsPlanAt,
   type ScissorsPlan,
 } from '../network/scissors';
 import { evaluateAlignment, type SegmentDiagnostics } from '../network/validation';
 import { createPreviewMaterial, riskTint, setPreviewBlocked } from '../render/materials';
+import {
+  ELEVATION_GUIDE_STEP,
+  ElevationGuideView,
+  type ElevationGuidePoint,
+} from '../render/elevationGuide';
 import { SnapView, type SnapKind, type SnapMarker } from '../render/snapView';
 import {
   inspectPoint,
@@ -40,7 +56,15 @@ import {
 } from './inspect';
 import type { Heightfield } from '../terrain/heightfield';
 
-export type ToolMode = 'build' | 'scissors' | 'bulldoze' | 'inspect';
+export type ToolMode = 'build' | 'station' | 'scissors' | 'bulldoze' | 'inspect';
+
+export interface StationToolSettings {
+  name: string;
+  trackCount: number;
+  platformCount: number;
+  length: StationLength;
+  heading: number;
+}
 
 export interface CursorModifiers {
   /** Shift: 直線・角度スナップ。 */
@@ -66,6 +90,8 @@ export interface ToolStatus {
   hoverSegment: SegmentId | null;
   /** 確認モードでカーソル下にある点 (無ければ null)。 */
   inspect: PointInspection | null;
+  selectedStation: Station | null;
+  station: StationToolSettings;
   cost: number;
   /** 平行スナップが有効か。 */
   parallelSnap: boolean;
@@ -82,7 +108,7 @@ interface Target {
   marker: SnapMarker | null;
 }
 
-const ELEVATION_STEP = 3;
+const ELEVATION_STEP = ELEVATION_GUIDE_STEP;
 
 /**
  * 吸い付く相手と「今働いている高さ」の差の上限 [m]。
@@ -129,6 +155,7 @@ export class BuildTool {
 
   readonly previewGroup = new Group();
   private readonly snapView = new SnapView();
+  private readonly elevationGuideView = new ElevationGuideView();
   private readonly previewMesh: Mesh;
   private readonly previewMaterial: MeshStandardMaterial;
   private anchor: Anchor | null = null;
@@ -150,6 +177,15 @@ export class BuildTool {
   private scissorsPlan: ScissorsPlan | null = null;
   /** 確認モードで読み取った、カーソル下の 1 点。 */
   private inspection: PointInspection | null = null;
+  private selectedStationId: StationId | null = null;
+  private stationCandidate: Station | null = null;
+  private stationSettings: StationToolSettings = {
+    name: '駅 1',
+    trackCount: 2,
+    platformCount: 2,
+    length: 120,
+    heading: 0,
+  };
   /** グラフ用のサンプル列。同じ線形を指している間は作り直さない。 */
   private inspectProfile: { segment: SegmentId; version: number; profile: InspectProfile } | null =
     null;
@@ -168,7 +204,7 @@ export class BuildTool {
     this.previewMaterial = createPreviewMaterial();
     this.previewMesh = new Mesh(new MeshBuilder().build(), this.previewMaterial);
     this.previewMesh.frustumCulled = false;
-    this.previewGroup.add(this.previewMesh, this.snapView.group);
+    this.previewGroup.add(this.previewMesh, this.snapView.group, this.elevationGuideView.group);
   }
 
   get cls(): NetworkClass {
@@ -178,6 +214,30 @@ export class BuildTool {
   setMode(mode: ToolMode): void {
     this.mode = mode;
     this.cancel();
+  }
+
+  setStationSettings(patch: Partial<Omit<StationToolSettings, 'heading'>>): void {
+    this.stationSettings = { ...this.stationSettings, ...patch };
+    const range = stationPlatformRange(this.stationSettings.trackCount);
+    this.stationSettings.platformCount = clamp(
+      Math.round(this.stationSettings.platformCount),
+      range.min,
+      range.max,
+    );
+    this.updateStationPreview();
+  }
+
+  rotateStation(steps: number): void {
+    this.stationSettings.heading += steps * ANGLE_SNAP;
+    this.stationSettings.heading = Math.atan2(
+      Math.sin(this.stationSettings.heading),
+      Math.cos(this.stationSettings.heading),
+    );
+    this.updateStationPreview();
+  }
+
+  selectStation(id: StationId | null): void {
+    this.selectedStationId = id !== null && this.network.stations.has(id) ? id : null;
   }
 
   setClass(classId: string): void {
@@ -216,6 +276,9 @@ export class BuildTool {
     this.scissorsPlan = null;
     this.inspection = null;
     this.inspectProfile = null;
+    this.stationCandidate = null;
+    this.selectedStationId = null;
+    this.elevationGuideView.update([]);
     this.updatePreviewMesh();
   }
 
@@ -230,12 +293,19 @@ export class BuildTool {
       this.preview = null;
       this.showMarkers(this.anchorMarker ? [this.anchorMarker] : []);
       this.scissorsPlan = null;
+      this.elevationGuideView.update([]);
       if (this.mode === 'scissors') this.blockers = [];
       this.updatePreviewMesh();
       return;
     }
 
+    if (this.mode === 'station') {
+      this.updateStationPreview();
+      return;
+    }
+
     if (this.mode === 'bulldoze' || this.mode === 'inspect') {
+      this.elevationGuideView.update([]);
       // 撤去・確認も指した高さのものを選ぶ (橋を指せば橋、下の道を
       // 指せば下の道)。カーソルは路面にも当たるので、橋の上を指せば
       // 橋の高さが返ってくる。
@@ -264,6 +334,7 @@ export class BuildTool {
     }
 
     if (this.mode === 'scissors') {
+      this.elevationGuideView.update([]);
       const result = scissorsPlanAt(this.network, cursor);
       this.scissorsPlan = result.plan;
       this.hoverSegment = result.hoverSegment;
@@ -279,6 +350,43 @@ export class BuildTool {
   }
 
   private modifiers: CursorModifiers = { straight: false, noSnap: false };
+
+  private updateStationPreview(): void {
+    if (this.mode !== 'station' || !this.cursor) {
+      this.stationCandidate = null;
+      this.elevationGuideView.update([]);
+      if (this.mode === 'station') this.updatePreviewMesh();
+      return;
+    }
+    const y = this.field.heightAt(this.cursor.x, this.cursor.z) + Math.max(0, this.elevationOffset);
+    const spec: StationSpec = {
+      ...this.stationSettings,
+      center: new Vector3(this.cursor.x, y, this.cursor.z),
+      elevated: this.elevationOffset > 0,
+    };
+    const layout = planStationLayout(spec.trackCount, spec.platformCount);
+    this.stationCandidate = {
+      id: 0,
+      ...spec,
+      center: spec.center.clone(),
+      tracks: layout.tracks.map((track) => ({ ...track, segment: -1 })),
+      platforms: layout.platforms,
+      minOffset: layout.minOffset,
+      maxOffset: layout.maxOffset,
+    };
+    this.blockers = [
+      ...(this.elevationOffset < 0 ? ['地下駅には対応していません'] : []),
+      ...validateStationSpec(spec),
+      ...checkStationPlacement(this.network, spec),
+    ];
+    this.snapKind = 'none';
+    this.preview = null;
+    this.showMarkers([]);
+    this.updateElevationGuides(
+      this.elevationOffset > 0 && this.stationCandidate ? [this.stationCandidate.center] : [],
+    );
+    this.updatePreviewMesh();
+  }
 
   /**
    * 今どの高さで働いているか。
@@ -559,12 +667,16 @@ export class BuildTool {
       this.endAnchor = null;
       this.parallelAlignmentPreview = null;
       this.showMarkers([target.marker]);
+      this.updateElevationGuides([target.anchor.pos]);
       this.updatePreviewMesh();
       return;
     }
 
     // 平行に敷いている間は、基準の線形をそのまま横にずらした線形を引く。
     if (this.parallel && !this.modifiers.noSnap && this.parallelPreview()) {
+      this.updateElevationGuides(
+        this.endAnchor ? [this.anchor.pos, this.endAnchor.pos] : [this.anchor.pos],
+      );
       this.updatePreviewMesh();
       return;
     }
@@ -583,7 +695,24 @@ export class BuildTool {
     // (角度スナップで位置をずらすのは、どこにも吸い付いていないときだけ
     //  なので、そのときは target.marker が無い。)
     this.showMarkers([this.anchorMarker, target.marker]);
+    this.updateElevationGuides([this.anchor.pos, end.pos]);
     this.updatePreviewMesh();
+  }
+
+  /** 地表の対応点から実際の敷設高さまでを、目盛付きの垂線で示す。 */
+  private updateElevationGuides(points: readonly Vector3[]): void {
+    if (
+      this.elevationOffset === 0 ||
+      (this.mode !== 'build' && this.mode !== 'station')
+    ) {
+      this.elevationGuideView.update([]);
+      return;
+    }
+    const guides: ElevationGuidePoint[] = points.map((point) => ({
+      point: point.clone(),
+      groundY: this.field.heightAt(point.x, point.z),
+    }));
+    this.elevationGuideView.update(guides);
   }
 
   /**
@@ -673,7 +802,10 @@ export class BuildTool {
   private updatePreviewMesh(): void {
     const mb = new MeshBuilder();
     const preview = this.preview;
-    if (this.scissorsPlan) {
+    if (this.mode === 'station' && this.stationCandidate) {
+      buildStationPreview(mb, this.stationCandidate);
+      this.lastDiagnostics = null;
+    } else if (this.scissorsPlan) {
       const cls = getClass(this.scissorsPlan.classId);
       for (const connection of this.scissorsPlan.connections) {
         buildRibbon(mb, connection.alignment.sample(2), profileFor(cls), {
@@ -696,7 +828,7 @@ export class BuildTool {
         field: this.field,
       }).blockers;
       buildRibbon(mb, alignment.sample(2), profileFor(cls), { skirt: false, cls });
-    } else if (this.mode !== 'scissors') {
+    } else if (this.mode !== 'scissors' && this.mode !== 'station') {
       this.lastDiagnostics = null;
       this.blockers = [];
     }
@@ -719,7 +851,26 @@ export class BuildTool {
       }
       return;
     }
-    if (this.mode === 'inspect') return;
+    if (this.mode === 'inspect') {
+      this.selectedStationId = this.inspection?.station?.id ?? null;
+      return;
+    }
+    if (this.mode === 'station') {
+      if (!this.stationCandidate || this.blockers.length > 0) return;
+      this.network.addStation({
+        name: this.stationCandidate.name,
+        center: this.stationCandidate.center,
+        heading: this.stationCandidate.heading,
+        length: this.stationCandidate.length,
+        trackCount: this.stationCandidate.trackCount,
+        platformCount: this.stationCandidate.platformCount,
+        elevated: this.stationCandidate.elevated,
+      });
+      this.stationSettings.name = this.nextStationName();
+      this.onChanged();
+      this.updateStationPreview();
+      return;
+    }
     if (this.mode === 'scissors') {
       if (!this.scissorsPlan || this.blockers.length > 0) return;
       placeScissorsCrossover(this.network, this.scissorsPlan);
@@ -737,7 +888,15 @@ export class BuildTool {
       this.anchorMarker = target.marker ? { ...target.marker, fixed: true } : null;
       // 始点が既存の線形の隣なら、そこから平行に敷き始める。既に敷いた
       // 平行線の端 (ノード) から続ける場合も同じ。
-      this.parallel = this.findParallel(target.anchor.pos);
+      // 駅端では隣の構内線を平行スナップの基準にすると、基準線が駅端で
+      // 終わっているためプレビューまで消えてしまう。構内線は各端点から
+      // 1 本ずつ独立して延長する。
+      const stationEndpoint =
+        target.anchor.node !== undefined &&
+        this.network
+          .branchesAt(target.anchor.node)
+          .some((branch) => this.network.getSegment(branch.segment).stationTrack !== undefined);
+      this.parallel = stationEndpoint ? null : this.findParallel(target.anchor.pos);
       this.refreshPreview();
       return;
     }
@@ -749,6 +908,7 @@ export class BuildTool {
 
     const preview = this.preview;
     const result = placeSegment(this.network, this.classId, this.anchor, this.endAnchor, preview);
+    this.alignRailDirection(result.segment, result.startNode, result.endNode);
 
     // 終点を始点にして続けて引けるようにする。接線は敷設後の線形から
     // 取り直す (折れをなめらかにした分だけ、プレビューとずれるため)。
@@ -784,14 +944,46 @@ export class BuildTool {
     return anchorFromNode(this.network, end, this.cls);
   }
 
+  /**
+   * Rails are directional. At a simple end-to-end joint, make one segment arrive
+   * and the other depart regardless of which end the user drew from. A station
+   * track takes priority when the endpoint is also part of a larger junction.
+   */
+  private alignRailDirection(segmentId: SegmentId, startNode: NodeId, endNode: NodeId): void {
+    const segment = this.network.segments.get(segmentId);
+    if (!segment || this.cls.kind !== 'rail') return;
+    let shouldReverse: boolean | null = null;
+    for (const nodeId of [startNode, endNode]) {
+      const connectedRails = this.network
+        .branchesAt(nodeId)
+        .map((branch) => this.network.getSegment(branch.segment))
+        .filter(
+          (candidate) =>
+            candidate.id !== segmentId && this.network.classOf(candidate).kind === 'rail',
+        );
+      const reference =
+        connectedRails.find((candidate) => candidate.stationTrack !== undefined) ??
+        (connectedRails.length === 1 ? connectedRails[0] : undefined);
+      if (!reference) continue;
+      const referenceArrives = reference.b === nodeId;
+      const newArrives = segment.b === nodeId;
+      const needed = referenceArrives === newArrives;
+      if (shouldReverse === null) shouldReverse = needed;
+      else if (shouldReverse !== needed) return;
+    }
+    if (shouldReverse) this.network.reverseSegment(segmentId);
+  }
+
   status(): ToolStatus {
     const preview = this.preview;
-    const length = this.scissorsPlan?.length ?? (preview ? preview.horizontal.length : 0);
+    const length = this.mode === 'station'
+      ? this.stationSettings.length * this.stationSettings.trackCount
+      : this.scissorsPlan?.length ?? (preview ? preview.horizontal.length : 0);
     return {
       mode: this.mode,
       classId: this.classId,
       elevation: this.elevationOffset,
-      drawing: this.anchor !== null || this.scissorsPlan !== null,
+      drawing: this.mode === 'station' ? this.stationCandidate !== null : this.anchor !== null || this.scissorsPlan !== null,
       length,
       radius: this.scissorsPlan
         ? Math.min(...this.scissorsPlan.connections.map((item) => item.preview.radius))
@@ -808,6 +1000,9 @@ export class BuildTool {
       markers: this.markers,
       hoverSegment: this.hoverSegment,
       inspect: this.inspection,
+      selectedStation:
+        this.selectedStationId === null ? null : this.network.stations.get(this.selectedStationId) ?? null,
+      station: { ...this.stationSettings },
       cost:
         length *
         (this.scissorsPlan ? getClass(this.scissorsPlan.classId).costPerMeter : this.cls.costPerMeter),
@@ -815,5 +1010,12 @@ export class BuildTool {
       parallelSnap: this.parallelSnap,
       parallelTo: this.parallel?.segment ?? null,
     };
+  }
+
+  private nextStationName(): string {
+    let index = this.network.stations.size + 1;
+    const used = new Set([...this.network.stations.values()].map((station) => station.name));
+    while (used.has(`駅 ${index}`)) index++;
+    return `駅 ${index}`;
   }
 }

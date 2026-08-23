@@ -27,12 +27,22 @@ interface Chunk {
 export class TerrainMesh {
   readonly group = new Group();
   private readonly chunks: Chunk[] = [];
+  private readonly normalAppearance: {
+    transparent: boolean;
+    opacity: number;
+    depthWrite: boolean;
+  };
 
   constructor(
     private readonly field: Heightfield,
-    material: Material,
+    private readonly material: Material,
   ) {
     this.group.name = 'terrain';
+    this.normalAppearance = {
+      transparent: material.transparent,
+      opacity: material.opacity,
+      depthWrite: material.depthWrite,
+    };
     const size = TERRAIN_CHUNK_CELLS;
     for (let iz0 = 0; iz0 < field.cells; iz0 += size) {
       for (let ix0 = 0; ix0 < field.cells; ix0 += size) {
@@ -42,6 +52,18 @@ export class TerrainMesh {
       }
     }
     this.update();
+  }
+
+  /** 地下ビューでは地形を薄い覆いにして、地中の線形を透かして見せる。 */
+  setUndergroundView(active: boolean): void {
+    this.material.transparent = active || this.normalAppearance.transparent;
+    this.material.opacity = active ? 0.3 : this.normalAppearance.opacity;
+    this.material.depthWrite = active ? false : this.normalAppearance.depthWrite;
+    this.material.needsUpdate = true;
+    for (const chunk of this.chunks) {
+      chunk.mesh.renderOrder = active ? 6 : 0;
+      chunk.mesh.receiveShadow = !active;
+    }
   }
 
   private createChunk(
