@@ -170,7 +170,9 @@ export class Ui {
       zoneRow.append(button);
     }
     left.append(zoneRow);
-    left.append(hint('道路沿いのマス目を塗ると建物が建ちます。道路を消すとその区画も無くなります'));
+    left.append(
+      hint('道路沿いのマス目を塗ると建物が建ちます。広く塗るほどマスがまとまって大きな建物になります'),
+    );
 
     left.append(sectionTitle('種別'));
     for (const cls of NETWORK_CLASSES) {
@@ -530,7 +532,7 @@ export class Ui {
       ['分岐器', `${s.turnouts}`],
       ['踏切', `${s.levelCrossings}`],
       ['駅', `${s.stations}`],
-      ['区画', `${s.buildings} / ${s.lots}`],
+      ['建物', `${s.buildings} 棟 / ${s.zoneCells} マス`],
       ['高架', `${s.bridgeLength.toFixed(0)} m`],
       ['トンネル', `${s.tunnelLength.toFixed(0)} m`],
       ['総延長', `${s.totalLength.toFixed(0)} m`],

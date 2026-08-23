@@ -125,7 +125,7 @@ import {
   createPropMaterial,
   createSurfaceMaterial,
 } from './materials';
-import { ZoneMap, planLots, type Lot } from '../network/zoning';
+import { ZoneMap, planZoning, type Lot, type ZoneCell } from '../network/zoning';
 
 export interface WorldWarning {
   message: string;
@@ -148,9 +148,9 @@ export interface WorldStats {
   roadNetworks: number;
   railNetworks: number;
   powerNetworks: number;
-  /** 沿道に割り付けた区画の数。 */
-  lots: number;
-  /** 用途を塗った区画のうち、実際に建物が建った数。 */
+  /** 沿道に割り付けた区画のマスの数。 */
+  zoneCells: number;
+  /** マスをまとめて建てた建物の数。 */
   buildings: number;
 }
 
@@ -185,7 +185,9 @@ export interface BuildResult {
   blends: Map<SegmentId, SurfaceBlend[]>;
   /** 平行に並んでいると判定した線形のまとまり。 */
   parallelGroups: ParallelGroup[];
-  /** 沿道に割り付けた区画。 */
+  /** 沿道に割り付けた区画のマス目。 */
+  zoneCells: ZoneCell[];
+  /** マスをまとめた、建物 1 棟ぶんの敷地。 */
   lots: Lot[];
 }
 
@@ -313,6 +315,7 @@ export class WorldBuilder {
   /** 地下ビューの最中か。地上の表示を出すかどうかの判断に使う。 */
   private undergroundView = false;
   /** 直近の rebuild で割り付けた区画。 */
+  zoneCells: ZoneCell[] = [];
   lots: Lot[] = [];
   /** 選択色で塗る車両の番号 (乗る車両を選んでいるとき)。 */
   highlightVehicle: number | null = null;
@@ -592,7 +595,7 @@ export class WorldBuilder {
       roadNetworks: 0,
       railNetworks: 0,
       powerNetworks: 0,
-      lots: 0,
+      zoneCells: 0,
       buildings: 0,
     };
     const diagnostics = new Map<SegmentId, SegmentDiagnostics>();
@@ -705,7 +708,7 @@ export class WorldBuilder {
     // 沿道の区画と建物。道路・線路・交差点の索引ができたあとに割り付ける。
     const zoneGrid = new MeshBuilder();
     const buildings = new MeshBuilder();
-    this.lots = planLots({
+    const zoning = planZoning({
       network,
       structures,
       ranges,
@@ -713,14 +716,13 @@ export class WorldBuilder {
       field: this.field,
       zones: this.zones,
     });
+    this.zoneCells = zoning.cells;
+    this.lots = zoning.lots;
     const groundAt = (x: number, z: number): number => this.field.heightAt(x, z);
-    buildZoneGrid(zoneGrid, this.lots, groundAt);
-    for (const lot of this.lots) {
-      if (!lot.zone || !lot.buildable) continue;
-      buildBuilding(buildings, lot, groundAt);
-      stats.buildings++;
-    }
-    stats.lots = this.lots.length;
+    buildZoneGrid(zoneGrid, this.zoneCells, groundAt);
+    for (const lot of this.lots) buildBuilding(buildings, lot, groundAt);
+    stats.zoneCells = this.zoneCells.length;
+    stats.buildings = this.lots.length;
 
     const power = this.buildPower(structure, structures, ranges);
     const powerNetworks = countPowerNetworks(power.poles, power.spans);
@@ -758,6 +760,7 @@ export class WorldBuilder {
       power,
       blends,
       parallelGroups,
+      zoneCells: this.zoneCells,
       lots: this.lots,
     };
   }

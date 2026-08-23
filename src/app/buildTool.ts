@@ -60,8 +60,8 @@ import type { Heightfield } from '../terrain/heightfield';
 
 export type ToolMode = 'build' | 'station' | 'zone' | 'scissors' | 'bulldoze' | 'inspect';
 
-/** 区画を塗る筆の半径 [m]。 */
-export const ZONE_BRUSH_RADIUS = 26;
+/** 区画を塗る筆の半径 [m]。沿道の全奥行き (`ZONE_DEPTH`) は覆える太さにする。 */
+export const ZONE_BRUSH_RADIUS = 20;
 
 export interface StationToolSettings {
   name: string;
