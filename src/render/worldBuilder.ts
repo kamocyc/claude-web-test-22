@@ -1278,6 +1278,8 @@ export class WorldBuilder {
               grading.stampQuad(quad[0], quad[1], quad[2], quad[3], {
                 ignoreProtected: cls.kind === 'road',
                 distance: bandDistance(o0, o1),
+                // footprint の外周は路肩の余裕幅 (margins) が持っている。
+                interior: true,
               });
             } else {
               margins.push({ quad });
@@ -1376,10 +1378,20 @@ export class WorldBuilder {
         const quad = [a[i], a[j], b[j], b[i]];
         // いちばん外側の帯は路肩の余裕幅なので、他の舗装より後で焼く。
         if (k === 0) margins.push({ quad });
-        else grading.stampQuad(quad[0], quad[1], quad[2], quad[3], { ignoreProtected, distance });
+        else {
+          grading.stampQuad(quad[0], quad[1], quad[2], quad[3], {
+            ignoreProtected,
+            distance,
+            interior: true,
+          });
+        }
       }
     }
-    grading.stampPolygon(bands[bands.length - 1], { ignoreProtected, distance: 0 });
+    grading.stampPolygon(bands[bands.length - 1], {
+      ignoreProtected,
+      distance: 0,
+      interior: true,
+    });
   }
 
   // ------------------------------------------------------------ セグメント

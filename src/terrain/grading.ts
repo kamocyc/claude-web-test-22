@@ -5,6 +5,18 @@ import type { Heightfield } from './heightfield';
 
 const INF = Infinity;
 
+/**
+ * 法面の起点として、footprint の**連続な縁**からの距離を直接求める帯の幅
+ * (セル数)。
+ *
+ * 伝播だけに任せると、法面は「footprint の**内側の格子点**」からの円錐の
+ * 下側包絡になる。格子点の並びは斜めの縁では階段状なので、縁からの距離が
+ * 最大で半セル分ばらつき、法面が道路に沿ってぎざぎざに波打つ (セルを
+ * 粗くするほど目立つ)。この帯の中だけは三角形の縁までの距離を厳密に
+ * 求めて上限・下限を置き、そこから先を伝播させる。
+ */
+const EDGE_BAND_CELLS = 1;
+
 /** 格子添字で表した矩形 (両端を含む)。 */
 export interface GridRegion {
   ix0: number;
@@ -41,6 +53,16 @@ export interface StampOptions {
   /** 保護領域 (踏切の舗装の下) を無視して焼き込む。道路側だけが使う。 */
   ignoreProtected?: boolean;
   /**
+   * その三角形が footprint の**内側にしかない**か (外周を含まない)。
+   *
+   * 既定では、焼き込む三角形のまわりの格子点に「縁からの厳密な距離」で
+   * 法面の上限・下限を置く (`EDGE_BAND_CELLS`)。内側の帯にこれをしても
+   * 結果は変わらない (内側の縁は外周より必ず遠い) 一方、細い帯ほど周囲の
+   * 格子点が増えて無駄が大きいので、外周を含まないと分かっている帯は
+   * これを立てて省く。
+   */
+  interior?: boolean;
+  /**
    * その帯が中心線からどれだけ離れているか [m]。
    *
    * 高さの違う舗装どうしが重なったとき、常に低い方を採ると高い方が宙に
@@ -72,6 +94,8 @@ export class TerrainGrading {
   private readonly ceiling: Float32Array;
   private readonly upper: Float32Array;
   private readonly lower: Float32Array;
+  private readonly edgeUpper: Float32Array;
+  private readonly edgeLower: Float32Array;
   private readonly protectedRects: ProtectedRect[] = [];
   /**
    * いま焼き込んだ範囲と、前回 `apply` で地形を書き換えた範囲。
@@ -93,6 +117,8 @@ export class TerrainGrading {
     this.ceiling = new Float32Array(n).fill(INF);
     this.upper = new Float32Array(n).fill(INF);
     this.lower = new Float32Array(n).fill(-INF);
+    this.edgeUpper = new Float32Array(n).fill(INF);
+    this.edgeLower = new Float32Array(n).fill(-INF);
   }
 
   reset(): void {
@@ -103,6 +129,8 @@ export class TerrainGrading {
       this.coreDistance[i] = 0;
       this.blocked[i] = 0;
       this.ceiling[i] = INF;
+      this.edgeUpper[i] = INF;
+      this.edgeLower[i] = -INF;
     });
     this.stamped = null;
     this.protectedRects.length = 0;
@@ -161,7 +189,7 @@ export class TerrainGrading {
     const core = options.core ?? true;
     const distance = options.distance ?? 0;
     const respectProtected = !options.ignoreProtected && this.protectedRects.length > 0;
-    this.rasterize(a, b, c, (i, y, x, z) => {
+    const write = (i: number, y: number, x: number, z: number): void => {
       if (respectProtected && this.isProtected(x, z)) return;
       if (!core) {
         // 余裕幅は、舗装が押さえている格子点には触らない。
@@ -182,6 +210,19 @@ export class TerrainGrading {
       }
       this.seeded[i] = 1;
       this.blocked[i] = 0;
+    };
+    if (options.interior) {
+      this.rasterize(a, b, c, write);
+      return;
+    }
+    this.rasterize(a, b, c, write, (i, y, toEdge, x, z) => {
+      if (respectProtected && this.isProtected(x, z)) return;
+      // 縁の高さから法面勾配で伸ばした上限・下限。複数の縁が届く所は、
+      // 伝播と同じ min-plus / max-minus の包絡を採る。
+      const upper = y + CUT_SLOPE * toEdge;
+      if (upper < this.edgeUpper[i]) this.edgeUpper[i] = upper;
+      const lower = y - FILL_SLOPE * toEdge;
+      if (lower > this.edgeLower[i]) this.edgeLower[i] = lower;
     });
   }
 
@@ -254,6 +295,11 @@ export class TerrainGrading {
     b: Vector3,
     c: Vector3,
     write: (index: number, y: number, x: number, z: number) => void,
+    /**
+     * 三角形の**外側**の格子点に対して、いちばん近い縁までの距離 [m] と
+     * そこでの高さを渡す。渡した場合は走査する帯もその分だけ広げる。
+     */
+    outside?: (index: number, y: number, toEdge: number, x: number, z: number) => void,
   ): void {
     const f = this.field;
     const ax = f.toGridX(a.x);
@@ -266,30 +312,71 @@ export class TerrainGrading {
     const area = (bx - ax) * (cz - az) - (cx - ax) * (bz - az);
     if (Math.abs(area) < 1e-9) return;
 
-    const minX = Math.max(0, Math.floor(Math.min(ax, bx, cx)) - 1);
-    const maxX = Math.min(f.cells, Math.ceil(Math.max(ax, bx, cx)) + 1);
-    const minZ = Math.max(0, Math.floor(Math.min(az, bz, cz)) - 1);
-    const maxZ = Math.min(f.cells, Math.ceil(Math.max(az, bz, cz)) + 1);
+    const pad = outside ? EDGE_BAND_CELLS : 1;
+    const minX = Math.max(0, Math.floor(Math.min(ax, bx, cx)) - pad);
+    const maxX = Math.min(f.cells, Math.ceil(Math.max(ax, bx, cx)) + pad);
+    const minZ = Math.max(0, Math.floor(Math.min(az, bz, cz)) - pad);
+    const maxZ = Math.min(f.cells, Math.ceil(Math.max(az, bz, cz)) + pad);
 
-    // 格子点が三角形の辺上に乗る場合を取りこぼさないよう、わずかに外側まで含める。
-    const eps = 0.06;
+    // 格子点が三角形の辺上に乗る場合を取りこぼさないよう、わずかに外側まで
+    // 含める (格子 0.06 マス分)。重心座標のままで許容量を決めると三角形の
+    // 大きさで意味が変わる (細長い三角形では 1 m 以上こぼれる) ので、辺
+    // からの**距離**で決めて重心座標に直す。
+    // (辺までの距離 = 重心座標 × その辺に対する高さ、高さ = |area| / 辺長。)
+    const slack = 0.06;
+    const eps0 = (slack * Math.hypot(bx - cx, bz - cz)) / Math.abs(area);
+    const eps1 = (slack * Math.hypot(cx - ax, cz - az)) / Math.abs(area);
+    const eps2 = (slack * Math.hypot(ax - bx, az - bz)) / Math.abs(area);
 
     this.include(minX, minZ, maxX, maxZ);
 
+    // 縁までの距離を測る作業変数。点ごとに閉包を作らないよう外に置く。
+    let bestD2 = 0;
+    let bestY = 0;
+    const consider = (
+      px: number,
+      pz: number,
+      x0: number,
+      z0: number,
+      y0: number,
+      x1: number,
+      z1: number,
+      y1: number,
+    ): void => {
+      const ex = x1 - x0;
+      const ez = z1 - z0;
+      const len2 = ex * ex + ez * ez;
+      let t = len2 > 1e-12 ? ((px - x0) * ex + (pz - z0) * ez) / len2 : 0;
+      t = t < 0 ? 0 : t > 1 ? 1 : t;
+      const qx = px - (x0 + ex * t);
+      const qz = pz - (z0 + ez * t);
+      const d2 = qx * qx + qz * qz;
+      if (d2 < bestD2) {
+        bestD2 = d2;
+        bestY = y0 + (y1 - y0) * t;
+      }
+    };
+
     for (let iz = minZ; iz <= maxZ; iz++) {
+      const wz = f.worldZ(iz);
       for (let ix = minX; ix <= maxX; ix++) {
         const px = ix;
         const pz = iz;
+        const index = f.index(ix, iz);
         const w0 = ((bx - px) * (cz - pz) - (cx - px) * (bz - pz)) / area;
         const w1 = ((cx - px) * (az - pz) - (ax - px) * (cz - pz)) / area;
         const w2 = 1 - w0 - w1;
-        if (w0 < -eps || w1 < -eps || w2 < -eps) continue;
-        write(
-          f.index(ix, iz),
-          w0 * a.y + w1 * b.y + w2 * c.y,
-          f.worldX(ix),
-          f.worldZ(iz),
-        );
+        if (w0 >= -eps0 && w1 >= -eps1 && w2 >= -eps2) {
+          write(index, w0 * a.y + w1 * b.y + w2 * c.y, f.worldX(ix), wz);
+        } else if (outside && !this.seeded[index]) {
+          // 焼き込まれた格子点は目標高さそのものを使うので、縁からの距離は要らない。
+          // 三角形の 3 辺への垂線の足のうち、いちばん近いものを採る。
+          bestD2 = INF;
+          consider(px, pz, ax, az, a.y, bx, bz, b.y);
+          consider(px, pz, bx, bz, b.y, cx, cz, c.y);
+          consider(px, pz, cx, cz, c.y, ax, az, a.y);
+          outside(index, bestY, Math.sqrt(bestD2) * f.cell, f.worldX(ix), wz);
+        }
       }
     }
   }
@@ -340,8 +427,9 @@ export class TerrainGrading {
           upper[i] = target[i];
           lower[i] = target[i];
         } else {
-          upper[i] = INF;
-          lower[i] = -INF;
+          // 縁の帯では、階段状の格子点ではなく連続な縁からの距離で始める。
+          upper[i] = this.edgeUpper[i];
+          lower[i] = this.edgeLower[i];
         }
       }
     }
