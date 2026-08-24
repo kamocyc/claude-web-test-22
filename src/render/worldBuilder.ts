@@ -81,6 +81,7 @@ import { solveJunctions, type Approach, type Junction } from '../network/junctio
 import { solveApproachLanes } from '../network/lanes';
 import type { Network, NodeId, SegmentId } from '../network/network';
 import { buildLaneGraph, signalPhaseOf, type LaneGraph } from '../sim/lanegraph';
+import { planLines, type LinePlan } from '../sim/lineRoute';
 import { signalStateAt } from '../sim/signals';
 import { Traffic } from '../sim/traffic';
 import { VehicleView } from './vehicles';
@@ -126,6 +127,8 @@ import {
   createSurfaceMaterial,
 } from './materials';
 import { ZoneMap, planZoning, type Lot, type ZoneCell } from '../network/zoning';
+import { LineMap } from '../network/line';
+import { buildLineOverlay } from '../build/lineOverlay';
 
 export interface WorldWarning {
   message: string;
@@ -152,6 +155,8 @@ export interface WorldStats {
   zoneCells: number;
   /** マスをまとめて建てた建物の数。 */
   buildings: number;
+  /** 引いた路線の数。 */
+  lines: number;
 }
 
 export type PropKind = 'signal' | 'stopSign' | 'crossingGate' | 'catenaryPole' | 'utilityPole';
@@ -189,6 +194,8 @@ export interface BuildResult {
   zoneCells: ZoneCell[];
   /** マスをまとめた、建物 1 棟ぶんの敷地。 */
   lots: Lot[];
+  /** 路線ごとの運転計画 (経路・折り返し・繋がっていない区間)。 */
+  lines: LinePlan[];
 }
 
 /** 配電線の系統数 (地中区間も繋がっているものとして数える)。 */
@@ -269,6 +276,8 @@ export class WorldBuilder {
   private readonly undergroundHighlightMesh: Mesh;
   /** 沿道の区画 (マス目)。区画ツールを使っている間だけ出す。 */
   private readonly zoneGridMesh: Mesh;
+  /** 路線の経路。路線ツールを使っている間だけ出す。 */
+  private readonly lineMesh: Mesh;
   /** 区画に建った建物。 */
   private readonly buildingMesh: Mesh;
   private readonly propGroup = new Group();
@@ -312,6 +321,17 @@ export class WorldBuilder {
   readonly zones = new ZoneMap();
   /** 区画のマス目を表示するか (区画ツールを使っている間)。 */
   showZones = false;
+  /**
+   * 引いた路線。
+   *
+   * 区画と同じで、持っているのは「どの駅にどの順で停まるか」だけ。経路は
+   * 敷き直すたびに引き直すので、線路を付け替えても路線は生き続ける。
+   */
+  readonly lines = new LineMap();
+  /** 直近の rebuild で引いた運転計画。 */
+  linePlans: LinePlan[] = [];
+  /** 路線の経路を表示するか (路線ツールを使っている間)。 */
+  showLines = false;
   /** 地下ビューの最中か。地上の表示を出すかどうかの判断に使う。 */
   private undergroundView = false;
   /** 直近の rebuild で割り付けた区画。 */
@@ -383,6 +403,22 @@ export class WorldBuilder {
     this.zoneGridMesh.name = 'zones';
     this.zoneGridMesh.renderOrder = 5;
     this.zoneGridMesh.visible = false;
+    this.lineMesh = new Mesh(
+      new MeshBuilder().build(),
+      new MeshBasicMaterial({
+        vertexColors: true,
+        transparent: true,
+        opacity: 0.95,
+        depthWrite: false,
+        polygonOffset: true,
+        polygonOffsetFactor: 0,
+        polygonOffsetUnits: -14,
+        side: DoubleSide,
+      }),
+    );
+    this.lineMesh.name = 'lines';
+    this.lineMesh.renderOrder = 6;
+    this.lineMesh.visible = false;
     this.buildingMesh = new Mesh(new MeshBuilder().build(), createPropMaterial());
     this.buildingMesh.name = 'buildings';
     this.buildingMesh.castShadow = true;
@@ -396,6 +432,7 @@ export class WorldBuilder {
       this.undergroundShadowMesh,
       this.undergroundHighlightMesh,
       this.zoneGridMesh,
+      this.lineMesh,
       this.buildingMesh,
       this.propGroup,
       this.vehicleView.group,
@@ -407,6 +444,12 @@ export class WorldBuilder {
     this.showZones = active;
     // 地下を見ている間は地上の表示を伏せる (地下ビューを抜けたら戻す)。
     this.zoneGridMesh.visible = active && !this.undergroundView;
+  }
+
+  /** 路線の経路の表示を切り替える。 */
+  setLineView(active: boolean): void {
+    this.showLines = active;
+    this.lineMesh.visible = active && !this.undergroundView;
   }
 
   /** 地形を透かし、地下区間だけを実際の深さで強調する。 */
@@ -421,6 +464,7 @@ export class WorldBuilder {
     setMeshFade(this.structureMesh, active ? 0.28 : 1, active);
     this.buildingMesh.visible = !active;
     this.zoneGridMesh.visible = this.showZones && !active;
+    this.lineMesh.visible = this.showLines && !active;
     this.propGroup.visible = !active;
     this.vehicleView.group.visible = !active;
   }
@@ -588,6 +632,7 @@ export class WorldBuilder {
       turnouts: 0,
       levelCrossings: 0,
       stations: network.stations.size,
+      lines: 0,
       bridgeLength: 0,
       tunnelLength: 0,
       totalLength: 0,
@@ -749,6 +794,16 @@ export class WorldBuilder {
     this.vehicleView.clear();
     this.structureRuns = structures;
 
+    // 路線の経路は車線グラフの上に引くので、グラフを組み立てたあとに引き直す。
+    // 撤去された駅は停車駅から落とす。
+    this.lines.prune(new Set(network.stations.keys()));
+    this.linePlans = planLines(this.laneGraph, this.lines.all, network.stations);
+    this.traffic.setLines(this.linePlans);
+    stats.lines = this.linePlans.length;
+    const lineOverlay = new MeshBuilder();
+    buildLineOverlay(lineOverlay, this.linePlans, this.laneGraph, network.stations);
+    this.replaceGeometry(this.lineMesh, lineOverlay);
+
     return {
       warnings,
       stats,
@@ -762,6 +817,7 @@ export class WorldBuilder {
       parallelGroups,
       zoneCells: this.zoneCells,
       lots: this.lots,
+      lines: this.linePlans,
     };
   }
 

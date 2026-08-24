@@ -26,6 +26,7 @@ import {
 import { checkPlacement, junctionReach } from '../network/rules';
 import {
   planStationLayout,
+  stationAt,
   stationPlatformRange,
   validateStationSpec,
   type Station,
@@ -33,6 +34,7 @@ import {
   type StationLength,
   type StationSpec,
 } from '../network/station';
+import type { LineId, LineMap } from '../network/line';
 import { checkStationPlacement } from '../network/stationPlacement';
 import { ZONE_COLORS, ZONE_EMPTY_COLOR } from '../build/buildings';
 import type { ZoneMap, ZoneType } from '../network/zoning';
@@ -58,7 +60,7 @@ import {
 } from './inspect';
 import type { Heightfield } from '../terrain/heightfield';
 
-export type ToolMode = 'build' | 'station' | 'zone' | 'scissors' | 'bulldoze' | 'inspect';
+export type ToolMode = 'build' | 'station' | 'zone' | 'line' | 'scissors' | 'bulldoze' | 'inspect';
 
 /** 区画を塗る筆の半径 [m]。沿道の全奥行き (`ZONE_DEPTH`) は覆える太さにする。 */
 export const ZONE_BRUSH_RADIUS = 20;
@@ -106,6 +108,10 @@ export interface ToolStatus {
   blockers: string[];
   /** 区画ツールでいま塗ろうとしている用途 (null なら消しゴム)。 */
   zone: ZoneType | null;
+  /** 路線ツールでいま駅を足している路線 (無ければ null)。 */
+  line: { id: LineId; name: string; stops: string[] } | null;
+  /** 路線ツールで、カーソルの下にある駅 (無ければ null)。 */
+  hoverStation: Station | null;
 }
 
 /** カーソルの行き先 (吸い付いた点と、その目印)。 */
@@ -188,6 +194,10 @@ export class BuildTool {
   private inspection: PointInspection | null = null;
   private selectedStationId: StationId | null = null;
   private stationCandidate: Station | null = null;
+  /** 路線ツールで駅を足している路線。 */
+  private editingLineId: LineId | null = null;
+  /** 路線ツールで、カーソルの下にある駅。 */
+  private hoverStation: Station | null = null;
   private stationSettings: StationToolSettings = {
     name: '駅 1',
     trackCount: 2,
@@ -210,6 +220,8 @@ export class BuildTool {
     private readonly surface: SurfaceContext | null = null,
     /** 区画の塗り分け。渡さなければ区画ツールは何もしない。 */
     private readonly zones: ZoneMap | null = null,
+    /** 路線の台帳。渡さなければ路線ツールは何もしない。 */
+    private readonly lines: LineMap | null = null,
   ) {
     this.previewGroup.name = 'preview';
     this.previewMaterial = createPreviewMaterial();
@@ -294,6 +306,9 @@ export class BuildTool {
     this.inspectProfile = null;
     this.stationCandidate = null;
     this.selectedStationId = null;
+    // 路線は「ここまで」で区切る。次にクリックしたら新しい路線を作る。
+    this.editingLineId = null;
+    this.hoverStation = null;
     this.elevationGuideView.update([]);
     this.updatePreviewMesh();
   }
@@ -326,6 +341,18 @@ export class BuildTool {
       this.preview = null;
       this.blockers = [];
       this.showMarkers([]);
+      this.updatePreviewMesh();
+      return;
+    }
+
+    if (this.mode === 'line') {
+      this.elevationGuideView.update([]);
+      this.snapKind = 'none';
+      this.preview = null;
+      this.blockers = [];
+      // 指した駅を光らせる。駅は敷地全体が的なので、ホームでも構内でもよい。
+      this.hoverStation = stationAt(this.network.stations.values(), cursor.x, cursor.z);
+      this.showMarkers(this.hoverStation ? [this.stationMarker(this.hoverStation)] : []);
       this.updatePreviewMesh();
       return;
     }
@@ -538,6 +565,17 @@ export class BuildTool {
       kind: 'node',
       pos: node.pos.clone(),
       radius: Math.max(junctionReach(this.network, node.id), this.cls.halfWidth * 0.8),
+    };
+  }
+
+  /** 路線ツールで駅を指したときの目印。駅の敷地をぐるりと囲む。 */
+  private stationMarker(station: Station): SnapMarker {
+    const line = this.editingLineId === null ? null : this.lines?.get(this.editingLineId) ?? null;
+    return {
+      kind: 'node',
+      pos: station.center.clone(),
+      radius: Math.max(station.length / 2, (station.maxOffset - station.minOffset) / 2) + 3,
+      tint: line?.color,
     };
   }
 
@@ -892,6 +930,14 @@ export class BuildTool {
       }
       return;
     }
+    if (this.mode === 'line') {
+      if (!this.lines || !this.hoverStation) return;
+      // 引いている路線が無ければ、最初の駅を選んだところで 1 本作る。
+      const line = this.currentLine() ?? this.lines.create();
+      this.editingLineId = line.id;
+      if (this.lines.addStop(line.id, this.hoverStation.id)) this.onChanged();
+      return;
+    }
     if (this.mode === 'station') {
       if (!this.stationCandidate || this.blockers.length > 0) return;
       this.network.addStation({
@@ -1011,6 +1057,37 @@ export class BuildTool {
     if (shouldReverse) this.network.reverseSegment(segmentId);
   }
 
+  /** いま駅を足している路線。 */
+  private currentLine(): { id: LineId; name: string; stops: StationId[] } | null {
+    if (this.editingLineId === null) return null;
+    return this.lines?.get(this.editingLineId) ?? null;
+  }
+
+  /** 新しい路線を作り、そこへ駅を足していく。 */
+  newLine(): void {
+    if (!this.lines) return;
+    this.editingLineId = this.lines.create().id;
+    this.onChanged();
+  }
+
+  /** 既にある路線に駅を足せるようにする (一覧から選んだとき)。 */
+  selectLine(id: LineId | null): void {
+    this.editingLineId = id !== null && this.lines?.get(id) ? id : null;
+  }
+
+  /** 路線を消す。 */
+  removeLine(id: LineId): void {
+    if (!this.lines?.remove(id)) return;
+    if (this.editingLineId === id) this.editingLineId = null;
+    this.onChanged();
+  }
+
+  /** 引いている路線の、最後に足した駅を取り消す。 */
+  undoLineStop(): void {
+    if (this.editingLineId === null) return;
+    if (this.lines?.removeLastStop(this.editingLineId)) this.onChanged();
+  }
+
   status(): ToolStatus {
     const preview = this.preview;
     const length = this.mode === 'station'
@@ -1047,6 +1124,18 @@ export class BuildTool {
       blockers: this.blockers,
       parallelSnap: this.parallelSnap,
       parallelTo: this.parallel?.segment ?? null,
+      line: this.lineStatus(),
+      hoverStation: this.mode === 'line' ? this.hoverStation : null,
+    };
+  }
+
+  private lineStatus(): ToolStatus['line'] {
+    const line = this.currentLine();
+    if (!line) return null;
+    return {
+      id: line.id,
+      name: line.name,
+      stops: line.stops.map((id) => this.network.stations.get(id)?.name ?? `駅 #${id}`),
     };
   }
 

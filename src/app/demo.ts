@@ -39,6 +39,72 @@ function findAtGradePoint(
 }
 
 /**
+ * 本線の端に終端駅を繋ぐ。
+ *
+ * 駅の構内線は独立した線形なので、本線の端点と 1 本ずつ結ぶ。線路には
+ * 向きがあるので、上り線・下り線それぞれの向きに合わせて繋ぐ (逆に繋ぐと
+ * その番線には列車が入れない)。
+ */
+function attachTerminus(
+  network: Network,
+  name: string,
+  railX: number,
+  mainZ: number,
+  stationZ: number,
+): void {
+  const ends = [...network.nodes.values()]
+    .filter(
+      (node) =>
+        Math.abs(node.pos.z - mainZ) < 1 &&
+        node.segments.some((id) => network.classOf(network.getSegment(id)).kind === 'rail'),
+    )
+    .sort((a, b) => a.pos.x - b.pos.x);
+  if (ends.length === 0) return;
+  const y = ends.reduce((sum, node) => sum + node.pos.y, 0) / ends.length;
+  const station = network.addStation({
+    name,
+    center: new Vector3(railX, y, stationZ),
+    heading: Math.PI / 2,
+    length: 120,
+    trackCount: 2,
+    platformCount: 2,
+    elevated: false,
+  });
+  // 構内線のうち、本線に近い側の端点。
+  const near = station.tracks
+    .map((track) => {
+      const seg = network.getSegment(track.segment);
+      const nodes = [network.getNode(seg.a), network.getNode(seg.b)].sort(
+        (a, b) => a.pos.z - b.pos.z,
+      );
+      return { track, node: stationZ > mainZ ? nodes[0] : nodes[1] };
+    })
+    .sort((a, b) => a.node.pos.x - b.node.pos.x);
+
+  for (let i = 0; i < Math.min(ends.length, near.length); i++) {
+    const main = ends[i];
+    const target = near[i];
+    const existing = network.getSegment(main.segments[0]);
+    const mainGrade = existing.a === main.id ? existing.gradeA : existing.gradeB;
+    // 南から北へ向かう線 (forward) は南の点が始点。逆向きの線はその反対。
+    const [low, high] = stationZ > mainZ ? [main, target.node] : [target.node, main];
+    const a = target.track.forward ? low : high;
+    const b = target.track.forward ? high : low;
+    const p0 = new Vector2(a.pos.x, a.pos.z);
+    const p1 = new Vector2(b.pos.x, b.pos.z);
+    network.addSegment({
+      classId: 'rail_single',
+      a: a.id,
+      b: b.id,
+      ctrlA: p0.clone().lerp(p1, 1 / 3),
+      ctrlB: p0.clone().lerp(p1, 2 / 3),
+      gradeA: a.id === main.id ? mainGrade : 0,
+      gradeB: b.id === main.id ? mainGrade : 0,
+    });
+  }
+}
+
+/**
  * 起動時に置くサンプル。切土・盛土、橋、トンネル、交差点、踏切、分岐器、
  * 立体交差が一通り含まれるように配置する。
  */
@@ -96,47 +162,9 @@ export function buildDemoNetwork(network: Network, field: Heightfield): void {
     { straight: true, count: 2 },
   );
 
-  // 起動直後から停車を見られるよう、北端の先に独立駅を接続する。
-  const northEnds = [...network.nodes.values()]
-    .filter((node) => Math.abs(node.pos.z - 300) < 1 && node.segments.some((id) => network.classOf(network.getSegment(id)).kind === 'rail'))
-    .sort((a, b) => a.pos.x - b.pos.x);
-  const stationY = northEnds.reduce((sum, node) => sum + node.pos.y, 0) / Math.max(1, northEnds.length);
-  const station = network.addStation({
-    name: 'みどり台',
-    center: new Vector3(railX, stationY, 430),
-    heading: Math.PI / 2,
-    length: 120,
-    trackCount: 2,
-    platformCount: 2,
-    elevated: false,
-  });
-  const stationSouth = station.tracks
-    .map((track) => {
-      const seg = network.getSegment(track.segment);
-      const nodes = [network.getNode(seg.a), network.getNode(seg.b)].sort((a, b) => a.pos.z - b.pos.z);
-      return { track, node: nodes[0] };
-    })
-    .sort((a, b) => a.node.pos.x - b.node.pos.x);
-  for (let i = 0; i < Math.min(northEnds.length, stationSouth.length); i++) {
-    const main = northEnds[i];
-    const target = stationSouth[i];
-    const forward = target.track.forward;
-    const existing = network.getSegment(main.segments[0]);
-    const mainGrade = existing.a === main.id ? existing.gradeA : existing.gradeB;
-    const a = forward ? main : target.node;
-    const b = forward ? target.node : main;
-    const p0 = new Vector2(a.pos.x, a.pos.z);
-    const p1 = new Vector2(b.pos.x, b.pos.z);
-    network.addSegment({
-      classId: 'rail_single',
-      a: a.id,
-      b: b.id,
-      ctrlA: p0.clone().lerp(p1, 1 / 3),
-      ctrlB: p0.clone().lerp(p1, 2 / 3),
-      gradeA: forward ? mainGrade : 0,
-      gradeB: forward ? 0 : mainGrade,
-    });
-  }
+  // 起動直後から路線を引けるよう、本線の両端の先に駅を 1 つずつ繋ぐ。
+  attachTerminus(network, 'みどり台', railX, 300, 430);
+  attachTerminus(network, '南浜', railX, -300, -430);
 
   // 側線への分岐。分岐器ができる。
   const branchNode = network.findNodeNear(new Vector3(railX, railY, roadZ + 120), 40);

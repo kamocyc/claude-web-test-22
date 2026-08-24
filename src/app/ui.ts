@@ -5,6 +5,8 @@ import type { ToolMode, ToolStatus } from './buildTool';
 import type { StationToolSettings } from './buildTool';
 import { stationPlatformRange, STATION_LENGTHS, type StationId } from '../network/station';
 import { ZONE_LABELS, ZONE_TYPES, type ZoneType } from '../network/zoning';
+import type { LineId } from '../network/line';
+import type { LinePlan } from '../sim/lineRoute';
 import type { RideStatus } from './ride';
 import {
   GRAPH_W,
@@ -26,6 +28,11 @@ export interface UiCallbacks {
   onStationRename: (id: StationId, name: string) => void;
   /** 区画ツールで塗る用途を選ぶ (null なら消しゴム)。 */
   onZone: (zone: ZoneType | null) => void;
+  /** 新しい路線を引き始める。 */
+  onLineNew: () => void;
+  /** 一覧から選んだ路線に、続けて駅を足せるようにする。 */
+  onLineSelect: (id: LineId) => void;
+  onLineRemove: (id: LineId) => void;
   /** 接続の色分け表示を切り替える。 */
   onConnectivityColors: (on: boolean) => void;
   /** 車両の走行表示を切り替える。 */
@@ -63,6 +70,11 @@ export class Ui {
   private readonly classButtons = new Map<string, HTMLButtonElement>();
   private readonly parallelButtons = new Map<boolean, HTMLButtonElement>();
   private readonly zoneButtons = new Map<ZoneType | null, HTMLButtonElement>();
+  private readonly lineBody: HTMLElement;
+  /** 直前に描いた路線一覧の内容。毎フレーム組み直さないための控え。 */
+  private lineHtml = '';
+  /** いま駅を足している路線 (一覧で強調する)。 */
+  private editingLine: LineId | null = null;
   private readonly elevationLabel: HTMLElement;
   private readonly rideButton: HTMLButtonElement;
   private readonly vehiclesToggle: HTMLInputElement;
@@ -97,6 +109,7 @@ export class Ui {
       ['build', '敷設', 'B'],
       ['station', '駅', 'S'],
       ['zone', '区画', 'Z'],
+      ['line', '路線', 'L'],
       ['scissors', 'シーサス', 'C'],
       ['bulldoze', '撤去', 'X'],
       ['inspect', '確認', 'V'],
@@ -172,6 +185,24 @@ export class Ui {
     left.append(zoneRow);
     left.append(
       hint('道路沿いのマス目を塗ると建物が建ちます。広く塗るほどマスがまとまって大きな建物になります'),
+    );
+
+    left.append(sectionTitle('路線'));
+    const lineRow = el('div', 'row');
+    lineRow.append(button('＋ 新しい路線', callbacks.onLineNew));
+    left.append(lineRow);
+    this.lineBody = el('div', 'line-list');
+    this.lineBody.addEventListener('click', (event) => {
+      const target = event.target as HTMLElement;
+      const item = target.closest('[data-line]') as HTMLElement | null;
+      if (!item) return;
+      const id = Number(item.dataset.line);
+      if (target.closest('[data-remove]')) callbacks.onLineRemove(id);
+      else callbacks.onLineSelect(id);
+    });
+    left.append(this.lineBody);
+    left.append(
+      hint('駅のホームを順にクリックすると路線になり、列車がその経路を走ります (Esc で区切り)'),
     );
 
     left.append(sectionTitle('種別'));
@@ -305,6 +336,7 @@ export class Ui {
       '<b>Shift</b> 直線・15° スナップ / <b>Ctrl</b> スナップ解除',
       '<b>S</b> 駅配置 / <b>N・M</b> 駅を回転',
       '<b>Z</b> 区画 (道路沿いを塗ると建物が建つ)',
+      '<b>L</b> 路線 (駅のホームを順にクリックすると列車が走る)',
       '<b>C</b> 平行線路へシーサスクロッシングを一括敷設',
       '<b>U</b> 地下ビュー (地形を透過)',
       '<b>右ドラッグ</b> 視点移動 / <b>ホイール</b> 拡大縮小',
@@ -393,8 +425,18 @@ export class Ui {
           : status.mode === 'station' ? '空き地をクリックして駅を配置'
           : status.mode === 'zone'
             ? `道路沿いをクリックして${status.zone ? ZONE_LABELS[status.zone] : '用途を解除'}`
+          : status.mode === 'line'
+            ? status.hoverStation
+              ? `${status.hoverStation.name} を路線に追加`
+              : '停める駅のホームをクリック'
           : status.mode === 'scissors' ? '平行線路上で位置を指定'
           : '対象をクリック',
+      ]);
+    }
+    if (!ride && status.mode === 'line' && status.line) {
+      rows.push([
+        status.line.name,
+        status.line.stops.length > 0 ? status.line.stops.join(' → ') : '駅を選んでください',
       ]);
     }
     if (!ride && status.parallelTo !== null) rows.push(['平行', `線形 #${status.parallelTo} に沿う`]);
@@ -444,6 +486,10 @@ export class Ui {
     if (html !== this.statusHtml) {
       this.statusHtml = html;
       this.statusBody.innerHTML = html;
+    }
+    if (this.editingLine !== (status.line?.id ?? null)) {
+      this.editingLine = status.line?.id ?? null;
+      this.markEditingLine();
     }
     this.updateGraph(!ride && status.mode === 'inspect' ? status.inspect : null);
     this.syncStationControls(status.station);
@@ -501,6 +547,57 @@ export class Ui {
   }
 
   /**
+   * 路線の一覧。
+   *
+   * 経路は敷設のたびに引き直されるので、ここには**その時点で走れるか**を
+   * 出す。繋がっていない区間があれば、どこが繋がっていないかを書く。
+   */
+  private updateLines(plans: LinePlan[]): void {
+    const html =
+      plans.length === 0
+        ? '<div class="hint">路線はまだありません</div>'
+        : plans
+            .map((plan) => {
+              const swatch = plan.color.map(toSrgb).join(',');
+              const stops = plan.stops.map((stop) => escapeHtml(stop.name)).join(' → ');
+              const state = !plan.runnable
+                ? plan.stops.length < 2
+                  ? '駅をもう 1 つ選んでください'
+                  : '線路が繋がっていません'
+                : plan.seamless
+                  ? `環状 ${plan.length.toFixed(0)} m`
+                  : `${plan.length.toFixed(0)} m · ${plan.runs.length} 区間`;
+              const gaps = plan.gaps
+                .map(
+                  (gap) =>
+                    `<div class="line-gap">${escapeHtml(gap.from)} → ${escapeHtml(gap.to)} は線路が繋がっていません</div>`,
+                )
+                .join('');
+              return [
+                `<div class="line-item" data-line="${plan.id}">`,
+                `<span class="line-swatch" style="background:rgb(${swatch})"></span>`,
+                `<span class="line-text"><b>${escapeHtml(plan.name)}</b>`,
+                `<small>${stops || '停車駅なし'}</small>`,
+                `<small>${state}</small>${gaps}</span>`,
+                '<button class="chip line-remove" data-remove="1">✕</button>',
+                '</div>',
+              ].join('');
+            })
+            .join('');
+    if (html === this.lineHtml) return;
+    this.lineHtml = html;
+    this.lineBody.innerHTML = html;
+    this.markEditingLine();
+  }
+
+  /** 一覧の中で、いま駅を足している路線に印を付ける。 */
+  private markEditingLine(): void {
+    for (const item of this.lineBody.querySelectorAll<HTMLElement>('[data-line]')) {
+      item.classList.toggle('active', Number(item.dataset.line) === this.editingLine);
+    }
+  }
+
+  /**
    * 区間全体の曲率・勾配のグラフ。
    *
    * SVG は指している線形が変わったときだけ組み直し、いま見ている位置の
@@ -525,6 +622,7 @@ export class Ui {
   }
 
   updateBuild(result: BuildResult): void {
+    this.updateLines(result.lines);
     const s = result.stats;
     const rows: [string, string][] = [
       ['セグメント', `${s.segments}`],
@@ -532,6 +630,7 @@ export class Ui {
       ['分岐器', `${s.turnouts}`],
       ['踏切', `${s.levelCrossings}`],
       ['駅', `${s.stations}`],
+      ['路線', `${s.lines}`],
       ['建物', `${s.buildings} 棟 / ${s.zoneCells} マス`],
       ['高架', `${s.bridgeLength.toFixed(0)} m`],
       ['トンネル', `${s.tunnelLength.toFixed(0)} m`],
@@ -666,6 +765,11 @@ function rideRows(ride: RideStatus): [string, string, string?][] {
   }
   rows.push(['操作', 'ドラッグで見回す / N で次の車両 / F で降りる']);
   return rows;
+}
+
+/** リニア色 (描画で使う値) を、CSS に書く sRGB の 0〜255 に直す。 */
+function toSrgb(value: number): number {
+  return Math.round(255 * Math.min(1, Math.max(0, value)) ** (1 / 2.2));
 }
 
 function escapeHtml(text: string): string {

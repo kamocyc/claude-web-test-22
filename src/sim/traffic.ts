@@ -1,7 +1,9 @@
 import { Vector3 } from 'three';
 import { clamp } from '../core/units';
 import type { RGB } from '../build/surface';
+import type { LineId } from '../network/line';
 import type { LaneGraph, VehicleKind } from './lanegraph';
+import type { LinePlan } from './lineRoute';
 import { signalStateAt } from './signals';
 
 /**
@@ -52,6 +54,12 @@ export interface Vehicle {
   lastStation?: number;
   /** Absolute simulation time at which doors close and the train may depart. */
   dwellUntil?: number;
+  /**
+   * 路線に沿って走る列車。無ければ行き当たりばったりに走る。
+   *
+   * `run` は走っている区間、`cursor` はその区間で次に足す車線の位置。
+   */
+  line?: { id: LineId; plan: LinePlan; run: number; cursor: number };
 }
 
 export const STATION_DWELL = 5;
@@ -75,6 +83,11 @@ const STOP_MARGIN = 0.5;
 const COUPLING = 0.8;
 /** 車両を湧かせるときに、まわりに空けておく距離 [m]。 */
 const SPAWN_CLEARANCE = 15;
+
+/** 路線 1 本に走らせる編成の数。この距離 [m] に 1 本。 */
+const LINE_TRAIN_SPACING = 2500;
+/** 路線 1 本の編成数の上限。 */
+const MAX_LINE_TRAINS = 3;
 
 const CAR_COLORS: RGB[] = [
   [0.82, 0.84, 0.86],
@@ -111,6 +124,7 @@ export class Traffic {
   /** 経過時間 [s]。信号の現示に使う。 */
   time = 0;
   private nextId = 1;
+  private lines: LinePlan[] = [];
   private rng: () => number;
   private readonly options: Required<TrafficOptions>;
 
@@ -132,7 +146,24 @@ export class Traffic {
   reset(graph: LaneGraph): void {
     this.graph = graph;
     this.vehicles.length = 0;
+    this.lines = [];
     this.rng = mulberry32(this.options.seed);
+  }
+
+  /**
+   * 路線の運転計画を差し替える。
+   *
+   * 計画は車線の番号で書かれているので、車線グラフを作り直したら
+   * (`reset` のあとに) 必ず入れ直す。計画から外れた列車は降ろす。
+   */
+  setLines(plans: LinePlan[]): void {
+    this.lines = plans.filter((plan) => plan.runnable);
+    const live = new Set(this.lines.map((plan) => plan.id));
+    this.vehicles.splice(
+      0,
+      this.vehicles.length,
+      ...this.vehicles.filter((vehicle) => !vehicle.line || live.has(vehicle.line.id)),
+    );
   }
 
   /** その車両がいま乗っている車線。 */
@@ -220,7 +251,11 @@ export class Traffic {
       vehicle.speed = 0;
       return;
     }
-    if (vehicle.dwellUntil !== undefined) vehicle.dwellUntil = undefined;
+    if (vehicle.dwellUntil !== undefined) {
+      vehicle.dwellUntil = undefined;
+      // 終端に着いた路線の列車は、ここで反対側のホームへ移る (折り返し)。
+      if (this.turnBack(vehicle)) return;
+    }
     // 進入すると決めた進路に乗ったら、そこから先は位置で押さえられる。
     if (vehicle.commit !== undefined && vehicle.route.indexOf(vehicle.commit) <= at.index) {
       vehicle.commit = undefined;
@@ -401,6 +436,10 @@ export class Traffic {
   }
 
   private extendRoute(vehicle: Vehicle): void {
+    if (vehicle.line) {
+      this.extendLineRoute(vehicle);
+      return;
+    }
     for (let guard = 0; guard < 8; guard++) {
       if (this.remaining(vehicle) > LOOKAHEAD) return;
       const options = this.successors(vehicle);
@@ -408,6 +447,64 @@ export class Traffic {
       const pick = options[Math.floor(this.rng() * options.length) % options.length];
       vehicle.route.push(pick);
     }
+  }
+
+  /**
+   * 路線の列車の経路を伸ばす。
+   *
+   * 走る車線は決まっているので、行き先を選ばずに計画のとおりに足す。
+   * 環状 (`seamless`) の路線では先頭に戻って足し続け、そうでない路線は
+   * 区間の終わりで止める (そこで折り返す)。
+   */
+  private extendLineRoute(vehicle: Vehicle): void {
+    const line = vehicle.line!;
+    const run = line.plan.runs[line.run];
+    if (!run) return;
+    for (let guard = 0; guard < 16; guard++) {
+      if (this.remaining(vehicle) > LOOKAHEAD) return;
+      if (line.cursor >= run.lanes.length) {
+        if (!line.plan.seamless) return;
+        line.cursor = 0;
+      }
+      vehicle.route.push(run.lanes[line.cursor++]);
+    }
+  }
+
+  /**
+   * 終端に着いた路線の列車を、次の区間の先頭 (反対側のホーム) へ移す。
+   *
+   * 線路には向きがあるので、終端駅では入ってきた線路をそのままは戻れない。
+   * 引き上げ線や渡り線があれば経路が繋がって折り返しは起きず、無ければ
+   * ここでホームを移る。移ったら折り返しの停車時間を取る。
+   */
+  private turnBack(vehicle: Vehicle): boolean {
+    const line = vehicle.line;
+    if (!line || line.plan.seamless || line.plan.runs.length === 0) return false;
+    const run = line.plan.runs[line.run];
+    if (!run || vehicle.lastStation !== run.endStation) return false;
+    // 途中で同じ駅に停まる路線もあるので、区間の最後の車線にいるかも見る。
+    if (line.cursor < run.lanes.length) return false;
+    if (this.laneOf(vehicle) !== run.lanes[run.lanes.length - 1]) return false;
+    this.placeOnRun(vehicle, (line.run + 1) % line.plan.runs.length);
+    return true;
+  }
+
+  /** 路線の列車を、その区間の始発ホームに置く。 */
+  private placeOnRun(vehicle: Vehicle, index: number): void {
+    const line = vehicle.line!;
+    const run = line.plan.runs[index];
+    const lane = this.graph.lanes[run.lanes[0]];
+    if (!lane) return;
+    const body = this.bodyLength(vehicle);
+    line.run = index;
+    line.cursor = 1;
+    vehicle.route = [run.lanes[0]];
+    vehicle.head = clamp(run.startStop + body / 2, body, lane.path.length);
+    vehicle.speed = 0;
+    vehicle.commit = undefined;
+    vehicle.lastStation = run.startStation;
+    vehicle.dwellUntil = this.time + STATION_DWELL;
+    this.updateBodies(vehicle);
   }
 
   /** 通り過ぎた車線を落とす。最後尾がまだ乗っている車線は残す。 */
@@ -458,16 +555,66 @@ export class Traffic {
   // ------------------------------------------------------------ 湧き出し
 
   private populate(): void {
+    this.populateLines();
     for (const kind of ['car', 'train'] as const) {
       const want = this.targetCount(kind);
-      const have = this.vehicles.filter((v) => v.kind === kind).length;
+      // 路線の列車は計画で決まった数だけ走るので、こちらでは数えない。
+      const have = this.vehicles.filter((v) => v.kind === kind && !v.line).length;
       // 1 フレームに 1 台ずつ。まとめて湧かせると団子になる。
       if (have < want) this.spawn(kind);
       else if (have > want + 1) {
-        const index = this.vehicles.findIndex((v) => v.kind === kind);
+        const index = this.vehicles.findIndex((v) => v.kind === kind && !v.line);
         if (index >= 0) this.vehicles.splice(index, 1);
       }
     }
+  }
+
+  /** 路線ごとに、足りない編成を 1 本ずつ足す。 */
+  private populateLines(): void {
+    for (const plan of this.lines) {
+      const running = this.vehicles.filter((v) => v.line?.id === plan.id);
+      const want = Math.min(
+        MAX_LINE_TRAINS,
+        Math.max(1, Math.round(plan.length / LINE_TRAIN_SPACING)),
+      );
+      if (running.length >= want) continue;
+      // 複数走らせるときは区間を散らす (往路と復路に 1 本ずつ)。
+      this.spawnLineTrain(plan, running.length % plan.runs.length);
+    }
+  }
+
+  /**
+   * 路線の列車を始発ホームに置く。
+   *
+   * ホームが塞がっていたら見送る (次のフレームでまた試す)。停まっている
+   * 列車の上に重ねて湧かせないため。
+   */
+  private spawnLineTrain(plan: LinePlan, runIndex: number): void {
+    const run = plan.runs[runIndex];
+    if (!run) return;
+    const lane = this.graph.lanes[run.lanes[0]];
+    if (!lane) return;
+    const cars = 3;
+    const body = cars * TRAIN_SIZE.length + (cars - 1) * COUPLING;
+    const head = clamp(run.startStop + body / 2, body, lane.path.length);
+    if (!this.isLaneClear(lane.id, Math.max(0, head - body), head)) return;
+    const vehicle: Vehicle = {
+      id: this.nextId++,
+      kind: 'train',
+      route: [run.lanes[0]],
+      head,
+      speed: 0,
+      size: TRAIN_SIZE,
+      cars,
+      color: plan.color,
+      bodies: [],
+      // 始発ホームでは、着いたばかりの列車と同じように少し停まってから出る。
+      lastStation: run.startStation,
+      dwellUntil: this.time + STATION_DWELL,
+      line: { id: plan.id, plan, run: runIndex, cursor: 1 },
+    };
+    this.updateBodies(vehicle);
+    this.vehicles.push(vehicle);
   }
 
   private spawn(kind: VehicleKind): void {
@@ -501,6 +648,28 @@ export class Traffic {
       this.vehicles.push(vehicle);
       return;
     }
+  }
+
+  /**
+   * その車線の、その範囲に誰もいないか。
+   *
+   * 始発ホームは駅の中なので、まわりの距離で見る (`isClear`) と、隣の
+   * ホームに停まっている別の路線の列車で塞がったことになってしまう。
+   * ここは同じ車線の上だけを、位置の重なりで見る。
+   */
+  private isLaneClear(id: number, from: number, to: number): boolean {
+    const length = this.graph.lanes[id]?.path.length ?? 0;
+    for (const vehicle of this.vehicles) {
+      const tail = this.locate(vehicle.route, this.tailOf(vehicle));
+      const head = this.locate(vehicle.route, vehicle.head);
+      for (let i = tail.index; i <= head.index; i++) {
+        if (vehicle.route[i] !== id) continue;
+        const low = i === tail.index ? tail.s : 0;
+        const high = i === head.index ? head.s : length;
+        if (high >= from - MIN_GAP && low <= to + MIN_GAP) return false;
+      }
+    }
+    return true;
   }
 
   /**
