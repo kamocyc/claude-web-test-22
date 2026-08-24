@@ -105,6 +105,8 @@ import {
 } from '../network/parallel';
 import {
   evaluateAlignment,
+  curveBreakMessage,
+  findCurveBreaks,
   findGradeBreaks,
   gradeBreakMessage,
   type SegmentDiagnostics,
@@ -713,6 +715,16 @@ export class WorldBuilder {
     for (const brk of findGradeBreaks(network)) {
       warnings.push({
         message: gradeBreakMessage(brk),
+        position: brk.pos.clone(),
+        severity: 'warning',
+      });
+    }
+
+    // 継ぎ目で平面線形が切れている所 (線路)。レールは曲がり角にも曲率の
+    // 飛びにも折り合えないので、残っていたら同じように報せる。
+    for (const brk of findCurveBreaks(network)) {
+      warnings.push({
+        message: curveBreakMessage(brk),
         position: brk.pos.clone(),
         severity: 'warning',
       });

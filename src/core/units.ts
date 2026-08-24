@@ -27,13 +27,12 @@ export const TERRAIN_CELLS = MAP_SIZE / TERRAIN_CELL;
 export const TERRAIN_CHUNK_CELLS = 64;
 
 /**
- * 遠景を霞ませ始める距離と、完全に霞む距離 [m]。
+ * 見通す距離 [m]。遠クリップ面・引ける上限・空の大きさをここから決める。
  *
  * マップの広さではなく**見える距離**の話なので、`MAP_SIZE` からは切り離す。
- * マップに比例させると、広いマップでは近くが霞まず、端まで見通せてしまう。
+ * マップに比例させると、広いマップでは端まで引けてしまう。
  */
-export const FOG_NEAR = 620;
-export const FOG_FAR = 2400;
+export const VIEW_DISTANCE = 2400;
 
 /** 線形をサンプリングする既定間隔 [m]。 */
 export const SAMPLE_SPACING = 2.0;

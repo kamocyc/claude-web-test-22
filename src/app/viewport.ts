@@ -4,7 +4,6 @@ import {
   BackSide,
   Color,
   DirectionalLight,
-  Fog,
   Mesh,
   PerspectiveCamera,
   PCFShadowMap,
@@ -18,7 +17,7 @@ import {
   WebGLRenderer,
 } from 'three';
 import { MapControls } from 'three/examples/jsm/controls/MapControls.js';
-import { FOG_FAR, FOG_NEAR } from '../core/units';
+import { VIEW_DISTANCE } from '../core/units';
 
 /**
  * 一人称視点のときの近クリップ面 [m]。
@@ -38,6 +37,8 @@ export class Viewport {
   readonly camera: PerspectiveCamera;
   readonly controls: MapControls;
   private readonly sun: DirectionalLight;
+  /** 空のドーム。視点を包んだままにするので、いつも同じ空が見える。 */
+  private readonly sky: Mesh;
   private readonly raycaster = new Raycaster();
   private readonly pointer = new Vector2();
   /** 一人称視点に入る前の視点。降りたときに戻す。 */
@@ -53,20 +54,17 @@ export class Viewport {
     this.renderer.shadowMap.type = PCFShadowMap;
 
     this.scene.background = new Color(0x9fc4e0);
-    // 霞む距離はマップの広さではなく見通しで決める (`FOG_NEAR`)。遠景は
-    // 霞に沈むので、遠クリップ面は霞み切る距離の少し先までで足りる。
-    this.scene.fog = new Fog(0xa8c8e0, FOG_NEAR, FOG_FAR);
-
-    this.camera = new PerspectiveCamera(52, 1, 1, FOG_FAR * 1.6);
+    // 遠景は霞ませない。地形の色と地図としての見通しをそのまま出す。
+    this.camera = new PerspectiveCamera(52, 1, 1, VIEW_DISTANCE * 1.6);
     this.camera.position.set(150, 180, 220);
 
     this.controls = new MapControls(this.camera, canvas);
     this.controls.enableDamping = true;
     this.controls.dampingFactor = 0.12;
     this.controls.minDistance = 20;
-    // 引ける上限は「霞み切る手前」まで。マップに比例させると、広いマップでは
+    // 引ける上限は見通す距離まで。マップに比例させると、広いマップでは
     // 何も見えない高さまで引けてしまう。
-    this.controls.maxDistance = FOG_FAR * 0.75;
+    this.controls.maxDistance = VIEW_DISTANCE * 0.75;
     this.controls.maxPolarAngle = Math.PI * 0.49;
     this.controls.target.set(0, 0, 0);
 
@@ -88,7 +86,8 @@ export class Viewport {
     this.scene.add(this.sun);
     this.scene.add(this.sun.target);
 
-    this.scene.add(createSky());
+    this.sky = createSky();
+    this.scene.add(this.sky);
 
     window.addEventListener('resize', () => this.resize());
     this.resize();
@@ -159,6 +158,9 @@ export class Viewport {
   render(): void {
     // 一人称視点の間は、カメラを外から置いている。
     if (this.controls.enabled) this.controls.update();
+    // 空は視点に付いて回る。置いたままにすると、引いたときにドームの縁が
+    // 空の中に見えてしまう。
+    this.sky.position.copy(this.camera.position);
     this.updateShadowCamera();
     this.renderer.render(this.scene, this.camera);
   }
@@ -194,13 +196,12 @@ export class Viewport {
   }
 }
 
-/** 天頂から地平にかけて色が変わる簡単な空。 */
+/** 天頂から地平にかけて色が変わる簡単な空。視点を中心に置いて使う。 */
 function createSky(): Mesh {
-  const geometry = new SphereGeometry(FOG_FAR * 1.5, 24, 16);
+  const geometry = new SphereGeometry(VIEW_DISTANCE * 1.5, 24, 16);
   const material = new ShaderMaterial({
     side: BackSide,
     depthWrite: false,
-    fog: false,
     uniforms: {
       topColor: { value: new Color(0x4f86c6) },
       middleColor: { value: new Color(0xa9cbe6) },

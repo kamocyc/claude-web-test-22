@@ -309,7 +309,7 @@ export interface PlaceResult {
 }
 
 /** 折れをなめらかにする角度の範囲。これより浅ければ元から折れていない。 */
-const MIN_SMOOTHED_DEFLECTION = 1 * DEG;
+export const MIN_SMOOTHED_DEFLECTION = 1 * DEG;
 /** これより深い折れは「角にしたい」意図とみなして触らない。 */
 const MAX_SMOOTHED_DEFLECTION = 60 * DEG;
 /** なめらかにする度合い。1 で完全に接線を揃える。 */

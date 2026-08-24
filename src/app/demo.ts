@@ -1,6 +1,9 @@
-import { Vector2, Vector3 } from 'three';
+import { Vector3 } from 'three';
 import { buildInterchange, buildTrumpetInterchange } from './interchange';
 import { draw, drawParallel, smoothProfile, type Waypoint } from './sketch';
+import { getClass } from '../network/classes';
+import { planStationLayout } from '../network/station';
+import { anchorFromNode, computePlacement, placeSegment } from '../network/editing';
 import type { Network } from '../network/network';
 import type { Heightfield } from '../terrain/heightfield';
 
@@ -38,19 +41,33 @@ function findAtGradePoint(
   return bestDelta < 4 ? best : null;
 }
 
+const TERMINUS_TRACKS = 2;
+const TERMINUS_PLATFORMS = 2;
+const TERMINUS_LENGTH = 120;
 /**
- * 本線の端に終端駅を繋ぐ。
+ * 本線の端から構内線の端までの長さ [m] (駅ののど)。
  *
- * 駅の構内線は独立した線形なので、本線の端点と 1 本ずつ結ぶ。線路に向きは
- * 無いので、繋ぐ向きは考えなくてよい。
+ * 構内線は本線より 2 m ほど外へずれるので、繋ぐ線形はそのぶん横へ振れる。
+ * 横へ振るには長さが要る — 詰めて繋ぐと反向曲線がきつくなり、継ぎ目で曲率が
+ * 飛ぶ (`findCurveBreaks` の警告に出る)。
+ */
+const TERMINUS_THROAT = 180;
+
+/**
+ * 本線の端に終端駅を繋ぐ。`side` は本線から見て駅を置く向き (+1 = 北)。
+ *
+ * 駅の構内線は独立した線形なので、本線の端点と 1 本ずつ結ぶ。両端の点を
+ * ただ結ぶと継ぎ目が折れるため、**敷設ツールと同じ手順**で置いて両端の
+ * 接線・曲率・勾配を引き継ぐ。線路に向きは無いので、繋ぐ向きは考えなくてよい。
  */
 function attachTerminus(
   network: Network,
   name: string,
   railX: number,
   mainZ: number,
-  stationZ: number,
+  side: 1 | -1,
 ): void {
+  const stationZ = mainZ + side * (TERMINUS_THROAT + TERMINUS_LENGTH / 2);
   const ends = [...network.nodes.values()]
     .filter(
       (node) =>
@@ -60,13 +77,18 @@ function attachTerminus(
     .sort((a, b) => a.pos.x - b.pos.x);
   if (ends.length === 0) return;
   const y = ends.reduce((sum, node) => sum + node.pos.y, 0) / ends.length;
+  // 構内線の並びは本線より広い (間にホームが入る) ので、中心を合わせて置く。
+  // 片方の線を真っ直ぐ繋ぐように置くと、もう片方が倍の幅だけ横へ振れる。
+  // 駅の向きは +Z で、右手 (`offset` の正) が -X。
+  const layout = planStationLayout(TERMINUS_TRACKS, TERMINUS_PLATFORMS);
+  const middle = layout.tracks.reduce((sum, t) => sum + t.offset, 0) / layout.tracks.length;
   const station = network.addStation({
     name,
-    center: new Vector3(railX, y, stationZ),
+    center: new Vector3(railX + middle, y, stationZ),
     heading: Math.PI / 2,
-    length: 120,
-    trackCount: 2,
-    platformCount: 2,
+    length: TERMINUS_LENGTH,
+    trackCount: TERMINUS_TRACKS,
+    platformCount: TERMINUS_PLATFORMS,
     elevated: false,
   });
   // 構内線のうち、本線に近い側の端点。
@@ -76,28 +98,17 @@ function attachTerminus(
       const nodes = [network.getNode(seg.a), network.getNode(seg.b)].sort(
         (a, b) => a.pos.z - b.pos.z,
       );
-      return { track, node: stationZ > mainZ ? nodes[0] : nodes[1] };
+      return { track, node: side > 0 ? nodes[0] : nodes[1] };
     })
     .sort((a, b) => a.node.pos.x - b.node.pos.x);
 
+  const cls = getClass('rail_single');
   for (let i = 0; i < Math.min(ends.length, near.length); i++) {
-    const main = ends[i];
-    const target = near[i];
-    const existing = network.getSegment(main.segments[0]);
-    const mainGrade = existing.a === main.id ? existing.gradeA : existing.gradeB;
     // 構内線と同じく、南から北へ向かう向きに揃えて敷く。
-    const [a, b] = stationZ > mainZ ? [main, target.node] : [target.node, main];
-    const p0 = new Vector2(a.pos.x, a.pos.z);
-    const p1 = new Vector2(b.pos.x, b.pos.z);
-    network.addSegment({
-      classId: 'rail_single',
-      a: a.id,
-      b: b.id,
-      ctrlA: p0.clone().lerp(p1, 1 / 3),
-      ctrlB: p0.clone().lerp(p1, 2 / 3),
-      gradeA: a.id === main.id ? mainGrade : 0,
-      gradeB: b.id === main.id ? mainGrade : 0,
-    });
+    const [a, b] = side > 0 ? [ends[i], near[i].node] : [near[i].node, ends[i]];
+    const from = anchorFromNode(network, a, cls);
+    const to = anchorFromNode(network, b, cls);
+    placeSegment(network, cls.id, from, to, computePlacement(from, to, { straight: false, cls }));
   }
 }
 
@@ -160,8 +171,8 @@ export function buildDemoNetwork(network: Network, field: Heightfield): void {
   );
 
   // 起動直後から路線を引けるよう、本線の両端の先に駅を 1 つずつ繋ぐ。
-  attachTerminus(network, 'みどり台', railX, 300, 430);
-  attachTerminus(network, '南浜', railX, -300, -430);
+  attachTerminus(network, 'みどり台', railX, 300, 1);
+  attachTerminus(network, '南浜', railX, -300, -1);
 
   // 側線への分岐。分岐器ができる。
   const branchNode = network.findNodeNear(new Vector3(railX, railY, roadZ + 120), 40);
