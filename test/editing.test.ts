@@ -394,6 +394,36 @@ describe('既存の線形への取り付き', () => {
     }
   });
 
+  it('線形の始点は、どんな繋ぎ方でもクリックした点から動かない', () => {
+    // 接続点 (枝が 2 本のノード) から、隣の線路へ渡り線を引く。終点側は
+    // 既存線路に接するので、解き方は「終点から逆向き」になる。始点の位置は
+    // クリックした点そのものなので、ここが動いてはいけない。
+    const cls = getClass('rail_single');
+    for (const span of [140, 90, 60, 40, 30, 20]) {
+      const network = new Network();
+      addStraight(network, 'rail_single', new Vector3(-200, 0, 0), new Vector3(0, 0, 0));
+      addStraight(network, 'rail_single', new Vector3(0, 0, 0), new Vector3(200, 0, 0));
+      addStraight(network, 'rail_single', new Vector3(-200, 0, 4.6), new Vector3(200, 0, 4.6));
+      const joint = network.findNodeNear(new Vector3(0, 0, 0), 0.5)!;
+      expect(network.branchesAt(joint.id)).toHaveLength(2);
+      const anchor = anchorFromNode(network, joint, cls);
+      // 枝が 2 本ある所では接線を引き継がない (向きは自由に決められる)。
+      expect(anchor.tangent).toBeUndefined();
+
+      const mate = [...network.segments.values()].find(
+        (seg) => network.getNode(seg.a).pos.z > 1,
+      )!;
+      const end = anchorFromSegment(network, mate.id, 200 + span);
+      const preview = computePlacement(anchor, end, { straight: false, cls });
+      const start = preview.horizontal.p0;
+      expect(Math.hypot(start.x - anchor.pos.x, start.y - anchor.pos.z), `span=${span}`).toBeLessThan(
+        0.05,
+      );
+      // 終点は指した所のまま。
+      expect(preview.end.distanceTo(end.pos), `span=${span}`).toBeLessThan(0.05);
+    }
+  });
+
   it('既存線路の端点へ、プレビューの時点から接線を揃えて接続する', () => {
     const network = new Network();
     addStraight(network, 'rail_yard', new Vector3(-120, 0, 0), new Vector3(0, 0, 0));

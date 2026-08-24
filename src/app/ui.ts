@@ -110,7 +110,6 @@ export class Ui {
       ['station', '駅', 'S'],
       ['zone', '区画', 'Z'],
       ['line', '路線', 'L'],
-      ['scissors', 'シーサス', 'C'],
       ['bulldoze', '撤去', 'X'],
       ['inspect', '確認', 'V'],
     ] as [ToolMode, string, string][]) {
@@ -337,7 +336,6 @@ export class Ui {
       '<b>S</b> 駅配置 / <b>N・M</b> 駅を回転',
       '<b>Z</b> 区画 (道路沿いを塗ると建物が建つ)',
       '<b>L</b> 路線 (駅のホームを順にクリックすると列車が走る)',
-      '<b>C</b> 平行線路へシーサスクロッシングを一括敷設',
       '<b>U</b> 地下ビュー (地形を透過)',
       '<b>右ドラッグ</b> 視点移動 / <b>ホイール</b> 拡大縮小',
       '<b>F</b> 乗車 (車両をクリックで選ぶ) / <b>N</b> 次の車両 / 乗車中はドラッグで見回す',
@@ -429,7 +427,6 @@ export class Ui {
             ? status.hoverStation
               ? `${status.hoverStation.name} を路線に追加`
               : '停める駅のホームをクリック'
-          : status.mode === 'scissors' ? '平行線路上で位置を指定'
           : '対象をクリック',
       ]);
     }
@@ -441,7 +438,7 @@ export class Ui {
     }
     if (!ride && status.parallelTo !== null) rows.push(['平行', `線形 #${status.parallelTo} に沿う`]);
     // 撤去・確認モードではスナップしないので、この行は出さない。
-    if (!ride && (status.mode === 'build' || status.mode === 'scissors')) {
+    if (!ride && status.mode === 'build') {
       rows.push([
         'スナップ',
         status.snap === 'node'
@@ -454,8 +451,6 @@ export class Ui {
               ? '踏切 (交点で止める)'
             : status.snap === 'parallel'
               ? '平行'
-              : status.snap === 'scissors'
-                ? 'シーサスクロッシング'
               : 'なし',
       ]);
     }

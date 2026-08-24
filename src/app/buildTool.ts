@@ -38,11 +38,6 @@ import type { LineId, LineMap } from '../network/line';
 import { checkStationPlacement } from '../network/stationPlacement';
 import { ZONE_COLORS, ZONE_EMPTY_COLOR } from '../build/buildings';
 import type { ZoneMap, ZoneType } from '../network/zoning';
-import {
-  placeScissorsCrossover,
-  scissorsPlanAt,
-  type ScissorsPlan,
-} from '../network/scissors';
 import { evaluateAlignment, type SegmentDiagnostics } from '../network/validation';
 import { createPreviewMaterial, riskTint, setPreviewBlocked } from '../render/materials';
 import {
@@ -60,7 +55,7 @@ import {
 } from './inspect';
 import type { Heightfield } from '../terrain/heightfield';
 
-export type ToolMode = 'build' | 'station' | 'zone' | 'line' | 'scissors' | 'bulldoze' | 'inspect';
+export type ToolMode = 'build' | 'station' | 'zone' | 'line' | 'bulldoze' | 'inspect';
 
 /** 区画を塗る筆の半径 [m]。沿道の全奥行き (`ZONE_DEPTH`) は覆える太さにする。 */
 export const ZONE_BRUSH_RADIUS = 20;
@@ -188,8 +183,6 @@ export class BuildTool {
   private parallel: ParallelReference | null = null;
   /** 平行スナップで組み立てた線形 (プレビューと同じもの)。 */
   private parallelAlignmentPreview: Alignment | null = null;
-  /** シーサスクロッシングの一括施工プレビュー。 */
-  private scissorsPlan: ScissorsPlan | null = null;
   /** 確認モードで読み取った、カーソル下の 1 点。 */
   private inspection: PointInspection | null = null;
   private selectedStationId: StationId | null = null;
@@ -301,7 +294,6 @@ export class BuildTool {
     this.parallelAlignmentPreview = null;
     this.anchorMarker = null;
     this.showMarkers([]);
-    this.scissorsPlan = null;
     this.inspection = null;
     this.inspectProfile = null;
     this.stationCandidate = null;
@@ -323,9 +315,7 @@ export class BuildTool {
     if (!cursor) {
       this.preview = null;
       this.showMarkers(this.anchorMarker ? [this.anchorMarker] : []);
-      this.scissorsPlan = null;
       this.elevationGuideView.update([]);
-      if (this.mode === 'scissors') this.blockers = [];
       this.updatePreviewMesh();
       return;
     }
@@ -382,19 +372,6 @@ export class BuildTool {
       } else {
         this.showMarkers([]);
       }
-      this.updatePreviewMesh();
-      return;
-    }
-
-    if (this.mode === 'scissors') {
-      this.elevationGuideView.update([]);
-      const result = scissorsPlanAt(this.network, cursor);
-      this.scissorsPlan = result.plan;
-      this.hoverSegment = result.hoverSegment;
-      this.blockers = result.blockers;
-      this.snapKind = result.plan ? 'scissors' : 'none';
-      this.preview = null;
-      this.showMarkers([]);
       this.updatePreviewMesh();
       return;
     }
@@ -873,15 +850,6 @@ export class BuildTool {
     } else if (this.mode === 'station' && this.stationCandidate) {
       buildStationPreview(mb, this.stationCandidate);
       this.lastDiagnostics = null;
-    } else if (this.scissorsPlan) {
-      const cls = getClass(this.scissorsPlan.classId);
-      for (const connection of this.scissorsPlan.connections) {
-        buildRibbon(mb, connection.alignment.sample(2), profileFor(cls), {
-          skirt: false,
-          cls,
-        });
-      }
-      this.lastDiagnostics = null;
     } else if (preview && this.anchor) {
       const cls = this.cls;
       const alignment = this.previewAlignment(preview);
@@ -896,7 +864,7 @@ export class BuildTool {
         field: this.field,
       }).blockers;
       buildRibbon(mb, alignment.sample(2), profileFor(cls), { skirt: false, cls });
-    } else if (this.mode !== 'scissors' && this.mode !== 'station') {
+    } else if (this.mode !== 'station') {
       this.lastDiagnostics = null;
       this.blockers = [];
     }
@@ -954,17 +922,6 @@ export class BuildTool {
       this.updateStationPreview();
       return;
     }
-    if (this.mode === 'scissors') {
-      if (!this.scissorsPlan || this.blockers.length > 0) return;
-      placeScissorsCrossover(this.network, this.scissorsPlan);
-      this.scissorsPlan = null;
-      this.preview = null;
-      this.blockers = [];
-      this.onChanged();
-      this.update(this.cursor, this.modifiers);
-      return;
-    }
-
     const target = this.resolveTarget();
     if (!this.anchor) {
       this.anchor = target.anchor;
@@ -1092,23 +1049,17 @@ export class BuildTool {
     const preview = this.preview;
     const length = this.mode === 'station'
       ? this.stationSettings.length * this.stationSettings.trackCount
-      : this.scissorsPlan?.length ?? (preview ? preview.horizontal.length : 0);
+      : preview
+        ? preview.horizontal.length
+        : 0;
     return {
       mode: this.mode,
       classId: this.classId,
       elevation: this.elevationOffset,
-      drawing: this.mode === 'station' ? this.stationCandidate !== null : this.anchor !== null || this.scissorsPlan !== null,
+      drawing: this.mode === 'station' ? this.stationCandidate !== null : this.anchor !== null,
       length,
-      radius: this.scissorsPlan
-        ? Math.min(...this.scissorsPlan.connections.map((item) => item.preview.radius))
-        : preview
-          ? preview.radius
-          : Infinity,
-      grade: this.scissorsPlan
-        ? Math.max(...this.scissorsPlan.connections.map((item) => item.preview.grade))
-        : preview
-          ? preview.grade
-          : 0,
+      radius: preview ? preview.radius : Infinity,
+      grade: preview ? preview.grade : 0,
       diagnostics: this.lastDiagnostics,
       snap: this.snapKind,
       markers: this.markers,
@@ -1118,9 +1069,7 @@ export class BuildTool {
       selectedStation:
         this.selectedStationId === null ? null : this.network.stations.get(this.selectedStationId) ?? null,
       station: { ...this.stationSettings },
-      cost:
-        length *
-        (this.scissorsPlan ? getClass(this.scissorsPlan.classId).costPerMeter : this.cls.costPerMeter),
+      cost: length * this.cls.costPerMeter,
       blockers: this.blockers,
       parallelSnap: this.parallelSnap,
       parallelTo: this.parallel?.segment ?? null,

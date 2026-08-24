@@ -335,10 +335,6 @@ window.addEventListener('keydown', (event) => {
     case 'L':
       setMode('line');
       break;
-    case 'c':
-    case 'C':
-      setMode('scissors');
-      break;
     case 'x':
     case 'X':
       setMode('bulldoze');

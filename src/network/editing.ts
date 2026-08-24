@@ -64,6 +64,13 @@ export interface PlacementPreview {
  * 既存の線形に接続しているときは接線と勾配を引き継ぐので、繋いだ所で
  * 折れ曲がったり勾配が急変したりしない。
  */
+/**
+ * 線形の始点がアンカーからずれてよい距離 [m]。
+ *
+ * 始点はクリックした点そのもの (そこにノードを作る) なので、実質 0。
+ */
+const START_REACH = 0.05;
+
 export function computePlacement(
   anchor: Anchor,
   target: Vector3 | Anchor,
@@ -133,12 +140,20 @@ export function computePlacement(
   } else {
     // 終点から逆向きに解いて反転すれば、始点が自由でも終点では既存線形へ
     // 接する。端点へ繋ぐ場合も確定後に形が変わらない。
-    if (easing) {
-      // 終点から外向きに辿るので、引き継ぐ曲率も外向きの符号にする。
-      const eased = easementFromTangent(b, endOutward!, a, {
-        ...easementOptions,
-        startCurvature: (destination.curvature ?? 0) * endSign,
-      });
+    //
+    // ただし「自由」なのは始点の**向き**だけで、位置は動かせない (クリック
+    // した点に置く)。緩和曲線は規格の最小半径で頭打ちになるので、短い渡り線
+    // では始点まで届かないことがある。そのときは緩和曲線を諦めて円弧で解く。
+    // 円弧は必ず始点を通るので、置いた線形がクリックした点からずれない
+    // (規格を割るほど短ければ、最小半径の判定がそれを止める)。
+    const eased = easing
+      ? easementFromTangent(b, endOutward!, a, {
+          // 終点から外向きに辿るので、引き継ぐ曲率も外向きの符号にする。
+          ...easementOptions,
+          startCurvature: (destination.curvature ?? 0) * endSign,
+        })
+      : null;
+    if (eased && eased.gap <= START_REACH) {
       horizontal = reversedCurve(eased.curve);
       radius = horizontal.extremeCurvature(48).minRadius;
     } else {

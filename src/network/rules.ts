@@ -28,6 +28,23 @@ import type { Heightfield } from '../terrain/heightfield';
 
 /** 交差点として成り立たない浅すぎる交差角。 */
 const MIN_CROSSING_ANGLE = 20 * DEG;
+/**
+ * 線路どうしが同一平面で交わってよい最小の交差角。
+ *
+ * 線路の平面交差はダイヤモンドクロッシングで、実物も浅い角度で交わる
+ * (シーサスクロッシングの中央は 1/8〜1/15 = 7°〜4° ほど)。道路の交差点と
+ * 違って隅を丸める必要がないので、ここまで許す。これより浅いと、交差の
+ * 中が長くなりすぎて「並走している」のと見分けが付かない。
+ *
+ * 浅い交差が実際に置けるかは角度ではなく**交差の中が線形に収まるか**で
+ * 決まる (`crossingTrim` と `tooClose`)。ここはその手前の足切り。
+ */
+const MIN_RAIL_CROSSING_ANGLE = 4 * DEG;
+
+/** 同一平面で交わってよい最小の交差角。線路どうしだけ浅い交差を許す。 */
+function minCrossingAngle(a: NetworkClass, b: NetworkClass): number {
+  return a.kind === 'rail' && b.kind === 'rail' ? MIN_RAIL_CROSSING_ANGLE : MIN_CROSSING_ANGLE;
+}
 /** 交差点 1 つが 1 本のセグメントから取れる長さの上限 (区間長に対する比)。 */
 const MAX_TRIM_RATIO = 0.45;
 /** 交差点 1 つが取り込める長さの上限 [m]。 */
@@ -249,7 +266,7 @@ function checkOverlaps(ctx: PlacementContext, connected: Set<SegmentId>): string
       const cos = Math.abs(a.dx * b.dx + a.dz * b.dz);
       // 浅すぎる角度は交差点にならない (別の規則が止める)。ここで
       // 窓を開けると、重なって並走しているだけの線形まで見逃す。
-      if (sin < Math.sin(MIN_CROSSING_ANGLE)) return;
+      if (sin < Math.sin(minCrossingAngle(cls, other))) return;
       windows.push({ s, reach: crossingTrim(cls, other, sin, cos) + CORNER_MARGIN });
     };
 
@@ -296,7 +313,7 @@ function checkOverlaps(ctx: PlacementContext, connected: Set<SegmentId>): string
     const hits = candidate.hits;
     const reach = candidate.reach;
 
-    let shallow = false;
+    let shallowLimit = 0;
     let tooClose = 0;
     let worstClearance = Infinity;
     let worstCrossing = 0;
@@ -309,7 +326,8 @@ function checkOverlaps(ctx: PlacementContext, connected: Set<SegmentId>): string
       const sin = Math.abs(hit.dirA.x * hit.dirB.y - hit.dirA.y * hit.dirB.x);
       if (Math.abs(dy) <= LEVEL_CROSSING_TOLERANCE) {
         // 同一平面。道路 × 線路は踏切、同じ種別どうしは交差点になる。
-        if (sin < Math.sin(MIN_CROSSING_ANGLE)) shallow = true;
+        const floor = minCrossingAngle(cls, other);
+        if (sin < Math.sin(floor)) shallowLimit = Math.max(shallowLimit, floor);
         if (cls.kind !== other.kind) {
           // 踏切。路面を線路の面に合わせるので、交差角が浅く道路の勾配が
           // 急だと、道路に何十 m もの平坦部を刻むことになる。
@@ -391,8 +409,8 @@ function checkOverlaps(ctx: PlacementContext, connected: Set<SegmentId>): string
         `交差点が近すぎます (あと ${Math.max(1, tooClose).toFixed(0)} m 離すか、既存のノードに繋いでください)。`,
       );
     }
-    if (shallow) {
-      out.push(`交差角が浅すぎます (${(MIN_CROSSING_ANGLE / DEG).toFixed(0)}° 以上必要)。`);
+    if (shallowLimit > 0) {
+      out.push(`交差角が浅すぎます (${(shallowLimit / DEG).toFixed(0)}° 以上必要)。`);
     }
     if (worstCrossing > 0) {
       out.push(
@@ -400,7 +418,7 @@ function checkOverlaps(ctx: PlacementContext, connected: Set<SegmentId>): string
           `すり付けが要ります (交差角を大きくするか、道路の勾配を緩めてください)。`,
       );
     }
-    if (!shallow && overlapDepth > 0) {
+    if (shallowLimit === 0 && overlapDepth > 0) {
       out.push(
         overlapLength > reach * 2.5
           ? '既存の線形と重なって並走しています。'
@@ -475,9 +493,22 @@ function checkRunningAlong(
     const fromStart = joint(ctx.start);
     const fromEnd = joint(ctx.end);
 
+    // 相手と**交わる**所は「戻ってきて重なっている」のではない (渡り線
+    // どうしが交わるシーサスクロッシングがこれにあたる)。交差点・踏切の
+    // 中と同じように、交差の中は判定から外す。
+    const windows: { s: number; reach: number }[] = [];
+    for (const hit of intersectPolylines(mine, line)) {
+      if (Math.abs(hit.yA - hit.yB) > LEVEL_CROSSING_TOLERANCE) continue;
+      const sin = Math.abs(hit.dirA.x * hit.dirB.y - hit.dirA.y * hit.dirB.x);
+      const cos = Math.abs(hit.dirA.x * hit.dirB.x + hit.dirA.y * hit.dirB.y);
+      if (sin < Math.sin(minCrossingAngle(cls, other))) continue;
+      windows.push({ s: hit.sA, reach: crossingTrim(cls, other, sin, cos) + CORNER_MARGIN });
+    }
+
     const otherChords = chordsOf(line, other.halfWidth);
     for (const chord of myChords) {
       if (chord.s <= fromStart || length - chord.s <= fromEnd) continue;
+      if (windows.some((w) => Math.abs(w.s - chord.s) <= w.reach + chord.halfLength)) continue;
       let depth = 0;
       for (const b of otherChords) {
         if (Math.abs(chord.cx - b.cx) > chord.reach + b.reach) continue;
