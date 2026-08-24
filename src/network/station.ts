@@ -28,8 +28,6 @@ export interface StationTrack {
   segment: SegmentId;
   /** Offset from the station centre line; positive is heading-left. */
   offset: number;
-  /** Whether the segment runs in the station heading direction. */
-  forward: boolean;
 }
 
 export interface StationPlatform {
@@ -164,7 +162,7 @@ export function planStationLayout(trackCount: number, platformCount: number): Pl
   for (let i = 0; i < best.strips.length; i++) {
     const item = placed[i];
     if (best.strips[i] === 'track') {
-      tracks.push({ index: trackIndex, offset: item.offset, forward: trackIndex % 2 === 0 });
+      tracks.push({ index: trackIndex, offset: item.offset });
       trackIndex++;
       continue;
     }

@@ -565,7 +565,10 @@ export class Ui {
                   ? '駅をもう 1 つ選んでください'
                   : '線路が繋がっていません'
                 : plan.seamless
-                  ? `環状 ${plan.length.toFixed(0)} m`
+                  ? plan.singleTrack
+                    ? // 同じ線路を往復する。行き違いができないので 1 編成。
+                      `折り返し ${plan.length.toFixed(0)} m · 1 編成`
+                    : `環状 ${plan.length.toFixed(0)} m`
                   : `${plan.length.toFixed(0)} m · ${plan.runs.length} 区間`;
               const gaps = plan.gaps
                 .map(

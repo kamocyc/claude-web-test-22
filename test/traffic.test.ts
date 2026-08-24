@@ -236,6 +236,72 @@ describe('交通シミュレーション', () => {
     expect(reversed).toBeGreaterThan(0);
   });
 
+  it('線路は 1 本の軌道が向き違いの 2 車線になり、折り返しは経路に入らない', () => {
+    const network = new Network();
+    const field = flatField();
+    draw(network, field, 'rail_single', [
+      { x: -300, z: 0, y: 0 },
+      { x: 300, z: 0, y: 0 },
+    ], { straight: true });
+
+    const graph = laneGraphOf(network);
+    for (const segment of network.segments.values()) {
+      const lanes = graph.lanes.filter((l) => l.segment === segment.id);
+      expect(lanes).toHaveLength(2);
+      const [a, b] = lanes;
+      expect(a.reverse).toBe(b.id);
+      expect(b.reverse).toBe(a.id);
+      // 同じ軌道の上を、逆向きに走る。
+      const forward = a.path.poseAt(0);
+      const backward = b.path.poseAt(b.path.length);
+      expect(forward.pos.distanceTo(backward.pos)).toBeLessThan(0.05);
+      expect(forward.dir.dot(backward.dir)).toBeLessThan(-0.99);
+      // 湧かせる場所としては、1 本の軌道を 1 回だけ数える。
+      expect(graph.spawnable.filter((id) => lanes.some((l) => l.id === id)).length).toBeLessThan(2);
+    }
+    // 折り返しは「続けて走れる先」ではない。入れると、その場で向きが変わる。
+    for (const lane of graph.lanes) {
+      expect(lane.next.includes(lane.reverse ?? -1)).toBe(false);
+    }
+  });
+
+  it('行き止まりの線路では、止まってからその場で折り返す', () => {
+    const network = new Network();
+    const field = flatField();
+    draw(network, field, 'rail_single', [
+      { x: -400, z: 0, y: 0 },
+      { x: 400, z: 0, y: 0 },
+    ], { straight: true });
+
+    const traffic = new Traffic(laneGraphOf(network));
+    const facing = new Map<number, number>();
+    const middle = new Map<number, Vector3>();
+    let reversed = 0;
+    let worstShift = 0;
+    let stopped = false;
+    run(traffic, 120, (vehicles) => {
+      for (const vehicle of vehicles) {
+        if (vehicle.kind !== 'train') continue;
+        const heading = Math.sign(vehicle.bodies[0].dir.x);
+        const centre = vehicle.bodies[Math.floor(vehicle.cars / 2)].pos.clone();
+        const before = facing.get(vehicle.id);
+        if (before !== undefined && before !== 0 && heading !== 0 && before !== heading) {
+          reversed++;
+          // 入ってきた線路をそのまま戻るので、編成はその場に留まる。
+          worstShift = Math.max(worstShift, middle.get(vehicle.id)!.distanceTo(centre));
+        }
+        if (vehicle.speed < 0.01) stopped = true;
+        facing.set(vehicle.id, heading);
+        middle.set(vehicle.id, centre);
+      }
+    });
+    expect(traffic.vehicles.some((v) => v.kind === 'train')).toBe(true);
+    expect(reversed).toBeGreaterThan(0);
+    // 走ったまま向きを変えない。車止めの手前で止まりきってから返る。
+    expect(stopped).toBe(true);
+    expect(worstShift).toBeLessThan(18);
+  });
+
   it('列車は線路の上だけを走る', () => {
     const network = new Network();
     const field = flatField();

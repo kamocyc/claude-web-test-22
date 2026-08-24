@@ -467,8 +467,9 @@ export class Network {
       const center = new Vector2(spec.center.x, spec.center.z).addScaledVector(right, track.offset);
       const low = center.clone().addScaledVector(forward, -half);
       const high = center.clone().addScaledVector(forward, half);
-      const p0 = track.forward ? low : high;
-      const p1 = track.forward ? high : low;
+      // 線路に向きは無いので、構内線はどれも駅の向きに揃えて敷く。
+      const p0 = low;
+      const p1 = high;
       const a = this.addNode(new Vector3(p0.x, spec.center.y, p0.y));
       const b = this.addNode(new Vector3(p1.x, spec.center.y, p1.y));
       const segment = this.addSegment({

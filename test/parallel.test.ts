@@ -352,26 +352,27 @@ describe('平行に並んだ線形の扱い', () => {
     }
   });
 
-  it('複線の 2 本は互いに逆向きに走る', () => {
+  it('複線の 2 本は同じ向きに敷かれ、どちらも両方向に走れる', () => {
     const network = new Network();
     const [[left, right]] = layParallel(network, [
       { x: -150, z: 0, y: 0 },
       { x: 150, z: 0, y: 0 },
     ], 2);
 
+    // 線路に向きは無いので、並べた線はどれも同じ向きに敷く。
     const dirOf = (id: SegmentId): Vector2 =>
       network.alignmentOf(id).horizontal.tangentAt(0);
-    expect(dirOf(left).dot(dirOf(right))).toBeLessThan(-0.99);
+    expect(dirOf(left).dot(dirOf(right))).toBeGreaterThan(0.99);
 
-    // 逆向きに敷いても、走る車線は必ず線形の向き (一方通行の種別)。
+    // 1 本の軌道が、向き違いの 2 車線になっている。
     for (const id of [left, right]) {
-      expect(network.classOf(network.getSegment(id)).lanes.every((l) => l.direction === 1)).toBe(
-        true,
-      );
+      const lanes = network.classOf(network.getSegment(id)).lanes;
+      expect(lanes.map((l) => l.direction).sort()).toEqual([-1, 1]);
+      expect(lanes.every((l) => l.offset === 0)).toBe(true);
     }
   });
 
-  it('3 線でも等間隔に並び、中央の線は上り方向のまま', () => {
+  it('3 線でも等間隔に並ぶ', () => {
     const network = new Network();
     const [span] = layParallel(network, [
       { x: -150, z: 0, y: 0 },
@@ -385,12 +386,14 @@ describe('平行に並んだ線形の扱い', () => {
     for (const distance of spacingBetween(network, span[0], span[2])) {
       expect(Math.abs(distance - spacing * 2)).toBeLessThan(0.2);
     }
-    // 左側通行では、中央 (上り) は線形の向きのまま。
+    // 線路には向きが無いので、どの線も反転させずに敷く。
     expect(parallelTracks(getClass('rail_single'), 3).map((t) => t.reversed)).toEqual([
       false,
       false,
-      true,
+      false,
     ]);
+    // 一方通行の種別 (ランプ) では、左側通行になるよう右半分を反転させる。
+    expect(parallelTracks(getClass('road_ramp'), 2).map((t) => t.reversed)).toEqual([false, true]);
   });
 
   it('道路を横切ると線ごとに交差ができるが、踏切としては 1 か所にまとめる', () => {

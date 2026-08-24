@@ -27,7 +27,12 @@ export interface NetworkClass {
 
   /** 車線 (線路では軌道) の一覧。中心線から見て左 (offset が小) の順。 */
   lanes: LaneSpec[];
-  /** 一方通行か。ランプなど、全車線が同じ向きに走る種別で true。 */
+  /**
+   * 一方通行か。ランプなど、全車線が同じ向きに走る種別で true。
+   *
+   * 線路は一方通行ではない。同じ軌道を両方向に走れるので、対向車線を
+   * 持つ道路と同じ扱いになる (ただし車線は左右に分かれず、同じ位置)。
+   */
   oneWay: boolean;
   /**
    * 中央分離帯があるか。
@@ -206,6 +211,10 @@ function road(opts: {
  * 線路の種別。軌道は 1 本だけで、複線・三線は既存の線路に平行して敷いて
  * 作る (`network/parallel.ts`)。1 本ずつ独立した線形なので、片側だけ
  * 分岐させる・片側だけ橋にするといったことが特別扱いなしにできる。
+ *
+ * **線路に向きは無い**。1 本の軌道を両方向の車線として持ち、列車は
+ * 止まった所で折り返して、入ってきた線路をそのまま戻れる。上り線・下り線を
+ * 分けるかどうかは、敷いた形と路線の引き方で決まる。
  */
 function rail(opts: {
   id: string;
@@ -227,8 +236,12 @@ function rail(opts: {
     carriagewayHalfWidth: opts.shoulder,
     sidewalkWidth: 0,
     curbHeight: 0,
-    lanes: [{ offset: 0, width: 3.0, direction: 1 }],
-    oneWay: true,
+    // 同じ軌道 (offset 0) を、線形の向きと逆向きの 2 車線として持つ。
+    lanes: [
+      { offset: 0, width: 3.0, direction: 1 },
+      { offset: 0, width: 3.0, direction: -1 },
+    ],
+    oneWay: false,
     divided: false,
     tracks: [0],
     minRadius: opts.minRadius,

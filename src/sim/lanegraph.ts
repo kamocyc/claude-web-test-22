@@ -15,6 +15,9 @@ import type { StationId } from '../network/station';
  * 車や列車は「線形」ではなく「車線」の上を走る。セグメントの車線と、
  * 交差点の中を通る進路 (コネクタ) を頂点とし、走れる順に辺を張った有向
  * グラフをここで組み立てる。交通シミュレーションはこのグラフだけを見る。
+ *
+ * 線路に向きは無いので、1 本の軌道は向き違いの 2 車線になる。この 2 本は
+ * `reverse` で互いを指し、止まってから折り返す先を表す (`next` ではない)。
  */
 
 export type VehicleKind = 'car' | 'train';
@@ -50,6 +53,14 @@ export interface GraphLane {
   speedLimit: number;
   /** 続けて走れる車線。 */
   next: number[];
+  /**
+   * 同じ線路を逆向きに走る車線 (線路だけ)。
+   *
+   * 線路に向きは無いので、1 本の軌道は向き違いの 2 車線になる。**折り返しは
+   * `next` には入れない**。続けて走れる先ではなく、いったん止まってから
+   * 移る先なので、`next` に入れると車両がその場で向きを変えてしまう。
+   */
+  reverse?: number;
   segment?: SegmentId;
   /** Platform-centre stop measured from this lane path's start. */
   stationStop?: { station: StationId; s: number };
@@ -276,6 +287,8 @@ export function buildLaneGraph(
       });
       bySegment.set(`${seg.id}:${lane.index}`, created.id);
     }
+    // 同じ軌道の向き違いの車線どうしを結ぶ (線路の折り返し)。
+    linkReverse(lanes, cls, seg.id, bySegment);
   }
 
   const laneId = (lane: Lane): number | undefined =>
@@ -388,8 +401,39 @@ export function buildLaneGraph(
     lanes,
     spawnable: lanes
       .filter((l) => l.kind === 'segment' && l.path.length > 15 && !l.stationStop)
+      // 線路は向き違いの 2 車線で 1 本の軌道なので、湧かせる場所としては
+      // 片方だけ数える (両方数えると線路の本数を倍に見積もってしまう)。
+      .filter((l) => l.reverse === undefined || l.reverse > l.id)
       .map((l) => l.id),
   };
+}
+
+/**
+ * 同じ軌道を逆向きに走る車線どうしを結ぶ。
+ *
+ * 断面の同じ位置にある、向きが逆の車線の組を探す。線路では 1 組だけだが、
+ * 種別の定義から引くので、軌道を増やしてもそのまま通る。
+ */
+function linkReverse(
+  lanes: GraphLane[],
+  cls: NetworkClass,
+  segment: SegmentId,
+  bySegment: Map<string, number>,
+): void {
+  if (cls.kind !== 'rail') return;
+  const specs = lanesOf(cls, segment);
+  for (const lane of specs) {
+    if (!lane.forward) continue;
+    const back = specs.find(
+      (other) => !other.forward && Math.abs(other.offset - lane.offset) < 1e-6,
+    );
+    if (!back) continue;
+    const a = bySegment.get(`${segment}:${lane.index}`);
+    const b = bySegment.get(`${segment}:${back.index}`);
+    if (a === undefined || b === undefined) continue;
+    lanes[a].reverse = b;
+    lanes[b].reverse = a;
+  }
 }
 
 type Connect = (

@@ -60,6 +60,8 @@ export interface Vehicle {
    * `run` は走っている区間、`cursor` はその区間で次に足す車線の位置。
    */
   line?: { id: LineId; plan: LinePlan; run: number; cursor: number };
+  /** 動けないまま止まっている時間 [s]。駅の停車・折り返しは数えない。 */
+  stuckFor?: number;
 }
 
 export const STATION_DWELL = 5;
@@ -83,6 +85,26 @@ const STOP_MARGIN = 0.5;
 const COUPLING = 0.8;
 /** 車両を湧かせるときに、まわりに空けておく距離 [m]。 */
 const SPAWN_CLEARANCE = 15;
+
+/**
+ * 止まりきったとみなす速度 [m/s]。
+ *
+ * 追従の式 (IDM) は止まる位置へ漸近するので、速度はいつまでも 0 にならず、
+ * じりじりと進み続ける。ホームや車止めのように「そこで止まる」所では、
+ * この速度まで落ちたら止まったものとして扱う。
+ */
+const CREEP_SPEED = 0.45;
+/** 止まる位置に着いたとみなす距離 [m]。 */
+const STOP_REACH = 0.75;
+
+/**
+ * 行き当たりばったりの列車を降ろすまでの、動けない時間 [s]。
+ *
+ * 線路に向きが無いので、単線で列車どうしが向かい合うと互いに譲れない。
+ * 閉塞を持ち込むほどの模型ではないので、詰まった列車は降ろして別の場所に
+ * 湧かせ直す。路線の列車は降ろさない (走る場所が決まっているため)。
+ */
+const STUCK_LIMIT = 25;
 
 /** 路線 1 本に走らせる編成の数。この距離 [m] に 1 本。 */
 const LINE_TRAIN_SPACING = 2500;
@@ -125,6 +147,13 @@ export class Traffic {
   time = 0;
   private nextId = 1;
   private lines: LinePlan[] = [];
+  /**
+   * 路線の列車が走る車線 (裏の車線も含む)。
+   *
+   * ここには行き当たりばったりの列車を湧かせない。線路に向きが無いので、
+   * 同じ線路に湧かせると路線の列車と正面から向き合うことになる。
+   */
+  private reserved = new Set<number>();
   private rng: () => number;
   private readonly options: Required<TrafficOptions>;
 
@@ -147,6 +176,7 @@ export class Traffic {
     this.graph = graph;
     this.vehicles.length = 0;
     this.lines = [];
+    this.reserved.clear();
     this.rng = mulberry32(this.options.seed);
   }
 
@@ -158,6 +188,16 @@ export class Traffic {
    */
   setLines(plans: LinePlan[]): void {
     this.lines = plans.filter((plan) => plan.runnable);
+    this.reserved.clear();
+    for (const plan of this.lines) {
+      for (const run of plan.runs) {
+        for (const id of run.lanes) {
+          this.reserved.add(id);
+          const twin = this.graph.lanes[id]?.reverse;
+          if (twin !== undefined) this.reserved.add(twin);
+        }
+      }
+    }
     const live = new Set(this.lines.map((plan) => plan.id));
     this.vehicles.splice(
       0,
@@ -174,7 +214,7 @@ export class Traffic {
   /** その種別で走らせたい台数。 */
   targetCount(kind: VehicleKind): number {
     let length = 0;
-    for (const id of this.graph.spawnable) {
+    for (const id of this.spawnPoints()) {
       const lane = this.graph.lanes[id];
       if (lane.vehicleKind === kind) length += lane.path.length;
     }
@@ -253,9 +293,11 @@ export class Traffic {
     }
     if (vehicle.dwellUntil !== undefined) {
       vehicle.dwellUntil = undefined;
-      // 終端に着いた路線の列車は、ここで反対側のホームへ移る (折り返し)。
-      if (this.turnBack(vehicle)) return;
+      // 線路が繋がっていない区間へ移る路線の列車は、ここで回送する。
+      if (this.deadhead(vehicle)) return;
     }
+    // 止まった所で折り返す。入ってきた線路をそのまま戻る。
+    if (this.turnBack(vehicle)) return;
     // 進入すると決めた進路に乗ったら、そこから先は位置で押さえられる。
     if (vehicle.commit !== undefined && vehicle.route.indexOf(vehicle.commit) <= at.index) {
       vehicle.commit = undefined;
@@ -268,6 +310,12 @@ export class Traffic {
       if (ahead > LOOKAHEAD) break;
       // 25 m 先までの制限速度を守る (曲がる進路の手前で落とす)。
       if (ahead <= 25) limit = Math.min(limit, lane.speedLimit);
+
+      // 折り返しの手前では必ず止まる。ホームのある車線ではホームで止まるので、
+      // ここが効くのは車止めの手前で折り返すときになる。
+      if (lane.reverse !== undefined && lane.reverse === vehicle.route[i + 1]) {
+        stopIn = Math.min(stopIn, ahead + lane.path.length);
+      }
 
       if (
         vehicle.kind === 'train' &&
@@ -358,10 +406,12 @@ export class Traffic {
     const crowding = gap > 0.05 ? (wanted / gap) ** 2 : 400;
     const accel = ACCEL * (1 - (v / Math.max(0.5, v0)) ** 4 - crowding);
     vehicle.speed = Math.max(0, v + clamp(accel, -MAX_BRAKE, ACCEL) * dt);
+    // 駅の停車・折り返しはここまで来ないので、数えるのは詰まった時間だけ。
+    vehicle.stuckFor = vehicle.speed < CREEP_SPEED ? (vehicle.stuckFor ?? 0) + dt : 0;
     vehicle.head += vehicle.speed * dt;
     if (upcomingStation) {
       const remaining = upcomingStation.distance - vehicle.speed * dt;
-      if (remaining <= 0.75 && vehicle.speed <= 0.45) {
+      if (remaining <= STOP_REACH && vehicle.speed <= CREEP_SPEED) {
         vehicle.head += Math.max(0, remaining);
         vehicle.speed = 0;
         vehicle.lastStation = upcomingStation.station;
@@ -394,37 +444,67 @@ export class Traffic {
     return distance >= this.brakingDistance(speed);
   }
 
-  /** 前を走る車両との車間 [m] と、その速度。いなければ無限大。 */
+  /**
+   * 前を走る車両との車間 [m] と、その速度。いなければ無限大。
+   *
+   * 線路には向きが無いので、同じ線路を逆から来る列車も見る。向こうは
+   * 弧長を逆から測っているので、こちらの車線の**出口**から測り直す。
+   */
   private leader(vehicle: Vehicle): { gap: number; speed: number } {
     const at = this.locate(vehicle.route, vehicle.head);
     let best = { gap: Infinity, speed: 0 };
+    /** 車線 → 自分の先頭からその車線の入口までの距離。 */
     const offsets = new Map<number, number>();
+    /** 対向の車線 → 自分の先頭からその車線の**起点**までの距離。 */
+    const oncoming = new Map<number, number>();
     let ahead = -at.s;
     for (let i = at.index; i < vehicle.route.length && ahead <= LOOKAHEAD; i++) {
       const id = vehicle.route[i];
+      const lane = this.graph.lanes[id];
       if (!offsets.has(id)) offsets.set(id, ahead);
-      ahead += this.graph.lanes[id]?.path.length ?? 0;
+      const twin = lane?.reverse;
+      // 対向車線の起点は、こちらの車線の終わりにある。
+      if (twin !== undefined && !oncoming.has(twin)) oncoming.set(twin, ahead + lane!.path.length);
+      ahead += lane?.path.length ?? 0;
     }
 
     for (const other of this.vehicles) {
       if (other === vehicle) continue;
       const tail = this.locate(other.route, this.tailOf(other));
       const laneOffset = offsets.get(other.route[tail.index]);
-      if (laneOffset === undefined) continue;
-      const gap = laneOffset + tail.s;
-      if (gap > 0 && gap < best.gap) best = { gap, speed: other.speed };
+      if (laneOffset !== undefined) {
+        const gap = laneOffset + tail.s;
+        if (gap > 0 && gap < best.gap) best = { gap, speed: other.speed };
+      }
+      // 対向はこちらを向いているので、近づいてくるのは向こうの先頭。
+      // 止まっている車両とみなして手前で止まる。
+      const head = this.locate(other.route, other.head);
+      const facing = oncoming.get(other.route[head.index]);
+      if (facing !== undefined) {
+        const gap = facing - head.s;
+        if (gap > 0 && gap < best.gap) best = { gap, speed: 0 };
+      }
     }
     return best;
   }
 
   /** 経路の終わりまでの距離 [m]。延長できるならまだ余裕がある。 */
   private remaining(vehicle: Vehicle): number {
+    return this.routeLength(vehicle) - vehicle.head;
+  }
+
+  /** いま持っている経路の長さ [m]。 */
+  private routeLength(vehicle: Vehicle): number {
     let total = 0;
     for (const id of vehicle.route) total += this.graph.lanes[id]?.path.length ?? 0;
-    return total - vehicle.head;
+    return total;
   }
 
   private alive(vehicle: Vehicle): boolean {
+    // 対向と鉢合わせて動けなくなった列車は降ろす。別の場所に湧き直す。
+    if (vehicle.kind === 'train' && !vehicle.line && (vehicle.stuckFor ?? 0) > STUCK_LIMIT) {
+      return false;
+    }
     // 転回できない行き止まり (一方通行の末端) に着いたら消す。
     if (this.successors(vehicle).length > 0) return true;
     return this.remaining(vehicle) > 3;
@@ -443,18 +523,35 @@ export class Traffic {
     for (let guard = 0; guard < 8; guard++) {
       if (this.remaining(vehicle) > LOOKAHEAD) return;
       const options = this.successors(vehicle);
-      if (options.length === 0) return;
-      const pick = options[Math.floor(this.rng() * options.length) % options.length];
+      if (options.length === 0) {
+        // 行き止まり。線路なら車止めの手前で折り返して戻る。
+        const last = this.graph.lanes[vehicle.route[vehicle.route.length - 1]];
+        if (last?.reverse === undefined) return;
+        vehicle.route.push(last.reverse);
+        continue;
+      }
+      // 対向の列車がいる線路へは入らない。単線で鉢合わせすると、どちらも
+      // 動けなくなる。
+      const free = options.filter((id) => !this.oncomingOn(id));
+      const pool = free.length > 0 ? free : options;
+      const pick = pool[Math.floor(this.rng() * pool.length) % pool.length];
       vehicle.route.push(pick);
     }
+  }
+
+  /** その車線と同じ線路を、逆向きに走っている車両がいるか。 */
+  private oncomingOn(id: number): boolean {
+    const twin = this.graph.lanes[id]?.reverse;
+    if (twin === undefined) return false;
+    return this.vehicles.some((vehicle) => vehicle.route.includes(twin));
   }
 
   /**
    * 路線の列車の経路を伸ばす。
    *
    * 走る車線は決まっているので、行き先を選ばずに計画のとおりに足す。
-   * 環状 (`seamless`) の路線では先頭に戻って足し続け、そうでない路線は
-   * 区間の終わりで止める (そこで折り返す)。
+   * 一巡してそのまま続けられる (`seamless`) 路線では先頭に戻って足し続け、
+   * そうでない路線は区間の終わりで止める (そこから先は回送になる)。
    */
   private extendLineRoute(vehicle: Vehicle): void {
     const line = vehicle.line!;
@@ -471,13 +568,46 @@ export class Traffic {
   }
 
   /**
-   * 終端に着いた路線の列車を、次の区間の先頭 (反対側のホーム) へ移す。
+   * 止まった所で折り返す。
    *
-   * 線路には向きがあるので、終端駅では入ってきた線路をそのままは戻れない。
-   * 引き上げ線や渡り線があれば経路が繋がって折り返しは起きず、無ければ
-   * ここでホームを移る。移ったら折り返しの停車時間を取る。
+   * 線路に向きは無いので、入ってきた線路をそのまま戻れる。経路の次が
+   * 「同じ線路を逆向きに走る車線」なら、そこが折り返し。編成はその場に
+   * 置いたまま向きだけを返すので、最後尾が先頭になる。
+   *
+   * 折り返す位置は、ホームのある車線ではホーム、無ければ線路の終わり
+   * (車止めの手前)。どちらも止まりきってから返す。
    */
   private turnBack(vehicle: Vehicle): boolean {
+    if (vehicle.speed > CREEP_SPEED) return false;
+    const at = this.locate(vehicle.route, vehicle.head);
+    const lane = this.graph.lanes[vehicle.route[at.index]];
+    const next = vehicle.route[at.index + 1];
+    if (!lane || next === undefined || lane.reverse !== next) return false;
+    const body = this.bodyLength(vehicle);
+    const stop =
+      lane.stationStop && lane.stationStop.station === vehicle.lastStation
+        ? lane.stationStop.s + body / 2
+        : lane.path.length;
+    if (at.s < stop - STOP_REACH) return false;
+    vehicle.route = vehicle.route.slice(at.index + 1);
+    // 弧長は逆から測ることになる。先頭は、いま最後尾がいる所に来る。
+    const s = Math.min(lane.path.length, Math.max(at.s, stop));
+    vehicle.head = clamp(lane.path.length - s + body, body, this.routeLength(vehicle));
+    vehicle.speed = 0;
+    vehicle.commit = undefined;
+    vehicle.dwellUntil = this.time + STATION_DWELL;
+    this.updateBodies(vehicle);
+    return true;
+  }
+
+  /**
+   * 終端に着いた路線の列車を、次の区間の始発ホームへ回送する。
+   *
+   * 停車駅の間の線路が繋がっていない路線では、そこで経路が切れている
+   * (`LinePlan.runs` が分かれている)。走れない区間は飛ばして、次の区間の
+   * 先頭に置き直す。繋がっている路線ではここは通らない。
+   */
+  private deadhead(vehicle: Vehicle): boolean {
     const line = vehicle.line;
     if (!line || line.plan.seamless || line.plan.runs.length === 0) return false;
     const run = line.plan.runs[line.run];
@@ -573,10 +703,11 @@ export class Traffic {
   private populateLines(): void {
     for (const plan of this.lines) {
       const running = this.vehicles.filter((v) => v.line?.id === plan.id);
-      const want = Math.min(
-        MAX_LINE_TRAINS,
-        Math.max(1, Math.round(plan.length / LINE_TRAIN_SPACING)),
-      );
+      // 同じ線路を両方向に使う路線は行き違いができない。2 本走らせると
+      // どこかで必ず鉢合わせるので、1 本だけにする。
+      const want = plan.singleTrack
+        ? 1
+        : Math.min(MAX_LINE_TRAINS, Math.max(1, Math.round(plan.length / LINE_TRAIN_SPACING)));
       if (running.length >= want) continue;
       // 複数走らせるときは区間を散らす (往路と復路に 1 本ずつ)。
       this.spawnLineTrain(plan, running.length % plan.runs.length);
@@ -617,8 +748,13 @@ export class Traffic {
     this.vehicles.push(vehicle);
   }
 
+  /** 行き当たりばったりの車両を湧かせてよい車線。 */
+  private spawnPoints(): number[] {
+    return this.graph.spawnable.filter((id) => !this.reserved.has(id));
+  }
+
   private spawn(kind: VehicleKind): void {
-    const candidates = this.graph.spawnable.filter(
+    const candidates = this.spawnPoints().filter(
       (id) => this.graph.lanes[id].vehicleKind === kind,
     );
     if (candidates.length === 0) return;
@@ -658,6 +794,16 @@ export class Traffic {
    * ここは同じ車線の上だけを、位置の重なりで見る。
    */
   private isLaneClear(id: number, from: number, to: number): boolean {
+    const length = this.graph.lanes[id]?.path.length ?? 0;
+    // 同じ線路を逆向きに走る車線にも、同じ場所に列車がいるかもしれない。
+    // 向こうの弧長は逆から測るので、範囲を裏返して見る。
+    const twin = this.graph.lanes[id]?.reverse;
+    if (twin !== undefined && !this.laneFree(twin, length - to, length - from)) return false;
+    return this.laneFree(id, from, to);
+  }
+
+  /** その車線の、その範囲に誰もいないか (対向は見ない)。 */
+  private laneFree(id: number, from: number, to: number): boolean {
     const length = this.graph.lanes[id]?.path.length ?? 0;
     for (const vehicle of this.vehicles) {
       const tail = this.locate(vehicle.route, this.tailOf(vehicle));

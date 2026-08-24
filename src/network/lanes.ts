@@ -33,7 +33,12 @@ export interface Lane {
   forward: boolean;
 }
 
-/** セグメントの車線を、断面の左から順に返す。 */
+/**
+ * セグメントの車線を、断面の左から順に返す。
+ *
+ * 線路は 1 本の軌道を両方向の車線として持つので、同じ横距 (0) の車線が
+ * 向き違いで 2 本返る。
+ */
 export function lanesOf(cls: NetworkClass, segment: SegmentId): Lane[] {
   return cls.lanes.map((spec, index) => ({
     segment,

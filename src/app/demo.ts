@@ -41,9 +41,8 @@ function findAtGradePoint(
 /**
  * 本線の端に終端駅を繋ぐ。
  *
- * 駅の構内線は独立した線形なので、本線の端点と 1 本ずつ結ぶ。線路には
- * 向きがあるので、上り線・下り線それぞれの向きに合わせて繋ぐ (逆に繋ぐと
- * その番線には列車が入れない)。
+ * 駅の構内線は独立した線形なので、本線の端点と 1 本ずつ結ぶ。線路に向きは
+ * 無いので、繋ぐ向きは考えなくてよい。
  */
 function attachTerminus(
   network: Network,
@@ -86,10 +85,8 @@ function attachTerminus(
     const target = near[i];
     const existing = network.getSegment(main.segments[0]);
     const mainGrade = existing.a === main.id ? existing.gradeA : existing.gradeB;
-    // 南から北へ向かう線 (forward) は南の点が始点。逆向きの線はその反対。
-    const [low, high] = stationZ > mainZ ? [main, target.node] : [target.node, main];
-    const a = target.track.forward ? low : high;
-    const b = target.track.forward ? high : low;
+    // 構内線と同じく、南から北へ向かう向きに揃えて敷く。
+    const [a, b] = stationZ > mainZ ? [main, target.node] : [target.node, main];
     const p0 = new Vector2(a.pos.x, a.pos.z);
     const p1 = new Vector2(b.pos.x, b.pos.z);
     network.addSegment({

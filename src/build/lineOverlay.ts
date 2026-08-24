@@ -39,10 +39,15 @@ export function buildLineOverlay(
   plans.forEach((plan, index) => {
     // 路線ごとに横へずらす。1 本だけなら中心を通る。
     const shift = (index - (plans.length - 1) / 2) * BAND_SPACING;
+    // 折り返す路線は同じ線路を両方向に通る。帯は 1 本だけ描く。
+    const drawn = new Set<number>();
     for (const run of plan.runs) {
       for (const id of run.lanes) {
         const lane = graph.lanes[id];
-        if (lane) band(mb, lane, plan.color, shift);
+        if (!lane || drawn.has(id)) continue;
+        drawn.add(id);
+        if (lane.reverse !== undefined) drawn.add(lane.reverse);
+        band(mb, lane, plan.color, shift);
       }
     }
     for (const stop of plan.stops) {

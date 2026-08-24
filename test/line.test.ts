@@ -8,7 +8,9 @@ import { stationAt, type Station } from '../src/network/station';
 import { buildLaneGraph, type GraphLane, type LaneGraph } from '../src/sim/lanegraph';
 import { planLines } from '../src/sim/lineRoute';
 import { Traffic } from '../src/sim/traffic';
+import { buildDemoNetwork } from '../src/app/demo';
 import { WorldBuilder } from '../src/render/worldBuilder';
+import { DEFAULT_TERRAIN, generateTerrain } from '../src/terrain/generator';
 import { TerrainMesh } from '../src/terrain/terrainMesh';
 import { testField } from './support/field';
 
@@ -60,17 +62,18 @@ function shuttleNetwork(): { network: Network; a: Station; b: Station } {
     platformCount: 2,
     elevated: false,
   });
-  // 上り線 (南の 1 番線 → 北の 1 番線) と下り線 (北の 2 番線 → 南の 2 番線)。
+  // 1 番線どうし・2 番線どうしを結ぶ複線。線路に向きは無いので、
+  // どちらの線路も両方向に走れる。
   const track = (station: Station, index: number) =>
     network.getSegment(station.tracks[index].segment);
   straight(network, track(a, 0).b, track(b, 0).a);
-  straight(network, track(b, 1).b, track(a, 1).a);
+  straight(network, track(a, 1).b, track(b, 1).a);
   return { network, a, b };
 }
 
 /** 経路探索だけを見るための、作り物の車線グラフ。 */
 function fakeGraph(
-  lanes: { next?: number[]; length?: number; station?: number; s?: number }[],
+  lanes: { next?: number[]; length?: number; station?: number; s?: number; reverse?: number }[],
 ): LaneGraph {
   const built: GraphLane[] = lanes.map((lane, id) => ({
     id,
@@ -82,11 +85,15 @@ function fakeGraph(
     },
     speedLimit: 20,
     next: lane.next ?? [],
+    reverse: lane.reverse,
     conflicts: [],
     stationStop: lane.station === undefined ? undefined : { station: lane.station, s: lane.s ?? 50 },
   }));
   return { lanes: built, spawnable: [] };
 }
+
+/** 1 両の長さ [m] (`traffic.ts` の TRAIN_SIZE)。 */
+const TRAIN_CAR_LENGTH = 18;
 
 function fakeStations(ids: number[]): Map<number, Station> {
   const out = new Map<number, Station>();
@@ -121,7 +128,7 @@ describe('路線の台帳', () => {
 });
 
 describe('路線の経路', () => {
-  it('複線の折り返し運転では、往路と復路の 2 区間になる', () => {
+  it('終点で折り返す往復運転は、ひと続きの区間になる', () => {
     const { network, a, b } = shuttleNetwork();
     const graph = laneGraphOf(network);
     const lines = new LineMap();
@@ -131,17 +138,68 @@ describe('路線の経路', () => {
 
     const [plan] = planLines(graph, lines.all, network.stations);
     expect(plan.runnable).toBe(true);
-    expect(plan.seamless).toBe(false);
     expect(plan.gaps).toEqual([]);
     expect(plan.itinerary).toEqual([a.id, b.id]);
-    expect(plan.runs).toHaveLength(2);
+    // 入ってきた線路をそのまま戻れるので、区間は切れない。
+    expect(plan.runs).toHaveLength(1);
+    expect(plan.seamless).toBe(true);
     expect(plan.runs[0].startStation).toBe(a.id);
-    expect(plan.runs[0].endStation).toBe(b.id);
-    expect(plan.runs[1].startStation).toBe(b.id);
-    expect(plan.runs[1].endStation).toBe(a.id);
-    // 往路と復路で別の線路 (別のホーム) を通る。
-    expect(plan.runs[0].lanes).not.toEqual(plan.runs[1].lanes);
     expect(plan.length).toBeGreaterThan(2 * 400);
+
+    // 経路の途中で、同じ線路の逆向きの車線へ移る (そこが折り返し)。
+    const lanes = plan.runs[0].lanes;
+    const turns = lanes.filter((id, i) => graph.lanes[id].reverse === lanes[i + 1]);
+    expect(turns).toHaveLength(1);
+    // 折り返して戻るので、同じ線路を両方向に使う。行き違いはできない。
+    expect(plan.singleTrack).toBe(true);
+  });
+
+  it('単線でも、終点で折り返して往復できる', () => {
+    // 0/1 = 駅10 のホーム, 2/3 = 途中, 4/5 = 駅20 のホーム。
+    // 偶数が北行き、奇数がその線路を南行きに走る車線。
+    const graph = fakeGraph([
+      { next: [2], station: 10, reverse: 1 },
+      { station: 10, reverse: 0 },
+      { next: [4], reverse: 3 },
+      { next: [1], reverse: 2 },
+      { station: 20, reverse: 5 },
+      { next: [3], station: 20, reverse: 4 },
+    ]);
+    const lines = new LineMap();
+    const line = lines.create();
+    lines.addStop(line.id, 10);
+    lines.addStop(line.id, 20);
+    const [plan] = planLines(graph, lines.all, fakeStations([10, 20]));
+    expect(plan.runnable).toBe(true);
+    expect(plan.seamless).toBe(true);
+    expect(plan.singleTrack).toBe(true);
+    expect(plan.gaps).toEqual([]);
+    expect(plan.runs).toHaveLength(1);
+    expect(plan.runs[0].lanes).toEqual([0, 2, 4, 5, 3, 1]);
+  });
+
+  it('折り返さずに一周できるなら、折り返さない', () => {
+    // 0 → 1 → 2 → 3 → 0 の環状線。逆向き (4〜7) にも同じだけ走れるが、
+    // 折り返すと時間がかかるぶん、そのまま一周する方が選ばれる。
+    const graph = fakeGraph([
+      { next: [1], station: 10, reverse: 4 },
+      { next: [2], reverse: 5 },
+      { next: [3], station: 20, reverse: 6 },
+      { next: [0], reverse: 7 },
+      { next: [7], station: 10, reverse: 0 },
+      { next: [4], reverse: 1 },
+      { next: [5], station: 20, reverse: 2 },
+      { next: [6], reverse: 3 },
+    ]);
+    const lines = new LineMap();
+    const line = lines.create();
+    lines.addStop(line.id, 10);
+    lines.addStop(line.id, 20);
+    const [plan] = planLines(graph, lines.all, fakeStations([10, 20]));
+    expect(plan.seamless).toBe(true);
+    expect(plan.runs[0].lanes).toEqual([0, 1, 2, 3]);
+    // 片方向にしか使わないので、複数の編成を走らせられる。
+    expect(plan.singleTrack).toBe(false);
   });
 
   it('停車駅が 1 つだけなら走らせない', () => {
@@ -232,7 +290,7 @@ describe('路線の経路', () => {
 });
 
 describe('路線の列車', () => {
-  it('始発ホームから走り出し、終点で折り返して戻ってくる', () => {
+  it('始発ホームから走り出し、終点でその場で折り返して戻ってくる', () => {
     const { network, a, b } = shuttleNetwork();
     const graph = laneGraphOf(network);
     const lines = new LineMap();
@@ -245,7 +303,11 @@ describe('路線の列車', () => {
     traffic.setLines(plans);
 
     const visited: number[] = [];
-    let turnedBack = false;
+    let turnedBack = 0;
+    /** 折り返したときに、編成の真ん中がどれだけ動いたか [m]。 */
+    let worstShift = 0;
+    let facing: Vector3 | null = null;
+    let middle: Vector3 | null = null;
     for (let i = 0; i < 8000; i++) {
       traffic.step(0.05);
       const train = traffic.vehicles.find((vehicle) => vehicle.line?.id === line.id);
@@ -254,10 +316,20 @@ describe('路線の列車', () => {
       if (train.lastStation !== undefined && visited[visited.length - 1] !== train.lastStation) {
         visited.push(train.lastStation);
       }
-      if (train.line!.run === 1) turnedBack = true;
+      // 折り返しは「その場で向きが返る」こと。編成の真ん中は動かない。
+      const now = train.bodies[Math.floor(train.cars / 2)].pos.clone();
+      const dir = train.bodies[0].dir.clone();
+      if (facing && middle && facing.dot(dir) < 0) {
+        turnedBack++;
+        worstShift = Math.max(worstShift, middle.distanceTo(now));
+      }
+      facing = dir;
+      middle = now;
       if (visited.length >= 4) break;
     }
-    expect(turnedBack).toBe(true);
+    expect(turnedBack).toBeGreaterThan(0);
+    // 入ってきた線路をそのまま戻るので、編成は 1 両ぶんも動かない。
+    expect(worstShift).toBeLessThan(TRAIN_CAR_LENGTH);
     // 南 (始発) → 北 (終点) → 折り返して南 → また北。
     expect(visited.slice(0, 4)).toEqual([a.id, b.id, a.id, b.id]);
   });
@@ -275,6 +347,47 @@ describe('路線の列車', () => {
     // 駅の外。
     expect(stationAt(stations, 0, 0)).toBeNull();
     expect(stationAt(stations, 400, a.center.z)).toBeNull();
+  });
+});
+
+describe('サンプルの町の路線', () => {
+  it('終端駅どうしを結ぶと、折り返しながら往復し続ける', () => {
+    const field = testField();
+    generateTerrain(field, DEFAULT_TERRAIN);
+    const network = new Network();
+    buildDemoNetwork(network, field);
+    const world = new WorldBuilder(network, field, new TerrainMesh(field, new MeshBasicMaterial()));
+    for (const station of network.stations.values()) {
+      const line = world.lines.all[0] ?? world.lines.create();
+      world.lines.addStop(line.id, station.id);
+    }
+    const [plan] = world.rebuild().lines;
+    expect(plan.runnable).toBe(true);
+    // 引き上げ線も渡り線も無いので、終端では入ってきた線路をそのまま戻る。
+    expect(plan.seamless).toBe(true);
+    expect(plan.singleTrack).toBe(true);
+    expect(plan.gaps).toEqual([]);
+
+    const [south, north] = [...network.stations.values()].sort(
+      (a, b) => a.center.z - b.center.z,
+    );
+    const visited: number[] = [];
+    let stuck = 0;
+    let worstStuck = 0;
+    for (let i = 0; i < 12000; i++) {
+      world.traffic.step(0.05);
+      const train = world.traffic.vehicles.find((vehicle) => vehicle.line);
+      if (!train) continue;
+      if (train.lastStation !== undefined && visited[visited.length - 1] !== train.lastStation) {
+        visited.push(train.lastStation);
+      }
+      // 停車・折り返し以外で止まったままにならない。
+      stuck = train.speed < 0.5 && train.dwellUntil === undefined ? stuck + 0.05 : 0;
+      worstStuck = Math.max(worstStuck, stuck);
+      if (visited.length >= 3) break;
+    }
+    expect(visited).toEqual([north.id, south.id, north.id]);
+    expect(worstStuck).toBeLessThan(30);
   });
 });
 
@@ -304,7 +417,7 @@ describe('路線ツール', () => {
     const track = (station: Station, index: number) =>
       network.getSegment(station.tracks[index].segment);
     straight(network, track(a, 0).b, track(b, 0).a);
-    straight(network, track(b, 1).b, track(a, 1).a);
+    straight(network, track(a, 1).b, track(b, 1).a);
 
     const world = new WorldBuilder(network, field, new TerrainMesh(field, new MeshBasicMaterial()));
     let changed = 0;
@@ -330,7 +443,8 @@ describe('路線ツール', () => {
     expect(result.stats.lines).toBe(1);
     const [plan] = result.lines;
     expect(plan.runnable).toBe(true);
-    expect(plan.runs).toHaveLength(2);
+    expect(plan.runs).toHaveLength(1);
+    expect(plan.seamless).toBe(true);
 
     // 走らせると、路線の列車が始発ホームに現れる。
     world.animate(0, 0.05);
