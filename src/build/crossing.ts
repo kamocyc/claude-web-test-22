@@ -87,6 +87,18 @@ export interface SurfaceBlend {
   roadGrade: number;
   /** 横断勾配。中心線から右へ 1 m につき上がる量。 */
   roll: number;
+  /**
+   * 目標面の高さを直に与える (省略時は `targetY` と `targetSlope` から
+   * まっすぐ伸ばす)。分岐器のように、目標が相手の縦断そのものになる所で使う。
+   */
+  level?: (s: number) => number;
+  /**
+   * 断面の段差 (縁石・歩道) を潰すか。既定は潰す。
+   *
+   * 踏切では舗装をレール頭頂面に合わせるので、実物と同じく縁石を切り下げる。
+   * 面を動かすだけの補正 (分岐器の高さ揃え) では断面はそのまま。
+   */
+  flattenSection?: boolean;
   /** 補正を全量かける範囲 (片側) [m]。舗装が線路に接している範囲。 */
   core: number;
   /** ここまでで補正を 0 に戻す [m]。 */
@@ -499,7 +511,10 @@ export function surfaceBlendAt(
  */
 export function surfaceHeightScale(blends: SurfaceBlend[], s: number): number {
   let w = 0;
-  for (const blend of blends) w = Math.max(w, blendWeight(blend, s));
+  for (const blend of blends) {
+    if (blend.flattenSection === false) continue;
+    w = Math.max(w, blendWeight(blend, s));
+  }
   return 1 - w;
 }
 
@@ -515,7 +530,10 @@ export function surfaceHeightScale(blends: SurfaceBlend[], s: number): number {
 function levelAt(blend: SurfaceBlend, s: number): number {
   const d = s - blend.s;
   const inside = clamp(d, -blend.core, blend.core);
-  return blend.targetY + blend.targetSlope * inside + blend.roadGrade * (d - inside);
+  const base = blend.level
+    ? blend.level(blend.s + inside)
+    : blend.targetY + blend.targetSlope * inside;
+  return base + blend.roadGrade * (d - inside);
 }
 
 /** 補正をどれだけ効かせるか。舗装の下では全量、そこから滑らかに 0 へ戻す。 */

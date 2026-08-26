@@ -220,6 +220,9 @@ export class BuildTool {
     this.previewMaterial = createPreviewMaterial();
     this.previewMesh = new Mesh(new MeshBuilder().build(), this.previewMaterial);
     this.previewMesh.frustumCulled = false;
+    // 地形より後に描く。掘割やトンネルで線形が地面の下に入っても、何を
+    // 引いているのかが見えるように (スナップ表示・案内線はさらに上)。
+    this.previewMesh.renderOrder = 10;
     this.previewGroup.add(this.previewMesh, this.snapView.group, this.elevationGuideView.group);
   }
 
