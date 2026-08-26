@@ -107,6 +107,34 @@ describe('継ぎ目の平面線形', () => {
     expect(findCurveBreaks(network)).toEqual([]);
   });
 
+  /**
+   * 標準半径より急な曲線には緩和曲線を入れない (徐行区間として素の円曲線で
+   * 敷く) ので、直線から入る所では曲率が飛ぶ。そこは黙って通すのではなく、
+   * 「急すぎて緩和曲線が入らない」と理由を添えて報せる。
+   */
+  it('標準半径より急な曲線は、緩和曲線が入らない旨を添えて鳴る', () => {
+    const cls = getClass('rail_single');
+    const network = chain('rail_single', [new Vector3(0, 0, 0), new Vector3(200, 0, 0)]);
+    const end = network.findNodeNear(new Vector3(200, 0, 0), 1)!;
+    const anchor = anchorFromNode(network, end, cls);
+    // 半径 75 m ぶんの曲がり (最小半径 70 m より緩く、標準半径より急)。
+    const target = new Vector3(260, 0, -30);
+    const preview = computePlacement(anchor, target, { straight: false, cls });
+    expect(preview.radius).toBeLessThan(cls.smoothRadius);
+    expect(preview.radius).toBeGreaterThan(cls.minRadius);
+    // 円弧なので、指した点にはちょうど届く。
+    expect(preview.end.distanceTo(target)).toBeLessThan(0.05);
+    placeSegment(network, cls.id, anchor, { pos: target }, preview);
+
+    const breaks = findCurveBreaks(network);
+    expect(breaks).toHaveLength(1);
+    expect(breaks[0].curvatureBreak).toBe(true);
+    expect(breaks[0].radius).toBeCloseTo(preview.radius, 0);
+    const message = curveBreakMessage(breaks[0]);
+    expect(message).toContain('標準半径');
+    expect(message).toContain('緩和曲線が入りません');
+  });
+
   it('サンプルの町の線路は、どの継ぎ目も繋がっている', () => {
     const field = testField();
     generateTerrain(field, DEFAULT_TERRAIN);

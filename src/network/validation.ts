@@ -170,6 +170,8 @@ export interface CurveBreak {
   deflection: number;
   /** 曲率の差 [1/m]。 */
   curvature: number;
+  /** 継ぎ目の両側のうち、急なほうの曲線半径 [m] (どちらも直線なら `Infinity`)。 */
+  radius: number;
   /** 接線が折れている (線形が曲がり角になっている)。 */
   tangentBreak: boolean;
   /** 曲率が飛んでいる (曲がり方が継ぎ目で急に変わる)。 */
@@ -210,12 +212,14 @@ export function findCurveBreaks(
     const tangentBreak = deflection > tangentLimit;
     const curvatureBreak = curvature > curvatureLimit;
     if (!tangentBreak && !curvatureBreak) continue;
+    const sharpest = Math.max(Math.abs(a.curvature), Math.abs(b.curvature));
     out.push({
       node: node.id,
       pos: node.pos.clone(),
       cls: a.cls,
       deflection,
       curvature,
+      radius: sharpest > 1e-9 ? 1 / sharpest : Infinity,
       tangentBreak,
       curvatureBreak,
     });
@@ -234,10 +238,17 @@ export function curveBreakMessage(brk: CurveBreak): string {
     );
   }
   if (brk.curvatureBreak) {
+    // 標準半径より急な曲線には、そもそも緩和曲線を入れていない (徐行区間
+    // として素の円曲線で敷く)。理由が違うので、直し方も分けて出す。
+    const tail =
+      brk.radius < brk.cls.smoothRadius
+        ? `半径 ${brk.radius.toFixed(0)} m は ${brk.cls.label} の標準半径 ` +
+          `${brk.cls.smoothRadius} m より急なので、緩和曲線が入りません。` +
+          '徐行して通る所ならこのままで、なめらかに繋ぎたければ半径を大きく取り直してください。'
+        : '両端の向きが決まっている繋ぎ方 (端点どうしを結ぶ) には緩和曲線が入らないので、' +
+          '横へ振る区間は長めに取ってください。';
     parts.push(
-      `継ぎ目で曲率が半径 ${(1 / brk.curvature).toFixed(0)} m 相当だけ飛んでいます。` +
-        '両端の向きが決まっている繋ぎ方 (端点どうしを結ぶ) には緩和曲線が入らないので、' +
-        '横へ振る区間は長めに取ってください。',
+      `継ぎ目で曲率が半径 ${(1 / brk.curvature).toFixed(0)} m 相当だけ飛んでいます。` + tail,
     );
   }
   return parts.join(' ');

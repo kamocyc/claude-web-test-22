@@ -98,6 +98,10 @@ export function checkPlacement(ctx: PlacementContext): PlacementCheck {
     const found = new Set<SegmentId>();
     const visit = (node: NodeId, depth: number): void => {
       for (const branch of network.branchesAt(node)) {
+        // 引き直している自分自身は通り抜けない。ここを辿ると、自分の向こう側に
+        // 繋がっている相手まで「両端で繋がる相手」になってしまう (敷く前には
+        // 自分がまだ無いので、そんな繋がり方は見えない)。
+        if (branch.segment === ctx.ignore) continue;
         if (found.has(branch.segment)) continue;
         found.add(branch.segment);
         if (depth <= 0) continue;
@@ -488,7 +492,7 @@ function checkRunningAlong(
     // 繋ぎ目として許す長さ。繋がっていない端からは測らない。
     const joint = (anchor: Anchor): number => {
       const spread = anchor.node !== undefined ? junctionReach(network, anchor.node) : 0;
-      return Math.max(Math.sqrt(2 * cls.minRadius * reach), spread) + CORNER_MARGIN;
+      return Math.max(Math.sqrt(2 * cls.smoothRadius * reach), spread) + CORNER_MARGIN;
     };
     const fromStart = joint(ctx.start);
     const fromEnd = joint(ctx.end);

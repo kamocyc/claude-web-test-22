@@ -42,28 +42,50 @@ function turnoutOnCurve(): Scene {
       { x: -200, z: 220, y: 20 },
       { x: 40, z: 300, y: 20 },
     ]);
+    // 継ぎ目から引くと本線の接線に沿って分かれる (角度の付かない分岐器に
+    // なる) ので、交差点の面を作りたいここでは直線で角度を付けて分ける。
     blockers.push(
-      ...drawBranch(net, field, 'rail_yard', new Vector3(-236, 20, 185), [
-        { x: -140, z: 140, y: 20 },
-        { x: 0, z: 60, y: 20 },
-      ]),
+      ...drawBranch(
+        net,
+        field,
+        'rail_yard',
+        new Vector3(-236, 20, 185),
+        [
+          { x: -140, z: 140, y: 20 },
+          { x: 0, z: 60, y: 20 },
+        ],
+        { straight: true },
+      ),
     );
     return blockers;
   });
 }
 
 describe('カントの付き方', () => {
-  it('曲率に応じて付き、規格最小半径で最大になる', () => {
+  it('曲率に応じて付き、標準半径で最大になる', () => {
     // 横断勾配 = カント / 軌間。
-    expect(cantRoll(RAIL, 1 / RAIL.minRadius)).toBeCloseTo(-RAIL.maxCant / RAIL_GAUGE, 6);
+    expect(cantRoll(RAIL, 1 / RAIL.smoothRadius)).toBeCloseTo(-RAIL.maxCant / RAIL_GAUGE, 6);
     // 緩い曲線では半径に反比例して小さくなる。
-    expect(cantRoll(RAIL, 1 / (RAIL.minRadius * 2))).toBeCloseTo(-RAIL.maxCant / RAIL_GAUGE / 2, 6);
+    expect(cantRoll(RAIL, 1 / (RAIL.smoothRadius * 2))).toBeCloseTo(
+      -RAIL.maxCant / RAIL_GAUGE / 2,
+      6,
+    );
     // 直線では 0。
     expect(cantRoll(RAIL, 0)).toBeCloseTo(0, 12);
     // 左カーブでは逆向き。
-    expect(cantRoll(RAIL, -1 / RAIL.minRadius)).toBeCloseTo(RAIL.maxCant / RAIL_GAUGE, 6);
-    // 規格より急な曲線でも頭打ち。
-    expect(cantRoll(RAIL, 1 / (RAIL.minRadius / 2))).toBeCloseTo(-RAIL.maxCant / RAIL_GAUGE, 6);
+    expect(cantRoll(RAIL, -1 / RAIL.smoothRadius)).toBeCloseTo(RAIL.maxCant / RAIL_GAUGE, 6);
+  });
+
+  /**
+   * 標準半径より急な曲線は徐行して通る所なので、カントを抜いていく。
+   * 実物でも、側線や構内の急曲線は平らな軌道になっている。
+   */
+  it('標準半径より急な曲線では抜けていき、最小半径で 0 になる', () => {
+    const half = (RAIL.smoothRadius + RAIL.minRadius) / 2;
+    expect(cantRoll(RAIL, 1 / half)).toBeCloseTo(-RAIL.maxCant / RAIL_GAUGE / 2, 6);
+    // 最小半径ちょうどで 0。それより急な曲線でも付かない。
+    expect(cantRoll(RAIL, 1 / RAIL.minRadius)).toBeCloseTo(0, 12);
+    expect(cantRoll(RAIL, 1 / (RAIL.minRadius / 2))).toBeCloseTo(0, 12);
   });
 
   it('道路には付かない', () => {

@@ -47,8 +47,21 @@ export interface NetworkClass {
    */
   tracks: number[];
 
-  /** 規格最小曲線半径 [m]。 */
+  /** 規格最小曲線半径 [m]。これを割ると警告になる。 */
   minRadius: number;
+  /**
+   * 緩和曲線とカントを入れる下限の半径 [m]。
+   *
+   * 最小半径は「ここまでなら敷ける」限界で、いつもの線形はもっと緩い。
+   * この半径までは実物どおり緩和曲線を挟んでカントを付けるが、それより
+   * 急な曲線は**徐行区間**として素の円曲線で敷き、カントも付けない
+   * (実物でも側線や構内の急曲線はカントを抜いた平らな軌道になる)。
+   *
+   * 交差点の面の大きさもここから決める (道路で使うのはこれだけ)。面は
+   * 「その種別のふつうの曲線で振り分けるのに要る長さ」なので、限界の
+   * 急曲線に合わせて縮めると、交差点が実際の取り付きより小さくなる。
+   */
+  smoothRadius: number;
   /**
    * 規格最大縦断勾配 (0.08 = 8%)。
    *
@@ -140,6 +153,16 @@ const VERTICAL_ACCEL = 2.4;
  */
 const MIN_VERTICAL_RADIUS = 50;
 
+/**
+ * 標準半径 (`smoothRadius`) / 規格最小半径。
+ *
+ * 最小半径は「ここまでなら敷ける」限界なので、そこを標準の線形とみなすと
+ * どの曲線も限界いっぱいのカントを背負うことになる。ふだん使う半径を
+ * その 1.7 倍あたりに置き、限界に近い急曲線は徐行区間として素の円曲線で
+ * 敷く (`smoothRadius` を参照)。
+ */
+const SMOOTH_RADIUS_RATIO = 1.7;
+
 /** 設計速度から縦曲線半径の規格を決める。5 m 刻みに丸める。 */
 export function verticalRadiusFor(designSpeed: number): number {
   const v = (designSpeed / 3.6) * SPEED_FACTOR;
@@ -193,6 +216,7 @@ function road(opts: {
     divided: opts.divided ?? false,
     tracks: [],
     minRadius: opts.minRadius,
+    smoothRadius: Math.round(opts.minRadius * SMOOTH_RADIUS_RATIO),
     maxGrade: opts.maxGrade,
     minVerticalRadius: opts.minVerticalRadius ?? verticalRadiusFor(opts.designSpeed),
     easement: false,
@@ -221,6 +245,8 @@ function rail(opts: {
   label: string;
   shoulder: number;
   minRadius: number;
+  /** 緩和曲線とカントを入れる下限の半径 [m]。既定は最小半径の 1.7 倍。 */
+  smoothRadius?: number;
   maxGrade: number;
   minVerticalRadius?: number;
   easement?: boolean;
@@ -245,6 +271,7 @@ function rail(opts: {
     divided: false,
     tracks: [0],
     minRadius: opts.minRadius,
+    smoothRadius: opts.smoothRadius ?? Math.round(opts.minRadius * SMOOTH_RADIUS_RATIO),
     maxGrade: opts.maxGrade,
     minVerticalRadius: opts.minVerticalRadius ?? verticalRadiusFor(opts.designSpeed),
     easement: opts.easement ?? true,
@@ -269,7 +296,7 @@ export const NETWORK_CLASSES: NetworkClass[] = [
     laneCount: 2,
     laneWidth: 3.0,
     sidewalkWidth: 1.6,
-    minRadius: 12,
+    minRadius: 7,
     maxGrade: 0.18,
     cornerRadius: 5,
     designSpeed: 30,
@@ -284,7 +311,7 @@ export const NETWORK_CLASSES: NetworkClass[] = [
     laneCount: 4,
     laneWidth: 3.25,
     sidewalkWidth: 2.4,
-    minRadius: 30,
+    minRadius: 18,
     maxGrade: 0.135,
     cornerRadius: 8,
     designSpeed: 50,
@@ -299,7 +326,7 @@ export const NETWORK_CLASSES: NetworkClass[] = [
     laneCount: 6,
     laneWidth: 3.4,
     sidewalkWidth: 3.0,
-    minRadius: 45,
+    minRadius: 26,
     maxGrade: 0.105,
     cornerRadius: 11,
     designSpeed: 60,
@@ -315,7 +342,7 @@ export const NETWORK_CLASSES: NetworkClass[] = [
     laneWidth: 3.5,
     sidewalkWidth: 0,
     divided: true,
-    minRadius: 120,
+    minRadius: 70,
     maxGrade: 0.075,
     cornerRadius: 15,
     designSpeed: 100,
@@ -332,7 +359,7 @@ export const NETWORK_CLASSES: NetworkClass[] = [
     sidewalkWidth: 0,
     shoulderWidth: 1.5,
     oneWay: true,
-    minRadius: 45,
+    minRadius: 26,
     maxGrade: 0.12,
     cornerRadius: 8,
     designSpeed: 50,
@@ -345,7 +372,7 @@ export const NETWORK_CLASSES: NetworkClass[] = [
     id: 'rail_single',
     label: '線路',
     shoulder: 2.2,
-    minRadius: 120,
+    minRadius: 70,
     maxGrade: 0.05,
     designSpeed: 100,
     costPerMeter: 150,
@@ -354,7 +381,7 @@ export const NETWORK_CLASSES: NetworkClass[] = [
     id: 'rail_yard',
     label: '側線 (低規格)',
     shoulder: 1.8,
-    minRadius: 50,
+    minRadius: 30,
     maxGrade: 0.03,
     maxCant: 0.05,
     designSpeed: 40,

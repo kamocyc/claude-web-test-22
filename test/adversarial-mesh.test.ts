@@ -375,13 +375,19 @@ function seamViolations(scene: Scene, tolerance = 0.01): Violation[] {
     if (sections.length !== 2) continue;
     const [a, b] = sections;
     if (a.length !== b.length) continue;
+    // 断面の並び順は、2 本の向きが揃っているか逆かで変わる。カントが付くと
+    // 断面は左右対称でなくなるので、どちら向きに突き合わせるかは世界座標で
+    // 決める (添字をそのまま裏返すと、カントのぶんずれて見える)。
+    const xz = (p: Vector3, q: Vector3): number => Math.hypot(p.x - q.x, p.z - q.z);
+    const flipped = xz(a[0], b[0]) > xz(a[0], b[b.length - 1]);
     for (let i = 0; i < a.length; i++) {
-      const dy = Math.abs(a[i].y - b[b.length - 1 - i].y);
+      const mate = flipped ? b[b.length - 1 - i] : b[i];
+      const dy = Math.abs(a[i].y - mate.y);
       if (dy > tolerance) {
         out.push({
           amount: dy,
           where: a[i],
-          what: `帯どうしの段差: node=${id} kind=${junction.kind} ${a[i].y.toFixed(2)} vs ${b[b.length - 1 - i].y.toFixed(2)}`,
+          what: `帯どうしの段差: node=${id} kind=${junction.kind} ${a[i].y.toFixed(2)} vs ${mate.y.toFixed(2)}`,
         });
       }
     }
@@ -1154,8 +1160,20 @@ function turnoutScene(options: {
     ], { straight: true });
     const hit = net.findSegmentNear(new Vector3(0, 0, 0), 10)!;
     const node = net.splitSegment(hit.segment, hit.s);
+    // 継ぎ目から引くと本線の接線に沿って分かれる (角度の付かない分岐器に
+    // なる) ので、交差点の面を作りたいここでは直線で角度を付けて分ける。
+    // その先は端点からの続きなので、いつもどおり接線を引き継ぐ。
+    draw(
+      net,
+      field,
+      'rail_yard',
+      [
+        { x: node.pos.x, z: node.pos.z, y: node.pos.y },
+        { x: 20, z: node.pos.z + 120, y: node.pos.y + yg * 120 },
+      ],
+      { straight: true },
+    );
     draw(net, field, 'rail_yard', [
-      { x: node.pos.x, z: node.pos.z, y: node.pos.y },
       { x: 20, z: node.pos.z + 120, y: node.pos.y + yg * 120 },
       { x: 70, z: node.pos.z + 240, y: node.pos.y + yg * 240 },
     ]);

@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { Vector2, Vector3 } from 'three';
 import { Alignment } from '../src/core/alignment';
-import { curveFromTangents } from '../src/core/curve';
+import { arcFromTangent, curveFromTangents } from '../src/core/curve';
 import { VerticalProfile } from '../src/core/profile';
 import { getClass } from '../src/network/classes';
 import {
@@ -90,6 +90,77 @@ describe('規格最大勾配', () => {
       expect(check(tooSteep).join(' ')).toContain('勾配');
     });
   }
+});
+
+describe('規格最小曲線半径', () => {
+  /**
+   * 曲線の規格も、実物の基準よりだいぶ緩めてある。1 区画 40 m の縮尺では
+   * 実物どおりの半径を求めると、街の中に線路も道路も収まらないため。
+   */
+  const cases: [string, number][] = [
+    ['road_small', 7],
+    ['road_medium', 18],
+    ['road_large', 26],
+    ['road_highway', 70],
+    ['road_ramp', 26],
+    ['rail_single', 70],
+    ['rail_yard', 30],
+  ];
+
+  /** 始点で +x を向き、半径 `radius` で 60° 曲がる円弧の線形。 */
+  function bend(radius: number): Alignment {
+    const sweep = Math.PI / 3;
+    const a = new Vector2(0, 0);
+    const b = new Vector2(radius * Math.sin(sweep), radius * (1 - Math.cos(sweep)));
+    const { curve } = arcFromTangent(a, new Vector2(1, 0), b);
+    return new Alignment(curve, VerticalProfile.linear(20, 20, curve.length));
+  }
+
+  for (const [classId, minRadius] of cases) {
+    it(`${classId} の最小半径は ${minRadius} m`, () => {
+      const cls = getClass(classId);
+      expect(cls.minRadius).toBe(minRadius);
+      const network = new Network();
+      const check = (radius: number): string[] => {
+        const alignment = bend(radius);
+        return checkPlacement({
+          network,
+          cls,
+          alignment,
+          start: { pos: alignment.sampleAt(0).pos.clone() },
+          end: { pos: alignment.sampleAt(alignment.length).pos.clone() },
+        }).blockers;
+      };
+      expect(check(minRadius * 1.05)).toEqual([]);
+      expect(check(minRadius * 0.9).join(' ')).toContain('最小半径');
+    });
+  }
+
+  /**
+   * 最小半径は「ここまでなら敷ける」限界で、ふだんの線形はもっと緩い。
+   * 標準半径 (`smoothRadius`) までは緩和曲線とカントを入れるが、それより
+   * 急な曲線は徐行区間として素の円弧で敷く。円弧は必ず指した点を通るので、
+   * 緩和曲線が届かずに終点がずれることもない。
+   */
+  it('標準半径より急な繋ぎ方は、緩和曲線を挟まずに円弧で解く', () => {
+    const cls = getClass('rail_single');
+    const from = { pos: new Vector3(0, 20, 0), tangent: new Vector2(1, 0) };
+
+    // 半径 75 m ぶんの曲がり (標準半径 119 m より急、最小半径 70 m より緩い)。
+    const tight = computePlacement(from, new Vector3(60, 20, 30), { straight: false, cls });
+    expect(tight.radius).toBeGreaterThan(cls.minRadius);
+    expect(tight.radius).toBeLessThan(cls.smoothRadius);
+    // 円弧なので、始点から終点まで曲率が一定。
+    expect(tight.horizontal.curvatureAt(0)).toBeCloseTo(1 / tight.radius, 3);
+    // 指した点にちょうど届く。
+    expect(tight.end.distanceTo(new Vector3(60, 20, 30))).toBeLessThan(0.05);
+
+    // 緩い曲線では今までどおり緩和曲線が入る (始点の曲率は 0 のまま)。
+    const gentle = computePlacement(from, new Vector3(240, 20, 30), { straight: false, cls });
+    expect(gentle.radius).toBeGreaterThan(cls.smoothRadius);
+    expect(Math.abs(gentle.horizontal.curvatureAt(0))).toBeLessThan(1e-4);
+    expect(gentle.end.distanceTo(new Vector3(240, 20, 30))).toBeLessThan(0.05);
+  });
 });
 
 describe('敷設できるかどうかの判定', () => {
@@ -407,8 +478,6 @@ describe('既存の線形への取り付き', () => {
       const joint = network.findNodeNear(new Vector3(0, 0, 0), 0.5)!;
       expect(network.branchesAt(joint.id)).toHaveLength(2);
       const anchor = anchorFromNode(network, joint, cls);
-      // 枝が 2 本ある所では接線を引き継がない (向きは自由に決められる)。
-      expect(anchor.tangent).toBeUndefined();
 
       const mate = [...network.segments.values()].find(
         (seg) => network.getNode(seg.a).pos.z > 1,
@@ -421,6 +490,43 @@ describe('既存の線形への取り付き', () => {
       );
       // 終点は指した所のまま。
       expect(preview.end.distanceTo(end.pos), `span=${span}`).toBeLessThan(0.05);
+    }
+  });
+
+  /**
+   * 継ぎ目 (枝が 2 本のノード) は、線形としては区間の途中と変わらない。
+   * 接線を引き継がないと、継ぎ目に当たった所だけ分岐が線路に沿わなくなる。
+   */
+  it('継ぎ目から分岐しても、区間の途中と同じように接線に沿う', () => {
+    const cls = getClass('rail_single');
+    const network = new Network();
+    addStraight(network, 'rail_single', new Vector3(-200, 0, 0), new Vector3(0, 0, 0));
+    addStraight(network, 'rail_single', new Vector3(0, 0, 0), new Vector3(200, 0, 0));
+    const joint = network.findNodeNear(new Vector3(0, 0, 0), 0.5)!;
+    expect(network.branchesAt(joint.id)).toHaveLength(2);
+    const anchor = anchorFromNode(network, joint, cls);
+
+    // 継ぎ目から 1 m だけ離れた、区間の途中と見比べる。
+    const mate = [...network.segments.values()].find(
+      (seg) => network.getNode(seg.a).pos.x >= 0,
+    )!;
+    const inside = anchorFromSegment(network, mate.id, 1);
+
+    for (const side of [-1, 1]) {
+      for (const z of [30, -30]) {
+        const target = new Vector3(side * 120, 0, z);
+        const here = computePlacement(anchor, target, { straight: false, cls });
+        const there = computePlacement(inside, target, { straight: false, cls });
+        // 出ていく向きは線路の接線そのもの (カーソルの側を向く)。
+        const tangent = here.horizontal.tangentAt(0);
+        expect(tangent.x * side).toBeGreaterThan(0.999);
+        expect(Math.abs(tangent.y)).toBeLessThan(1e-6);
+        // 区間の途中から引いたときと同じ形になる (1 m ぶんの差だけ)。
+        expect(Math.abs(here.radius - there.radius) / there.radius).toBeLessThan(0.05);
+        // 始点も終点もクリックした点のまま。
+        expect(Math.hypot(here.horizontal.p0.x, here.horizontal.p0.y)).toBeLessThan(0.05);
+        expect(here.end.distanceTo(target)).toBeLessThan(0.05);
+      }
     }
   });
 
