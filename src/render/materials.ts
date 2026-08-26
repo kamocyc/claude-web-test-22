@@ -57,6 +57,8 @@ export function createSurfaceMaterial(options?: {
   transparent?: boolean;
   opacity?: number;
   depthWrite?: boolean;
+  /** false にすると、何かの陰に入っていても必ず描かれる (透視表示)。 */
+  depthTest?: boolean;
   polygonOffsetUnits?: number;
   side?: typeof DoubleSide | undefined;
   /** 診断表示の on/off を制御する uniform。既定は全体共有のもの。 */
@@ -71,6 +73,7 @@ export function createSurfaceMaterial(options?: {
     transparent: options?.transparent ?? false,
     opacity: options?.opacity ?? 1,
     depthWrite: options?.depthWrite ?? true,
+    depthTest: options?.depthTest ?? true,
     polygonOffset: true,
     // 傾き係数は 0 にする。視線に対して浅い角度で見た面では傾き係数の項が
     // 巨大になり、路面が数十 cm 手前に寄ってしまう。踏切のレールのように
@@ -241,19 +244,67 @@ export function createPropMaterial(): MeshStandardMaterial {
   });
 }
 
+/** 敷設できないプレビューを赤く塗るための uniform。 */
+const previewBlocked = { value: 0 };
+
+/*
+ * プレビューの濃さ。
+ *
+ * プレビューは 2 枚重ねで描く (`createPreviewXrayMaterial` を参照)。
+ * 隠れている所は透視用の 1 枚だけなので `XRAY` の濃さで薄く透け、地表に
+ * 出ている所は 2 枚が重なって
+ *   xray + surface - xray * surface
+ * の濃さになる。これが `VISIBLE` ちょうどになるよう上に重ねる 1 枚を
+ * 逆算するので、見えている所の濃さは 1 枚だった頃と変わらない。
+ */
+
+/** 隠れている所 (透視用の 1 枚だけ) の濃さ。 */
+const PREVIEW_XRAY_OPACITY = { open: 0.4, blocked: 0.52 };
+/** 見えている所 (2 枚重ね) の濃さ。 */
+const PREVIEW_VISIBLE_OPACITY = { open: 0.75, blocked: 0.9 };
+
+/** 透視用の 1 枚に重ねて `visible` の濃さになる、上の 1 枚の不透明度。 */
+function overlayOpacity(visible: number, xray: number): number {
+  return (visible - xray) / (1 - xray);
+}
+
+const PREVIEW_OPACITY = {
+  open: overlayOpacity(PREVIEW_VISIBLE_OPACITY.open, PREVIEW_XRAY_OPACITY.open),
+  blocked: overlayOpacity(PREVIEW_VISIBLE_OPACITY.blocked, PREVIEW_XRAY_OPACITY.blocked),
+};
+
 /**
  * 建設プレビュー用の半透明マテリアル。規格違反がすぐ分かるよう、
  * 全体設定にかかわらず常に診断色で表示する。
  */
-/** 敷設できないプレビューを赤く塗るための uniform。 */
-const previewBlocked = { value: 0 };
-
 export function createPreviewMaterial(): MeshStandardMaterial {
   return createSurfaceMaterial({
     transparent: true,
-    opacity: 0.75,
+    opacity: PREVIEW_OPACITY.open,
     depthWrite: false,
     polygonOffsetUnits: -16,
+    diagnostics: { value: 1 },
+    blocked: previewBlocked,
+  });
+}
+
+/**
+ * 隠れたプレビューを透かして出すためのマテリアル。
+ *
+ * 深度試験をしないので、トンネルのように地形の下へ潜る線形も、丘の陰に
+ * 入った線形も必ず描かれる。`createPreviewMaterial` の面より**先に**
+ * 描いて (renderOrder を小さくする)、見えている所はその上から塗り直す。
+ * こうすると、地表に出ている所は今までどおりの濃さで、隠れている所だけが
+ * 薄く透けて見える。裏から見ることになるので両面表示にする。
+ */
+export function createPreviewXrayMaterial(): MeshStandardMaterial {
+  return createSurfaceMaterial({
+    transparent: true,
+    opacity: PREVIEW_XRAY_OPACITY.open,
+    depthWrite: false,
+    depthTest: false,
+    polygonOffsetUnits: -16,
+    side: DoubleSide,
     diagnostics: { value: 1 },
     blocked: previewBlocked,
   });
@@ -264,9 +315,10 @@ export function createPreviewMaterial(): MeshStandardMaterial {
  * 診断色より優先して赤く塗るので、置けないことが一目で分かる。
  */
 export function setPreviewBlocked(
-  mesh: { material: MeshStandardMaterial },
+  materials: { preview: MeshStandardMaterial; xray: MeshStandardMaterial },
   blocked: boolean,
 ): void {
   previewBlocked.value = blocked ? 1 : 0;
-  mesh.material.opacity = blocked ? 0.9 : 0.75;
+  materials.preview.opacity = blocked ? PREVIEW_OPACITY.blocked : PREVIEW_OPACITY.open;
+  materials.xray.opacity = blocked ? PREVIEW_XRAY_OPACITY.blocked : PREVIEW_XRAY_OPACITY.open;
 }

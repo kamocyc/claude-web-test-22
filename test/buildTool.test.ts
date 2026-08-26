@@ -4,7 +4,7 @@ import { Mesh } from 'three';
 import { BuildTool } from '../src/app/buildTool';
 import { SnapView } from '../src/render/snapView';
 import { Network } from '../src/network/network';
-import { Vector2, MeshBasicMaterial } from 'three';
+import { Vector2, MeshBasicMaterial, type MeshStandardMaterial } from 'three';
 import { getClass } from '../src/network/classes';
 import { anchorFromNode, computePlacement, placeSegment } from '../src/network/editing';
 import { formatRadius } from '../src/app/inspect';
@@ -309,6 +309,65 @@ describe('高さで選ぶスナップ', () => {
   });
 });
 
+describe('地形に隠れたプレビュー', () => {
+  /** 地下へ 1 段下げた線路を引きかけの状態にする。 */
+  function underground(): BuildTool {
+    const network = new Network();
+    const tool = new BuildTool(network, flatField(10), () => {});
+    tool.setClass('rail_single');
+    tool.setParallelSnap(false);
+    // 地表 (標高 10 m) より下を通す。
+    tool.adjustElevation(-2);
+    clickAt(tool, -60, 0);
+    tool.update(new Vector3(60, 0, 0), MODS);
+    return tool;
+  }
+
+  function meshes(tool: BuildTool): { surface: Mesh; xray: Mesh } {
+    return {
+      surface: tool.previewGroup.getObjectByName('preview-surface') as Mesh,
+      xray: tool.previewGroup.getObjectByName('preview-xray') as Mesh,
+    };
+  }
+
+  it('地形の下でも見えるよう、深度試験なしの面を重ねて描く', () => {
+    const { surface, xray } = meshes(underground());
+    const material = xray.material as MeshStandardMaterial;
+    // 深度試験をしないので、地形やその他の物に隠れても必ず描かれる。
+    expect(material.depthTest).toBe(false);
+    expect(material.transparent).toBe(true);
+    // 地表に出ている所は本体が上から塗り直せるよう、先に描く。
+    expect(xray.renderOrder).toBeLessThan(surface.renderOrder);
+    expect((surface.material as MeshStandardMaterial).depthTest).toBe(true);
+  });
+
+  it('透ける面は本体と同じ形 (プレビューが二重にずれない)', () => {
+    const tool = underground();
+    const { surface, xray } = meshes(tool);
+    expect(surface.geometry.getAttribute('position').count).toBeGreaterThan(0);
+    expect(xray.geometry).toBe(surface.geometry);
+
+    // 引き直しても同じ形を指したままにする。
+    tool.update(new Vector3(40, 0, 30), MODS);
+    expect(xray.geometry).toBe(surface.geometry);
+  });
+
+  it('置けないときは本体も透ける面も赤く濃くなる', () => {
+    const tool = underground();
+    const { surface, xray } = meshes(tool);
+    const open = {
+      surface: (surface.material as MeshStandardMaterial).opacity,
+      xray: (xray.material as MeshStandardMaterial).opacity,
+    };
+    // 短い区間で一気に持ち上げると、最大勾配を超えて置けなくなる。
+    tool.adjustElevation(20);
+    tool.update(new Vector3(-40, 0, 0), MODS);
+    expect(tool.status().blockers.length).toBeGreaterThan(0);
+    expect((surface.material as MeshStandardMaterial).opacity).toBeGreaterThan(open.surface);
+    expect((xray.material as MeshStandardMaterial).opacity).toBeGreaterThan(open.xray);
+  });
+});
+
 describe('引いてきた道の上への折り返し', () => {
   /** 東西の道路を 1 本引いて、終点に居る (続きを引ける) 状態にする。 */
   function drawn(mods = MODS): { tool: BuildTool; network: Network } {
@@ -349,13 +408,24 @@ describe('引いてきた道の上への折り返し', () => {
     expect(network.segments.size).toBe(before);
   });
 
-  it('少し外して指しても、指した所まで届かない線形は置けない', () => {
-    // 真後ろに近い所は、接線に接する円弧が何百 m も回り込む。
-    const { tool } = drawn();
+  it('少し外して指しても、届く所まで敷ける (警告は出さない)', () => {
+    // 真後ろに近い所は、接線に接する円弧が何百 m も回り込む。掃引角の
+    // 制限でその円弧は指した所まで届かないが、届く所までは敷ける。
+    const { tool, network } = drawn();
     tool.update(new Vector3(60, 0, 12), { straight: false, noSnap: false });
     const status = tool.status();
     expect(status.length).toBeGreaterThan(400);
-    expect(status.blockers.join(' ')).toContain('届きません');
+    expect(status.blockers).toEqual([]);
+
+    tool.click();
+    expect(network.segments.size).toBe(2);
+    // 端点は指した所ではなく、線形が実際に届いた所に立つ。プレビューに
+    // 出ていた形のまま残るので、敷いたあとで線形が歪まない。
+    const added = network.getSegment([...network.segments.keys()].pop()!);
+    const alignment = network.alignmentOf(added.id);
+    expect(alignment.length).toBeCloseTo(status.length, 1);
+    const tip = alignment.sampleAt(alignment.length).pos;
+    expect(Math.hypot(tip.x - 60, tip.z - 12)).toBeGreaterThan(5);
   });
 
   it('前へ続けるのはそのまま置ける', () => {

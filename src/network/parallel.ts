@@ -131,9 +131,11 @@ export function parallelAlignment(
 export function previewFromAlignment(alignment: Alignment): PlacementPreview {
   const horizontal = alignment.horizontal;
   const length = horizontal.length;
+  const start = alignment.sampleAt(0).pos;
   const end = alignment.sampleAt(length).pos;
   return {
     horizontal,
+    start: new Vector3(start.x, start.y, start.z),
     end: new Vector3(end.x, end.y, end.z),
     startGrade: alignment.vertical.m0,
     endGrade: alignment.vertical.m1,

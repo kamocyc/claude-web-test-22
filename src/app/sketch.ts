@@ -186,6 +186,7 @@ function placeTracks(
     const result = placeSegment(network, classId, start, end, {
       ...preview,
       horizontal,
+      start: startPos,
       end: endPos,
       endTangent: horizontal.tangentAt(horizontal.length),
       endCurvature: horizontal.curvatureAt(horizontal.length),

@@ -7,10 +7,12 @@ import { buildRibbon, profileFor } from '../build/surface';
 import { buildStationPreview } from '../build/station';
 import { getClass, type NetworkClass } from '../network/classes';
 import {
+  REACH_GAP,
   anchorFromNode,
   anchorFromSegment,
   computePlacement,
   placeSegment,
+  reachedAnchor,
   type Anchor,
   type PlaceResult,
   type PlacementPreview,
@@ -39,7 +41,12 @@ import { checkStationPlacement } from '../network/stationPlacement';
 import { ZONE_COLORS, ZONE_EMPTY_COLOR } from '../build/buildings';
 import type { ZoneMap, ZoneType } from '../network/zoning';
 import { evaluateAlignment, type SegmentDiagnostics } from '../network/validation';
-import { createPreviewMaterial, riskTint, setPreviewBlocked } from '../render/materials';
+import {
+  createPreviewMaterial,
+  createPreviewXrayMaterial,
+  riskTint,
+  setPreviewBlocked,
+} from '../render/materials';
 import {
   ELEVATION_GUIDE_STEP,
   ElevationGuideView,
@@ -168,6 +175,9 @@ export class BuildTool {
   private readonly elevationGuideView = new ElevationGuideView();
   private readonly previewMesh: Mesh;
   private readonly previewMaterial: MeshStandardMaterial;
+  /** 地形などに隠れた所を透かして出す、プレビューのもう 1 枚。 */
+  private readonly previewXrayMesh: Mesh;
+  private readonly previewXrayMaterial: MeshStandardMaterial;
   private anchor: Anchor | null = null;
   private cursor: Vector3 | null = null;
   private preview: PlacementPreview | null = null;
@@ -219,8 +229,23 @@ export class BuildTool {
     this.previewGroup.name = 'preview';
     this.previewMaterial = createPreviewMaterial();
     this.previewMesh = new Mesh(new MeshBuilder().build(), this.previewMaterial);
+    this.previewMesh.name = 'preview-surface';
     this.previewMesh.frustumCulled = false;
-    this.previewGroup.add(this.previewMesh, this.snapView.group, this.elevationGuideView.group);
+    // トンネルや丘の陰でプレビューが消えないよう、同じ形をもう 1 枚、
+    // 深度試験なしで**先に**描く。地表に出ている所はこのあと
+    // `previewMesh` が上から塗り直すので、隠れている所だけが薄く透ける。
+    this.previewXrayMaterial = createPreviewXrayMaterial();
+    this.previewXrayMesh = new Mesh(this.previewMesh.geometry, this.previewXrayMaterial);
+    this.previewXrayMesh.name = 'preview-xray';
+    this.previewXrayMesh.frustumCulled = false;
+    this.previewXrayMesh.renderOrder = 14;
+    this.previewMesh.renderOrder = 15;
+    this.previewGroup.add(
+      this.previewXrayMesh,
+      this.previewMesh,
+      this.snapView.group,
+      this.elevationGuideView.group,
+    );
   }
 
   get cls(): NetworkClass {
@@ -728,15 +753,19 @@ export class BuildTool {
       end = { ...end, pos: this.snapAngle(this.anchor.pos, end.pos) };
     }
 
-    this.endAnchor = end;
     this.preview = computePlacement(this.anchor, end, {
       straight: this.modifiers.straight,
       cls: this.cls,
     });
+    // 掃引角の制限で指した所まで届かないときは、届いた所を終点にして敷く。
+    // 吸い付いていた相手には繋がらないので、その目印も出さない。
+    const short =
+      Math.hypot(this.preview.end.x - end.pos.x, this.preview.end.z - end.pos.z) > REACH_GAP;
+    this.endAnchor = reachedAnchor(end, this.preview.end);
     // (角度スナップで位置をずらすのは、どこにも吸い付いていないときだけ
     //  なので、そのときは target.marker が無い。)
-    this.showMarkers([this.anchorMarker, target.marker]);
-    this.updateElevationGuides([this.anchor.pos, end.pos]);
+    this.showMarkers([this.anchorMarker, short ? null : target.marker]);
+    this.updateElevationGuides([this.anchor.pos, this.endAnchor.pos]);
     this.updatePreviewMesh();
   }
 
@@ -859,7 +888,9 @@ export class BuildTool {
         network: this.network,
         cls,
         alignment,
-        start: this.anchor,
+        // 届かなかった端は接続を諦めて敷くので、判定もその形で行う
+        // (`placeSegment` が同じ `reachedAnchor` で端点を決める)。
+        start: reachedAnchor(this.anchor, preview.start),
         end: this.endAnchor ?? { pos: preview.end },
         field: this.field,
       }).blockers;
@@ -869,9 +900,15 @@ export class BuildTool {
       this.blockers = [];
     }
     // 置けないときはプレビューを赤くする。
-    setPreviewBlocked({ material: this.previewMaterial }, this.blockers.length > 0);
+    setPreviewBlocked(
+      { preview: this.previewMaterial, xray: this.previewXrayMaterial },
+      this.blockers.length > 0,
+    );
     const old = this.previewMesh.geometry;
-    this.previewMesh.geometry = mb.build();
+    // 透視用の面は同じ形を使い回す (作り直すのは 1 つだけ)。
+    const geometry = mb.build();
+    this.previewMesh.geometry = geometry;
+    this.previewXrayMesh.geometry = geometry;
     old.dispose();
   }
 
