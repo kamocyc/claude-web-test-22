@@ -28,8 +28,6 @@ export interface StationTrack {
   segment: SegmentId;
   /** Offset from the station centre line; positive is heading-left. */
   offset: number;
-  /** Whether the segment runs in the station heading direction. */
-  forward: boolean;
 }
 
 export interface StationPlatform {
@@ -164,7 +162,7 @@ export function planStationLayout(trackCount: number, platformCount: number): Pl
   for (let i = 0; i < best.strips.length; i++) {
     const item = placed[i];
     if (best.strips[i] === 'track') {
-      tracks.push({ index: trackIndex, offset: item.offset, forward: trackIndex % 2 === 0 });
+      tracks.push({ index: trackIndex, offset: item.offset });
       trackIndex++;
       continue;
     }
@@ -215,4 +213,40 @@ function placeStrips(strips: readonly StripKind[]): ({ offset: number }[] & { wi
   });
   out.width = max - min;
   return out;
+}
+
+/**
+ * その地点を覆っている駅。
+ *
+ * 駅は線路・ホーム・駅舎をまとめた 1 つの敷地 (`length` × `minOffset`〜
+ * `maxOffset`) なので、ホームを指してもその外の構内を指しても同じ駅が返る。
+ * 高さは見ない (高架駅ではカーソルが下の地面に当たるため)。重なっていたら
+ * 中心にいちばん近いものを返す。
+ */
+export function stationAt(
+  stations: Iterable<Station>,
+  x: number,
+  z: number,
+  margin = 0,
+): Station | null {
+  let best: Station | null = null;
+  let bestScore = Infinity;
+  for (const station of stations) {
+    const cos = Math.cos(station.heading);
+    const sin = Math.sin(station.heading);
+    const dx = x - station.center.x;
+    const dz = z - station.center.z;
+    // 駅の向きを基準にした縦距 (線路方向) と横距 (`right` = perp(forward))。
+    const along = dx * cos + dz * sin;
+    const lateral = -dx * sin + dz * cos;
+    const half = station.length / 2 + margin;
+    if (Math.abs(along) > half) continue;
+    if (lateral < station.minOffset - margin || lateral > station.maxOffset + margin) continue;
+    const score = Math.abs(along) / half + Math.abs(lateral);
+    if (score < bestScore) {
+      bestScore = score;
+      best = station;
+    }
+  }
+  return best;
 }

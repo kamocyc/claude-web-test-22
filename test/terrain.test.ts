@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { Vector3 } from 'three';
-import { CUT_SLOPE, FILL_SLOPE } from '../src/core/units';
+import { CUT_SLOPE, FILL_SLOPE, TERRAIN_CELL } from '../src/core/units';
 import { TerrainGrading } from '../src/terrain/grading';
 import { Heightfield } from '../src/terrain/heightfield';
 import {
@@ -117,6 +117,55 @@ describe('TerrainGrading', () => {
       expect(Math.abs(field.heightAt(x, 9) - targetY)).toBeLessThan(2.0);
       expect(Math.abs(field.heightAt(x, -9) - targetY)).toBeLessThan(2.0);
     }
+  });
+
+  /**
+   * 斜めの帯を焼き込んで、法面が「帯の縁からの距離」だけで決まるかを見る。
+   *
+   * 焼き込みは格子点への書き込みなので、帯の縁が格子に対して斜めだと、
+   * 焼き込まれた格子点の並びは階段状になる。そこから距離を伝播させると
+   * 法面が帯に沿ってぎざぎざに波打つ (掘割・築堤をカーブや斜めに引いた
+   * ときに見えるあれ)。縁の帯だけ厳密な距離で始めることで、向きによらず
+   * 同じ断面になる。
+   */
+  it('斜めに焼き込んでも、法面が帯の向きで波打たない', () => {
+    const halfWidth = 8;
+    const depth = 6;
+    const results: string[] = [];
+    for (const deg of [0, 22.5, 30, 45]) {
+      const field = new Heightfield(64, TERRAIN_CELL); // 平らな地形。
+      const angle = (deg * Math.PI) / 180;
+      const dir = new Vector2(Math.cos(angle), Math.sin(angle));
+      const nrm = new Vector2(-dir.y, dir.x);
+      const at = (along: number, across: number): Vector3 =>
+        new Vector3(dir.x * along + nrm.x * across, -depth, dir.y * along + nrm.y * across);
+
+      const grading = new TerrainGrading(field);
+      grading.stampQuad(
+        at(-110, -halfWidth),
+        at(110, -halfWidth),
+        at(110, halfWidth),
+        at(-110, halfWidth),
+      );
+      grading.apply();
+
+      let worst = 0;
+      for (let iz = 0; iz <= field.cells; iz++) {
+        for (let ix = 0; ix <= field.cells; ix++) {
+          const x = field.worldX(ix);
+          const z = field.worldZ(iz);
+          // 端の影響を避け、帯の中ほどだけを見る。
+          if (Math.abs(x * dir.x + z * dir.y) > 60) continue;
+          const across = Math.abs(-x * dir.y + z * dir.x);
+          // 帯の縁から切土勾配で立ち上がり、自然地形 (0 m) で頭打ちになる。
+          const ideal = Math.min(0, -depth + CUT_SLOPE * Math.max(0, across - halfWidth));
+          worst = Math.max(worst, Math.abs(field.work[field.index(ix, iz)] - ideal));
+        }
+      }
+      // 残るのは焼き込みの取りこぼし防止分 (格子 0.06 マス) だけ。
+      results.push(`${deg}deg: ${worst < 0.2 ? 'ok' : `${worst.toFixed(2)} m ずれた`}`);
+    }
+    expect(results).toEqual(['0deg: ok', '22.5deg: ok', '30deg: ok', '45deg: ok']);
   });
 
   it('遮断した領域では自然地形がそのまま残る', () => {

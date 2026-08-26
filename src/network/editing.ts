@@ -34,9 +34,9 @@ export interface Anchor {
    *
    * 3 叉以上のノードでは「どの枝の続きか」が、出入りする向きが決まるまで
    * 決まらない。方位を添えて全部渡しておき、`computePlacement` が向きから
-   * 選ぶ。分岐器で本線の反対側の勾配を拾って繋ぎ目が折れるのを防ぐ。
+   * 選ぶ。分岐器で本線の反対側の勾配や曲率を拾って繋ぎ目が折れるのを防ぐ。
    */
-  branches?: { dir: Vector2; grade: number }[];
+  branches?: { dir: Vector2; grade: number; curvature: number }[];
   /**
    * 接続先から引き継ぐ曲率 [1/m] (`tangent` の向きに進んだときの値)。
    * これを繋いでいくと、緩和曲線で曲率が連続する線形になる。
@@ -57,6 +57,13 @@ export interface PlacementPreview {
   /** 終端の曲率 [1/m] (`endTangent` の向き)。次の区間へ引き継ぐ。 */
   endCurvature: number;
 }
+
+/**
+ * 解いた線形が、指した点に「届いた」とみなす距離 [m]。
+ *
+ * 始点も終点もクリックした点そのもの (そこにノードを作る) なので、実質 0。
+ */
+const REACH = 0.05;
 
 /**
  * 始点の接線を保ったまま、カーソル位置まで伸びる線形を求める。
@@ -83,6 +90,17 @@ export function computePlacement(
     startSign = -1;
   }
 
+  // 出ていく向きの真逆を向いている枝が「この線形の続き元」。継ぎ目でも
+  // 分岐器でも、同じ規則で正しい枝を選べる。勾配と曲率はそこから引き継ぐ。
+  const away = startDirection ?? (chord.lengthSq() > 1e-9 ? chord.clone().normalize() : null);
+  const from = away ? pickBranch(anchor.branches, away.clone().negate()) : undefined;
+  // 継ぎ目のように枝が 2 本ある所では、続き元が決まってはじめて接線も
+  // 決まる。折れた継ぎ目でも、入ってきた枝の延長として出ていく。
+  if (startDirection && from && anchor.bidirectional) {
+    startDirection = from.dir.clone().negate();
+  }
+  const startCurvature = from ? -from.curvature : (anchor.curvature ?? 0) * startSign;
+
   // 終点アンカーの tangent は「そこから先へ延長するときの向き」。到着側では
   // 逆向きが線形の終端接線になる。途中接続なら、弦から遠ざかる向きを選べる。
   let endOutward = destination.tangent?.clone();
@@ -101,8 +119,10 @@ export function computePlacement(
   // 引き継ぐ。`straight` は接線も曲率も無視して素直に直線を引く。
   const cls = options.cls;
   const easing = !options.straight && (cls?.easement ?? false);
+  // 緩和曲線は**標準半径**まで。それより急な繋ぎ方は徐行区間として、
+  // 緩和曲線を挟まない素の円弧で解く (`smoothRadius` を参照)。
   const easementOptions = {
-    minRadius: cls?.minRadius ?? 1,
+    minRadius: cls?.smoothRadius ?? cls?.minRadius ?? 1,
     designSpeed: cls?.designSpeed ?? 60,
   };
 
@@ -116,11 +136,13 @@ export function computePlacement(
     endTangent = horizontal.tangentAt(horizontal.length);
     radius = horizontal.extremeCurvature(48).minRadius;
   } else if (startDirection) {
-    if (easing) {
-      const eased = easementFromTangent(a, startDirection, b, {
-        ...easementOptions,
-        startCurvature: (anchor.curvature ?? 0) * startSign,
-      });
+    const eased = easing
+      ? easementFromTangent(a, startDirection, b, {
+          ...easementOptions,
+          startCurvature,
+        })
+      : null;
+    if (eased && eased.gap <= REACH) {
       horizontal = eased.curve;
       endTangent = eased.endTangent as Vector2;
       radius = horizontal.extremeCurvature(48).minRadius;
@@ -133,12 +155,20 @@ export function computePlacement(
   } else {
     // 終点から逆向きに解いて反転すれば、始点が自由でも終点では既存線形へ
     // 接する。端点へ繋ぐ場合も確定後に形が変わらない。
-    if (easing) {
-      // 終点から外向きに辿るので、引き継ぐ曲率も外向きの符号にする。
-      const eased = easementFromTangent(b, endOutward!, a, {
-        ...easementOptions,
-        startCurvature: (destination.curvature ?? 0) * endSign,
-      });
+    //
+    // ただし「自由」なのは始点の**向き**だけで、位置は動かせない (クリック
+    // した点に置く)。緩和曲線は標準半径で頭打ちになるので、短い渡り線では
+    // 始点まで届かないことがある。そのときは緩和曲線を諦めて円弧で解く。
+    // 円弧は必ず始点を通るので、置いた線形がクリックした点からずれない
+    // (規格を割るほど短ければ、最小半径の判定がそれを止める)。
+    const eased = easing
+      ? easementFromTangent(b, endOutward!, a, {
+          // 終点から外向きに辿るので、引き継ぐ曲率も外向きの符号にする。
+          ...easementOptions,
+          startCurvature: (destination.curvature ?? 0) * endSign,
+        })
+      : null;
+    if (eased && eased.gap <= REACH) {
       horizontal = reversedCurve(eased.curve);
       radius = horizontal.extremeCurvature(48).minRadius;
     } else {
@@ -156,13 +186,9 @@ export function computePlacement(
   const average = (end.y - anchor.pos.y) / length;
   const maximum = options.cls?.maxGrade ?? 0.35;
 
-  // 出ていく向きの真逆を向いている枝が「この線形の続き元」。2 本しかない
-  // 継ぎ目でも分岐器でも、同じ規則で正しい枝を選べる。
-  const away = startDirection ?? (chord.lengthSq() > 1e-9 ? chord.clone().normalize() : null);
-  const from = away ? pickBranch(anchor.branches, away.clone().negate()) : undefined;
   const inherited =
     from !== undefined
-      ? -from
+      ? -from.grade
       : anchor.grade !== undefined
         ? anchor.grade * startSign
         : average;
@@ -179,7 +205,7 @@ export function computePlacement(
   const into = pickBranch(destination.branches, endTangent);
   const endGrade =
     into !== undefined
-      ? clamp(into, -maximum, maximum)
+      ? clamp(into.grade, -maximum, maximum)
       : destination.grade === undefined
         ? solved.endGrade
         : clamp(-destination.grade * endSign, -maximum, maximum);
@@ -196,19 +222,17 @@ export function computePlacement(
   };
 }
 
-/**
- * `dir` の向きにいちばん近い枝の外向き勾配を返す。枝が無ければ `undefined`。
- */
-function pickBranch(
-  branches: { dir: Vector2; grade: number }[] | undefined,
+/** `dir` の向きにいちばん近い枝を返す。枝が無ければ `undefined`。 */
+function pickBranch<T extends { dir: Vector2 }>(
+  branches: T[] | undefined,
   dir: Vector2,
-): number | undefined {
+): T | undefined {
   if (!branches || branches.length === 0) return undefined;
   let best = branches[0];
   for (const b of branches) {
     if (b.dir.dot(dir) > best.dir.dot(dir)) best = b;
   }
-  return best.grade;
+  return best;
 }
 
 /**
@@ -309,7 +333,7 @@ export interface PlaceResult {
 }
 
 /** 折れをなめらかにする角度の範囲。これより浅ければ元から折れていない。 */
-const MIN_SMOOTHED_DEFLECTION = 1 * DEG;
+export const MIN_SMOOTHED_DEFLECTION = 1 * DEG;
 /** これより深い折れは「角にしたい」意図とみなして触らない。 */
 const MAX_SMOOTHED_DEFLECTION = 60 * DEG;
 /** なめらかにする度合い。1 で完全に接線を揃える。 */
@@ -667,9 +691,16 @@ function segmentIntersection(
  * 既存ノードに接続するアンカーを作る。
  *
  * 端点 (枝が 1 本) から引く場合は、その線形の延長として接線と勾配を
- * 引き継ぐので、繋ぎ目が折れない。既に 2 本以上が集まっているノードから
- * 引く場合は分岐を作りたい場面なので、向きは自由にする。勾配だけは
- * 段差ができないよう既存の枝から受け継ぐ。
+ * 引き継ぐので、繋ぎ目が折れない。
+ *
+ * 線路の**継ぎ目** (同じ種別が 2 本つながっているだけの所) は、線形としては
+ * 区間の途中と変わらないので、`anchorFromSegment` と同じ扱いにする。接線を
+ * 渡さないと、継ぎ目に当たった所だけ分岐が線路の接線に沿わなくなる (継ぎ目を
+ * 1 m 外すと接線に沿うのに、継ぎ目ちょうどでは折れる) ため。正逆どちらへ
+ * 分かれるかは、カーソルの側から `computePlacement` が選ぶ。
+ *
+ * 3 本以上が集まっているノード (分岐器や交差) は、どの枝の続きとも言えない
+ * ので向きは自由にする。勾配だけは段差ができないよう既存の枝から受け継ぐ。
  */
 export function anchorFromNode(network: Network, node: NetNode, cls: NetworkClass): Anchor {
   const branches = network.branchesAt(node.id);
@@ -680,14 +711,23 @@ export function anchorFromNode(network: Network, node: NetNode, cls: NetworkClas
   // 勾配は枝が何本あっても引き継ぐ (繋ぎ目に段差ができないように)。
   // どの枝の続きになるかは出入りの向き次第なので、方位を添えて全部渡す。
   anchor.grade = -same.grade;
-  anchor.branches = branches
-    .filter((b) => b.cls.kind === same.cls.kind)
-    .map((b) => ({ dir: b.dir.clone(), grade: b.grade }));
+  const kin = branches.filter((b) => b.cls.kind === same.cls.kind);
+  anchor.branches = kin.map((b) => ({
+    dir: b.dir.clone(),
+    grade: b.grade,
+    curvature: b.curvature,
+  }));
   if (branches.length === 1) {
     anchor.tangent = same.dir.clone().negate();
     // 接線を引き継ぐときだけ、曲率も引き継ぐ (向きが自由な分岐では、
     // 曲率だけ引き継いでも意味が無い)。
     anchor.curvature = -same.curvature;
+  } else if (same.cls.kind === 'rail' && kin.length === 2 && kin.length === branches.length) {
+    // 継ぎ目。どちらの枝の続きになるかはカーソルの側で決まるので、接線は
+    // 仮に片方の裏を入れておく (`computePlacement` が `branches` から
+    // 選び直す)。接線・勾配・曲率のどれも、選ばれた枝から引き継がれる。
+    anchor.tangent = kin[0].dir.clone().negate();
+    anchor.bidirectional = true;
   }
   return anchor;
 }

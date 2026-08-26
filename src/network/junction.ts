@@ -357,7 +357,7 @@ function solveNode(
     ? solveTrackConnections(branches, warnings)
     : [];
 
-  // 分岐器は、規格の最小半径で振り分けられるだけの長さを交差点に取り込む。
+  // 分岐器は、標準半径で振り分けられるだけの長さを交差点に取り込む。
   // 短いまま繋ぐと、線路とは思えない急な折れ線になってしまう。
   // (継ぎ目は交差点面を作らないので、トリムするとそこが穴になる。)
   for (const conn of kind === 'railSwitch' || kind === 'railCrossing' ? connections : []) {
@@ -365,9 +365,9 @@ function solveNode(
     const pair = approaches.filter(
       (ap) => ap.branch.segment === conn.from || ap.branch.segment === conn.to,
     );
-    // 分岐側の規格で決める。本線の最小半径を使うと、側線が浅い角度で
+    // 分岐側の規格で決める。本線の標準半径を使うと、側線が浅い角度で
     // 分かれるだけで交差点が何十 m にも膨らんでしまう。
-    const radius = Math.min(...pair.map((ap) => ap.branch.cls.minRadius));
+    const radius = Math.min(...pair.map((ap) => ap.branch.cls.smoothRadius));
     const tangent = turnoutTangentLength(radius, conn.deflection);
     for (const ap of pair) ap.trim = Math.max(ap.trim, tangent);
   }

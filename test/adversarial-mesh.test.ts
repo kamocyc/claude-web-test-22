@@ -22,6 +22,8 @@ import { WorldBuilder } from '../src/render/worldBuilder';
 import { DEFAULT_TERRAIN, generateTerrain } from '../src/terrain/generator';
 import { Heightfield } from '../src/terrain/heightfield';
 import { TerrainMesh } from '../src/terrain/terrainMesh';
+import { testField } from './support/field';
+import { TERRAIN_CELL } from '../src/core/units';
 
 /**
  * 敵対的検証: 高低差のあるところで「メッシュが離れる」「線路が埋まる」が
@@ -88,7 +90,7 @@ function buildScene(
   terrain: (x: number, z: number) => number,
   place: (net: Network, field: Heightfield) => void,
 ): Scene {
-  const field = new Heightfield();
+  const field = testField();
   for (let iz = 0; iz <= field.cells; iz++) {
     for (let ix = 0; ix <= field.cells; ix++) {
       field.base[field.index(ix, iz)] = terrain(field.worldX(ix), field.worldZ(iz));
@@ -156,7 +158,19 @@ function ribbonEndSection(scene: Scene, segment: SegmentId, atStart: boolean): V
  * 路面より上に出るのが正常だから (world.test.ts の地表判定も同じ理由で
  * 4 m 内側を見ている)。
  */
-function groundStations(scene: Scene, segment: SegmentId, step = 2, inset = 4): number[] {
+/**
+ * 地表区間の検査点。
+ *
+ * 区間の端 (坑口・橋台) では地形が垂直に切り立つので、格子の補間はその
+ * 段差を 1 マスぶん引きずる。整地の目標そのものを見たいので、端から
+ * 格子 2 マス分は避ける。
+ */
+function groundStations(
+  scene: Scene,
+  segment: SegmentId,
+  step = 2,
+  inset = Math.max(4, TERRAIN_CELL * 2),
+): number[] {
   const out: number[] = [];
   for (const run of scene.result.structures.get(segment) ?? []) {
     if (run.mode !== 'ground') continue;
@@ -361,13 +375,19 @@ function seamViolations(scene: Scene, tolerance = 0.01): Violation[] {
     if (sections.length !== 2) continue;
     const [a, b] = sections;
     if (a.length !== b.length) continue;
+    // 断面の並び順は、2 本の向きが揃っているか逆かで変わる。カントが付くと
+    // 断面は左右対称でなくなるので、どちら向きに突き合わせるかは世界座標で
+    // 決める (添字をそのまま裏返すと、カントのぶんずれて見える)。
+    const xz = (p: Vector3, q: Vector3): number => Math.hypot(p.x - q.x, p.z - q.z);
+    const flipped = xz(a[0], b[0]) > xz(a[0], b[b.length - 1]);
     for (let i = 0; i < a.length; i++) {
-      const dy = Math.abs(a[i].y - b[b.length - 1 - i].y);
+      const mate = flipped ? b[b.length - 1 - i] : b[i];
+      const dy = Math.abs(a[i].y - mate.y);
       if (dy > tolerance) {
         out.push({
           amount: dy,
           where: a[i],
-          what: `帯どうしの段差: node=${id} kind=${junction.kind} ${a[i].y.toFixed(2)} vs ${b[b.length - 1 - i].y.toFixed(2)}`,
+          what: `帯どうしの段差: node=${id} kind=${junction.kind} ${a[i].y.toFixed(2)} vs ${mate.y.toFixed(2)}`,
         });
       }
     }
@@ -1140,8 +1160,20 @@ function turnoutScene(options: {
     ], { straight: true });
     const hit = net.findSegmentNear(new Vector3(0, 0, 0), 10)!;
     const node = net.splitSegment(hit.segment, hit.s);
+    // 継ぎ目から引くと本線の接線に沿って分かれる (角度の付かない分岐器に
+    // なる) ので、交差点の面を作りたいここでは直線で角度を付けて分ける。
+    // その先は端点からの続きなので、いつもどおり接線を引き継ぐ。
+    draw(
+      net,
+      field,
+      'rail_yard',
+      [
+        { x: node.pos.x, z: node.pos.z, y: node.pos.y },
+        { x: 20, z: node.pos.z + 120, y: node.pos.y + yg * 120 },
+      ],
+      { straight: true },
+    );
     draw(net, field, 'rail_yard', [
-      { x: node.pos.x, z: node.pos.z, y: node.pos.y },
       { x: 20, z: node.pos.z + 120, y: node.pos.y + yg * 120 },
       { x: 70, z: node.pos.z + 240, y: node.pos.y + yg * 240 },
     ]);
@@ -1256,7 +1288,7 @@ function roughTerrainScene() {
 
 /** デモ配置 (回帰の基準)。 */
 function demoScene(): Scene {
-  const field = new Heightfield();
+  const field = testField();
   generateTerrain(field, DEFAULT_TERRAIN);
   const network = new Network();
   buildDemoNetwork(network, field);

@@ -9,6 +9,7 @@ import { buildLaneGraph, type LaneGraph } from '../src/sim/lanegraph';
 import { Traffic } from '../src/sim/traffic';
 import { DEFAULT_TERRAIN, generateTerrain } from '../src/terrain/generator';
 import { Heightfield } from '../src/terrain/heightfield';
+import { testField } from './support/field';
 
 /**
  * 車線と交通シミュレーションに対する敵対的検証。
@@ -32,7 +33,7 @@ function sceneOf(
   build: (network: Network, field: Heightfield) => void,
   seed?: number,
 ): Scene {
-  const field = new Heightfield();
+  const field = testField();
   if (seed !== undefined) generateTerrain(field, { ...DEFAULT_TERRAIN, seed });
   const network = new Network();
   build(network, field);

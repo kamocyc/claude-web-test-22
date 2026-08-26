@@ -123,6 +123,22 @@
         margin-top: 2px;
       }
 
+      /* 区画の用途チップ。色は 3D の区画表示と揃える。 */
+      button.chip.zone-residential.active {
+        background: rgba(92, 184, 102, 0.28);
+        border-color: #5cb866;
+      }
+
+      button.chip.zone-commercial.active {
+        background: rgba(82, 153, 235, 0.28);
+        border-color: #5299eb;
+      }
+
+      button.chip.zone-industrial.active {
+        background: rgba(235, 179, 77, 0.28);
+        border-color: #ebb34d;
+      }
+
       .elevation {
         flex: 1 1 auto;
         text-align: center;
@@ -161,6 +177,65 @@
         margin: 6px 0 0;
         color: var(--muted);
         font-size: 11px;
+      }
+
+      /* 路線の一覧。色の見本・停車駅・状態を 1 行にまとめる。 */
+      .line-list {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        margin-top: 6px;
+      }
+
+      .line-item {
+        display: flex;
+        align-items: flex-start;
+        gap: 7px;
+        padding: 5px 6px;
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        border-radius: 6px;
+        cursor: pointer;
+      }
+
+      .line-item:hover {
+        background: rgba(255, 255, 255, 0.06);
+      }
+
+      .line-item.active {
+        border-color: rgba(120, 200, 255, 0.75);
+        background: rgba(120, 200, 255, 0.12);
+      }
+
+      .line-swatch {
+        flex: 0 0 auto;
+        width: 10px;
+        height: 10px;
+        margin-top: 3px;
+        border-radius: 2px;
+      }
+
+      .line-text {
+        flex: 1 1 auto;
+        min-width: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 1px;
+      }
+
+      .line-text small {
+        color: var(--muted);
+        font-size: 11px;
+        overflow-wrap: anywhere;
+      }
+
+      .line-gap {
+        color: #f0776b;
+        font-size: 11px;
+      }
+
+      button.chip.line-remove {
+        flex: 0 0 auto;
+        padding: 2px 7px;
       }
 
       label.check {

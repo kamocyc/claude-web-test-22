@@ -44,7 +44,7 @@ function laneGraphOf(network: Network) {
 }
 
 describe('駅の横断配置', () => {
-  it('有効な全組合せで全線がホームに接し、進行方向が交互になる', () => {
+  it('有効な全組合せで全線がホームに接する', () => {
     for (let tracks = 1; tracks <= 6; tracks++) {
       const range = stationPlatformRange(tracks);
       for (let platforms = range.min; platforms <= range.max; platforms++) {
@@ -55,7 +55,6 @@ describe('駅の横断配置', () => {
         expect(a.platforms).toHaveLength(platforms);
         for (const track of a.tracks) {
           expect(a.platforms.some((platform) => platform.tracks.includes(track.index))).toBe(true);
-          expect(track.forward).toBe(track.index % 2 === 0);
         }
       }
     }

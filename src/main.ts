@@ -37,6 +37,8 @@ const tool = new BuildTool(
     dirty = true;
   },
   world,
+  world.zones,
+  world.lines,
 );
 viewport.scene.add(tool.previewGroup);
 
@@ -48,6 +50,16 @@ const ui = new Ui(uiRoot, {
   onMode: (mode) => setMode(mode),
   onStationSettings: (patch) => tool.setStationSettings(patch),
   onStationRotate: (steps) => tool.rotateStation(steps),
+  onZone: (zone) => tool.setZone(zone),
+  onLineNew: () => {
+    setMode('line');
+    tool.newLine();
+  },
+  onLineSelect: (id) => {
+    setMode('line');
+    tool.selectLine(id);
+  },
+  onLineRemove: (id) => tool.removeLine(id),
   onStationRename: (id, name) => {
     try {
       network.renameStation(id, name);
@@ -94,6 +106,8 @@ const ui = new Ui(uiRoot, {
   },
   onClear: () => {
     network.clear();
+    world.zones.clear();
+    world.lines.clear();
     tool.cancel();
     dirty = true;
   },
@@ -104,6 +118,9 @@ function setMode(mode: ToolMode): void {
   stopRide();
   tool.setMode(mode);
   ui.setMode(mode);
+  // 区画のマス目は区画を塗っている間、路線の経路は路線を引いている間だけ出す。
+  world.setZoneView(mode === 'zone');
+  world.setLineView(mode === 'line');
 }
 
 function applyUndergroundView(on: boolean): void {
@@ -163,6 +180,7 @@ function stopRide(): void {
 
 setMode('build');
 ui.setClass(tool.classId);
+ui.setZone(tool.zoneType);
 ui.setParallelSnap(tool.parallelSnap);
 buildDemoNetwork(network, field);
 
@@ -309,9 +327,13 @@ window.addEventListener('keydown', (event) => {
     case 'S':
       setMode('station');
       break;
-    case 'c':
-    case 'C':
-      setMode('scissors');
+    case 'z':
+    case 'Z':
+      setMode('zone');
+      break;
+    case 'l':
+    case 'L':
+      setMode('line');
       break;
     case 'x':
     case 'X':

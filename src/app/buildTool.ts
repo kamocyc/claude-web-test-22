@@ -26,6 +26,7 @@ import {
 import { checkPlacement, junctionReach } from '../network/rules';
 import {
   planStationLayout,
+  stationAt,
   stationPlatformRange,
   validateStationSpec,
   type Station,
@@ -33,12 +34,10 @@ import {
   type StationLength,
   type StationSpec,
 } from '../network/station';
+import type { LineId, LineMap } from '../network/line';
 import { checkStationPlacement } from '../network/stationPlacement';
-import {
-  placeScissorsCrossover,
-  scissorsPlanAt,
-  type ScissorsPlan,
-} from '../network/scissors';
+import { ZONE_COLORS, ZONE_EMPTY_COLOR } from '../build/buildings';
+import type { ZoneMap, ZoneType } from '../network/zoning';
 import { evaluateAlignment, type SegmentDiagnostics } from '../network/validation';
 import { createPreviewMaterial, riskTint, setPreviewBlocked } from '../render/materials';
 import {
@@ -56,7 +55,10 @@ import {
 } from './inspect';
 import type { Heightfield } from '../terrain/heightfield';
 
-export type ToolMode = 'build' | 'station' | 'scissors' | 'bulldoze' | 'inspect';
+export type ToolMode = 'build' | 'station' | 'zone' | 'line' | 'bulldoze' | 'inspect';
+
+/** 区画を塗る筆の半径 [m]。沿道の全奥行き (`ZONE_DEPTH`) は覆える太さにする。 */
+export const ZONE_BRUSH_RADIUS = 20;
 
 export interface StationToolSettings {
   name: string;
@@ -99,6 +101,12 @@ export interface ToolStatus {
   parallelTo: SegmentId | null;
   /** 空でなければ敷設できない。理由をそのまま表示する。 */
   blockers: string[];
+  /** 区画ツールでいま塗ろうとしている用途 (null なら消しゴム)。 */
+  zone: ZoneType | null;
+  /** 路線ツールでいま駅を足している路線 (無ければ null)。 */
+  line: { id: LineId; name: string; stops: string[] } | null;
+  /** 路線ツールで、カーソルの下にある駅 (無ければ null)。 */
+  hoverStation: Station | null;
 }
 
 /** カーソルの行き先 (吸い付いた点と、その目印)。 */
@@ -152,6 +160,8 @@ export class BuildTool {
   elevationOffset = 0;
   /** 既存の線形に平行してスナップするか。複線・側道はこれで作る。 */
   parallelSnap = true;
+  /** 区画ツールで塗る用途。null なら塗った用途を消す。 */
+  zoneType: ZoneType | null = 'residential';
 
   readonly previewGroup = new Group();
   private readonly snapView = new SnapView();
@@ -173,12 +183,14 @@ export class BuildTool {
   private parallel: ParallelReference | null = null;
   /** 平行スナップで組み立てた線形 (プレビューと同じもの)。 */
   private parallelAlignmentPreview: Alignment | null = null;
-  /** シーサスクロッシングの一括施工プレビュー。 */
-  private scissorsPlan: ScissorsPlan | null = null;
   /** 確認モードで読み取った、カーソル下の 1 点。 */
   private inspection: PointInspection | null = null;
   private selectedStationId: StationId | null = null;
   private stationCandidate: Station | null = null;
+  /** 路線ツールで駅を足している路線。 */
+  private editingLineId: LineId | null = null;
+  /** 路線ツールで、カーソルの下にある駅。 */
+  private hoverStation: Station | null = null;
   private stationSettings: StationToolSettings = {
     name: '駅 1',
     trackCount: 2,
@@ -199,6 +211,10 @@ export class BuildTool {
      * 確認モードの読み取りに使う。無くても動く。
      */
     private readonly surface: SurfaceContext | null = null,
+    /** 区画の塗り分け。渡さなければ区画ツールは何もしない。 */
+    private readonly zones: ZoneMap | null = null,
+    /** 路線の台帳。渡さなければ路線ツールは何もしない。 */
+    private readonly lines: LineMap | null = null,
   ) {
     this.previewGroup.name = 'preview';
     this.previewMaterial = createPreviewMaterial();
@@ -240,6 +256,11 @@ export class BuildTool {
     this.selectedStationId = id !== null && this.network.stations.has(id) ? id : null;
   }
 
+  /** 区画ツールで塗る用途を選ぶ。 */
+  setZone(zone: ZoneType | null): void {
+    this.zoneType = zone;
+  }
+
   setClass(classId: string): void {
     // 種別を変えたら、途中まで引いていた線形は破棄する。
     if (this.classId !== classId) this.cancel();
@@ -273,11 +294,13 @@ export class BuildTool {
     this.parallelAlignmentPreview = null;
     this.anchorMarker = null;
     this.showMarkers([]);
-    this.scissorsPlan = null;
     this.inspection = null;
     this.inspectProfile = null;
     this.stationCandidate = null;
     this.selectedStationId = null;
+    // 路線は「ここまで」で区切る。次にクリックしたら新しい路線を作る。
+    this.editingLineId = null;
+    this.hoverStation = null;
     this.elevationGuideView.update([]);
     this.updatePreviewMesh();
   }
@@ -292,15 +315,35 @@ export class BuildTool {
     if (!cursor) {
       this.preview = null;
       this.showMarkers(this.anchorMarker ? [this.anchorMarker] : []);
-      this.scissorsPlan = null;
       this.elevationGuideView.update([]);
-      if (this.mode === 'scissors') this.blockers = [];
       this.updatePreviewMesh();
       return;
     }
 
     if (this.mode === 'station') {
       this.updateStationPreview();
+      return;
+    }
+
+    if (this.mode === 'zone') {
+      this.elevationGuideView.update([]);
+      this.snapKind = 'none';
+      this.preview = null;
+      this.blockers = [];
+      this.showMarkers([]);
+      this.updatePreviewMesh();
+      return;
+    }
+
+    if (this.mode === 'line') {
+      this.elevationGuideView.update([]);
+      this.snapKind = 'none';
+      this.preview = null;
+      this.blockers = [];
+      // 指した駅を光らせる。駅は敷地全体が的なので、ホームでも構内でもよい。
+      this.hoverStation = stationAt(this.network.stations.values(), cursor.x, cursor.z);
+      this.showMarkers(this.hoverStation ? [this.stationMarker(this.hoverStation)] : []);
+      this.updatePreviewMesh();
       return;
     }
 
@@ -329,19 +372,6 @@ export class BuildTool {
       } else {
         this.showMarkers([]);
       }
-      this.updatePreviewMesh();
-      return;
-    }
-
-    if (this.mode === 'scissors') {
-      this.elevationGuideView.update([]);
-      const result = scissorsPlanAt(this.network, cursor);
-      this.scissorsPlan = result.plan;
-      this.hoverSegment = result.hoverSegment;
-      this.blockers = result.blockers;
-      this.snapKind = result.plan ? 'scissors' : 'none';
-      this.preview = null;
-      this.showMarkers([]);
       this.updatePreviewMesh();
       return;
     }
@@ -512,6 +542,17 @@ export class BuildTool {
       kind: 'node',
       pos: node.pos.clone(),
       radius: Math.max(junctionReach(this.network, node.id), this.cls.halfWidth * 0.8),
+    };
+  }
+
+  /** 路線ツールで駅を指したときの目印。駅の敷地をぐるりと囲む。 */
+  private stationMarker(station: Station): SnapMarker {
+    const line = this.editingLineId === null ? null : this.lines?.get(this.editingLineId) ?? null;
+    return {
+      kind: 'node',
+      pos: station.center.clone(),
+      radius: Math.max(station.length / 2, (station.maxOffset - station.minOffset) / 2) + 3,
+      tint: line?.color,
     };
   }
 
@@ -802,17 +843,12 @@ export class BuildTool {
   private updatePreviewMesh(): void {
     const mb = new MeshBuilder();
     const preview = this.preview;
-    if (this.mode === 'station' && this.stationCandidate) {
-      buildStationPreview(mb, this.stationCandidate);
+    if (this.mode === 'zone') {
+      if (this.cursor) buildZoneBrush(mb, this.cursor, this.field, this.zoneType);
       this.lastDiagnostics = null;
-    } else if (this.scissorsPlan) {
-      const cls = getClass(this.scissorsPlan.classId);
-      for (const connection of this.scissorsPlan.connections) {
-        buildRibbon(mb, connection.alignment.sample(2), profileFor(cls), {
-          skirt: false,
-          cls,
-        });
-      }
+      this.blockers = [];
+    } else if (this.mode === 'station' && this.stationCandidate) {
+      buildStationPreview(mb, this.stationCandidate);
       this.lastDiagnostics = null;
     } else if (preview && this.anchor) {
       const cls = this.cls;
@@ -828,7 +864,7 @@ export class BuildTool {
         field: this.field,
       }).blockers;
       buildRibbon(mb, alignment.sample(2), profileFor(cls), { skirt: false, cls });
-    } else if (this.mode !== 'scissors' && this.mode !== 'station') {
+    } else if (this.mode !== 'station') {
       this.lastDiagnostics = null;
       this.blockers = [];
     }
@@ -855,6 +891,21 @@ export class BuildTool {
       this.selectedStationId = this.inspection?.station?.id ?? null;
       return;
     }
+    if (this.mode === 'zone') {
+      if (!this.zones) return;
+      if (this.zones.paint(this.cursor.x, this.cursor.z, ZONE_BRUSH_RADIUS, this.zoneType)) {
+        this.onChanged();
+      }
+      return;
+    }
+    if (this.mode === 'line') {
+      if (!this.lines || !this.hoverStation) return;
+      // 引いている路線が無ければ、最初の駅を選んだところで 1 本作る。
+      const line = this.currentLine() ?? this.lines.create();
+      this.editingLineId = line.id;
+      if (this.lines.addStop(line.id, this.hoverStation.id)) this.onChanged();
+      return;
+    }
     if (this.mode === 'station') {
       if (!this.stationCandidate || this.blockers.length > 0) return;
       this.network.addStation({
@@ -871,17 +922,6 @@ export class BuildTool {
       this.updateStationPreview();
       return;
     }
-    if (this.mode === 'scissors') {
-      if (!this.scissorsPlan || this.blockers.length > 0) return;
-      placeScissorsCrossover(this.network, this.scissorsPlan);
-      this.scissorsPlan = null;
-      this.preview = null;
-      this.blockers = [];
-      this.onChanged();
-      this.update(this.cursor, this.modifiers);
-      return;
-    }
-
     const target = this.resolveTarget();
     if (!this.anchor) {
       this.anchor = target.anchor;
@@ -974,41 +1014,77 @@ export class BuildTool {
     if (shouldReverse) this.network.reverseSegment(segmentId);
   }
 
+  /** いま駅を足している路線。 */
+  private currentLine(): { id: LineId; name: string; stops: StationId[] } | null {
+    if (this.editingLineId === null) return null;
+    return this.lines?.get(this.editingLineId) ?? null;
+  }
+
+  /** 新しい路線を作り、そこへ駅を足していく。 */
+  newLine(): void {
+    if (!this.lines) return;
+    this.editingLineId = this.lines.create().id;
+    this.onChanged();
+  }
+
+  /** 既にある路線に駅を足せるようにする (一覧から選んだとき)。 */
+  selectLine(id: LineId | null): void {
+    this.editingLineId = id !== null && this.lines?.get(id) ? id : null;
+  }
+
+  /** 路線を消す。 */
+  removeLine(id: LineId): void {
+    if (!this.lines?.remove(id)) return;
+    if (this.editingLineId === id) this.editingLineId = null;
+    this.onChanged();
+  }
+
+  /** 引いている路線の、最後に足した駅を取り消す。 */
+  undoLineStop(): void {
+    if (this.editingLineId === null) return;
+    if (this.lines?.removeLastStop(this.editingLineId)) this.onChanged();
+  }
+
   status(): ToolStatus {
     const preview = this.preview;
     const length = this.mode === 'station'
       ? this.stationSettings.length * this.stationSettings.trackCount
-      : this.scissorsPlan?.length ?? (preview ? preview.horizontal.length : 0);
+      : preview
+        ? preview.horizontal.length
+        : 0;
     return {
       mode: this.mode,
       classId: this.classId,
       elevation: this.elevationOffset,
-      drawing: this.mode === 'station' ? this.stationCandidate !== null : this.anchor !== null || this.scissorsPlan !== null,
+      drawing: this.mode === 'station' ? this.stationCandidate !== null : this.anchor !== null,
       length,
-      radius: this.scissorsPlan
-        ? Math.min(...this.scissorsPlan.connections.map((item) => item.preview.radius))
-        : preview
-          ? preview.radius
-          : Infinity,
-      grade: this.scissorsPlan
-        ? Math.max(...this.scissorsPlan.connections.map((item) => item.preview.grade))
-        : preview
-          ? preview.grade
-          : 0,
+      radius: preview ? preview.radius : Infinity,
+      grade: preview ? preview.grade : 0,
       diagnostics: this.lastDiagnostics,
       snap: this.snapKind,
       markers: this.markers,
+      zone: this.zoneType,
       hoverSegment: this.hoverSegment,
       inspect: this.inspection,
       selectedStation:
         this.selectedStationId === null ? null : this.network.stations.get(this.selectedStationId) ?? null,
       station: { ...this.stationSettings },
-      cost:
-        length *
-        (this.scissorsPlan ? getClass(this.scissorsPlan.classId).costPerMeter : this.cls.costPerMeter),
+      cost: length * this.cls.costPerMeter,
       blockers: this.blockers,
       parallelSnap: this.parallelSnap,
       parallelTo: this.parallel?.segment ?? null,
+      line: this.lineStatus(),
+      hoverStation: this.mode === 'line' ? this.hoverStation : null,
+    };
+  }
+
+  private lineStatus(): ToolStatus['line'] {
+    const line = this.currentLine();
+    if (!line) return null;
+    return {
+      id: line.id,
+      name: line.name,
+      stops: line.stops.map((id) => this.network.stations.get(id)?.name ?? `駅 #${id}`),
     };
   }
 
@@ -1017,5 +1093,41 @@ export class BuildTool {
     const used = new Set([...this.network.stations.values()].map((station) => station.name));
     while (used.has(`駅 ${index}`)) index++;
     return `駅 ${index}`;
+  }
+}
+
+/**
+ * 区画を塗る筆の輪。
+ *
+ * 円板で塗り潰すと、起伏のある地形では三角形が地面に潜って歯抜けに
+ * 見える。細い輪 (幅 1.6 m) なら地形に沿うので、どこまで塗れるかが
+ * どんな斜面でも分かる。
+ */
+function buildZoneBrush(
+  mb: MeshBuilder,
+  cursor: Vector3,
+  field: Heightfield,
+  zone: ZoneType | null,
+): void {
+  const color = zone ? ZONE_COLORS[zone] : ZONE_EMPTY_COLOR;
+  const up = new Vector3(0, 1, 0);
+  const steps = 64;
+  const lift = 0.3;
+  const width = 1.6;
+  const inner: number[] = [];
+  const outer: number[] = [];
+  const at = (angle: number, radius: number): number => {
+    const x = cursor.x + Math.cos(angle) * radius;
+    const z = cursor.z + Math.sin(angle) * radius;
+    return mb.vertex(new Vector3(x, field.heightAt(x, z) + lift, z), up, 0, 0, color);
+  };
+  for (let i = 0; i < steps; i++) {
+    const angle = (i / steps) * Math.PI * 2;
+    inner.push(at(angle, ZONE_BRUSH_RADIUS - width));
+    outer.push(at(angle, ZONE_BRUSH_RADIUS));
+  }
+  for (let i = 0; i < steps; i++) {
+    const j = (i + 1) % steps;
+    mb.quad(inner[i], inner[j], outer[j], outer[i]);
   }
 }

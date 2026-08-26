@@ -11,9 +11,9 @@ import {
 } from '../src/network/editing';
 import { findGradeBreaks, gradeBreakMessage } from '../src/network/validation';
 import { Network } from '../src/network/network';
-import { Heightfield } from '../src/terrain/heightfield';
 import { DEFAULT_TERRAIN, generateTerrain } from '../src/terrain/generator';
 import { buildDemoNetwork } from '../src/app/demo';
+import { testField } from './support/field';
 
 /**
  * 継ぎ目での勾配の連続性。
@@ -96,7 +96,7 @@ describe('継ぎ目の勾配', () => {
   });
 
   it('デモの線路の継ぎ目が、どこも 0.3% 以内に収まっている', () => {
-    const field = new Heightfield();
+    const field = testField();
     generateTerrain(field, DEFAULT_TERRAIN);
     const network = new Network();
     buildDemoNetwork(network, field);
@@ -198,7 +198,7 @@ describe('勾配の折れの警告', () => {
     ]);
     expect(findGradeBreaks(network)).toEqual([]);
 
-    const field = new Heightfield();
+    const field = testField();
     generateTerrain(field, DEFAULT_TERRAIN);
     const demo = new Network();
     buildDemoNetwork(demo, field);

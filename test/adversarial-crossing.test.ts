@@ -15,6 +15,7 @@ import type { LanePose } from '../src/sim/lanegraph';
 import { WorldBuilder } from '../src/render/worldBuilder';
 import { Heightfield } from '../src/terrain/heightfield';
 import { TerrainMesh } from '../src/terrain/terrainMesh';
+import { testField } from './support/field';
 
 /**
  * 敵対的検証 (踏切と分岐器)。
@@ -80,7 +81,7 @@ function buildScene(
   terrain: (x: number, z: number) => number,
   place: (net: Network, field: Heightfield) => void,
 ): Scene {
-  const field = new Heightfield();
+  const field = testField();
   for (let iz = 0; iz <= field.cells; iz++) {
     for (let ix = 0; ix <= field.cells; ix++) {
       field.base[field.index(ix, iz)] = terrain(field.worldX(ix), field.worldZ(iz));

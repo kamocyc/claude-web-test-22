@@ -40,8 +40,14 @@ const MAX_OVERLAP = 140;
 /** 曲率 `curvature` [1/m] における横断勾配 (中心から右へ 1 m あたりの上がり)。 */
 export function cantRoll(cls: NetworkClass, curvature: number): number {
   if (cls.kind !== 'rail' || cls.maxCant <= 0) return 0;
-  // 規格最小半径でカント最大。緩い曲線では半径に反比例して小さくなる。
-  const ratio = clamp(Math.abs(curvature) * cls.minRadius, 0, 1);
+  const radius = Math.abs(curvature) > 1e-9 ? 1 / Math.abs(curvature) : Infinity;
+  // 標準半径 (`smoothRadius`) でカント最大。緩い曲線では半径に反比例して
+  // 小さくなり、標準より急な曲線では逆に**抜いていく**。急曲線は徐行して
+  // 通るので、実物でもカントは付けない (最小半径で 0 になる)。
+  const ratio =
+    radius >= cls.smoothRadius
+      ? cls.smoothRadius / radius
+      : clamp((radius - cls.minRadius) / Math.max(cls.smoothRadius - cls.minRadius, 1e-3), 0, 1);
   const cant = cls.maxCant * ratio;
   // 外側 (曲率中心の反対側) のレールが上がる。右カーブ (曲率が正) なら
   // 右が下がるので、右向きの傾きは負。
@@ -116,7 +122,7 @@ function flatReach(network: Network, node: NodeId): number {
       const deflection = Math.PI - Math.acos(dot);
       // ほぼ一直線に繋がる継ぎ目には交差点の面ができない。
       if (deflection < 2 * (Math.PI / 180)) continue;
-      const radius = Math.min(branches[i].cls.minRadius, branches[j].cls.minRadius);
+      const radius = Math.min(branches[i].cls.smoothRadius, branches[j].cls.smoothRadius);
       face = Math.max(
         face,
         turnoutTangentLength(radius, deflection),

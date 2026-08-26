@@ -7,7 +7,7 @@ import { solveJunctions } from '../src/network/junction';
 import { Network, type SegmentId } from '../src/network/network';
 import { buildLaneGraph, type LaneGraph, type VehicleKind } from '../src/sim/lanegraph';
 import { Traffic, type Vehicle } from '../src/sim/traffic';
-import { Heightfield } from '../src/terrain/heightfield';
+import { testField } from './support/field';
 
 /**
  * 乗車モード (一人称視点)。
@@ -58,7 +58,7 @@ function laneGraphOf(network: Network): LaneGraph {
 /** 曲線と勾配のある 1 本の線路。 */
 function railLine(): Network {
   const network = new Network();
-  const field = new Heightfield();
+  const field = testField();
   draw(network, field, 'rail_single', [
     { x: -400, z: -120, y: 0 },
     { x: -100, z: -120, y: 4 },
@@ -295,7 +295,9 @@ describe('走っている列車に乗る', () => {
     let worstHeight = 0;
     let worstLateral = 0;
     let worstStep = 0;
+    let turnBacks = 0;
     let previous: Vector3 | null = null;
+    let facing: Vector3 | null = null;
     let seat = ride.vehicleId;
 
     for (let i = 0; i < 60 / dt; i++) {
@@ -313,11 +315,16 @@ describe('走っている列車に乗る', () => {
       worstLateral = Math.max(worstLateral, Math.abs(lateral));
       worstHeight = Math.max(worstHeight, Math.abs(eye.y - sample.pos.y - 2.2));
 
+      // 行き止まりで折り返すと、運転台は編成の反対の端に移る。乗り換えと
+      // 同じで、目はそこへ飛ぶ (追いかけない)。そのフレームだけ数えて外す。
+      const turned = facing !== null && facing.dot(status.pose.forward) < 0;
+      if (turned) turnBacks++;
       // 1 フレームで進む距離は、車両の速度ぶん。跳ねたら気付く。
-      if (previous && seat === ride.vehicleId) {
+      if (previous && seat === ride.vehicleId && !turned) {
         worstStep = Math.max(worstStep, previous.distanceTo(eye) - status.speed * dt);
       }
       previous = eye.clone();
+      facing = status.pose.forward.clone();
       seat = ride.vehicleId;
       // 視線は進行方向。勾配 (5 % まで) のぶんしか上下しない。
       expect(Math.abs(status.pose.forward.y)).toBeLessThan(0.06);
@@ -331,6 +338,8 @@ describe('走っている列車に乗る', () => {
     expect(worstHeight).toBeLessThan(0.12);
     // 平滑化の遅れがあるぶん、進む距離が速度を上回ることはない。
     expect(worstStep).toBeLessThan(0.01);
+    // この線路は両端が行き止まりなので、折り返して戻ってくる。
+    expect(turnBacks).toBeGreaterThan(0);
   });
 });
 

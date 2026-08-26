@@ -13,6 +13,7 @@ import { MeshBuilder, signedAreaXZ } from '../core/meshbuilder';
 import { perp } from '../core/curve';
 import {
   DECK_THICKNESS,
+  PROP_MAX_DROP,
   PROP_MAX_RISE,
   TERRAIN_CELL,
   TUNNEL_THRESHOLD,
@@ -42,6 +43,7 @@ import {
   type ApproachFrame,
   type SurfacePath,
 } from '../build/markings';
+import { buildBuilding, buildZoneGrid } from '../build/buildings';
 import { buildCatenary, buildTrack, buildTrackConnection } from '../build/rail';
 import { buildStation, createStationLabels, stationFootprint } from '../build/station';
 import { computeCant, type CantProfile } from '../build/cant';
@@ -79,6 +81,7 @@ import { solveJunctions, type Approach, type Junction } from '../network/junctio
 import { solveApproachLanes } from '../network/lanes';
 import type { Network, NodeId, SegmentId } from '../network/network';
 import { buildLaneGraph, signalPhaseOf, type LaneGraph } from '../sim/lanegraph';
+import { planLines, type LinePlan } from '../sim/lineRoute';
 import { signalStateAt } from '../sim/signals';
 import { Traffic } from '../sim/traffic';
 import { VehicleView } from './vehicles';
@@ -102,11 +105,13 @@ import {
 } from '../network/parallel';
 import {
   evaluateAlignment,
+  curveBreakMessage,
+  findCurveBreaks,
   findGradeBreaks,
   gradeBreakMessage,
   type SegmentDiagnostics,
 } from '../network/validation';
-import { TerrainGrading } from '../terrain/grading';
+import { TerrainGrading, type GridRegion } from '../terrain/grading';
 import type { Heightfield } from '../terrain/heightfield';
 import type { TerrainMesh } from '../terrain/terrainMesh';
 import {
@@ -123,6 +128,9 @@ import {
   createPropMaterial,
   createSurfaceMaterial,
 } from './materials';
+import { ZoneMap, planZoning, type Lot, type ZoneCell } from '../network/zoning';
+import { LineMap } from '../network/line';
+import { buildLineOverlay } from '../build/lineOverlay';
 
 export interface WorldWarning {
   message: string;
@@ -145,6 +153,12 @@ export interface WorldStats {
   roadNetworks: number;
   railNetworks: number;
   powerNetworks: number;
+  /** 沿道に割り付けた区画のマスの数。 */
+  zoneCells: number;
+  /** マスをまとめて建てた建物の数。 */
+  buildings: number;
+  /** 引いた路線の数。 */
+  lines: number;
 }
 
 export type PropKind = 'signal' | 'stopSign' | 'crossingGate' | 'catenaryPole' | 'utilityPole';
@@ -178,6 +192,12 @@ export interface BuildResult {
   blends: Map<SegmentId, SurfaceBlend[]>;
   /** 平行に並んでいると判定した線形のまとまり。 */
   parallelGroups: ParallelGroup[];
+  /** 沿道に割り付けた区画のマス目。 */
+  zoneCells: ZoneCell[];
+  /** マスをまとめた、建物 1 棟ぶんの敷地。 */
+  lots: Lot[];
+  /** 路線ごとの運転計画 (経路・折り返し・繋がっていない区間)。 */
+  lines: LinePlan[];
 }
 
 /** 配電線の系統数 (地中区間も繋がっているものとして数える)。 */
@@ -246,10 +266,22 @@ export class WorldBuilder {
   readonly surfaceMesh: Mesh;
   private readonly overlayMesh: Mesh;
   private readonly structureMesh: Mesh;
-  /** 通常ビューで、地下区間を地表へ投影して見せる影。 */
+  /**
+   * 地下区間を地表へ投影して見せる影。
+   *
+   * 地上を見ているときに出すと、地面の下を通っているだけの線形が
+   * 地表に描かれてしまう。地下ビューのときだけ出し、実深度の X-ray と
+   * 組にして「地表から見てどこを通っているか」を示す。
+   */
   private readonly undergroundShadowMesh: Mesh;
   /** 地下ビューで実際の深さに重ねる X-ray 表示。 */
   private readonly undergroundHighlightMesh: Mesh;
+  /** 沿道の区画 (マス目)。区画ツールを使っている間だけ出す。 */
+  private readonly zoneGridMesh: Mesh;
+  /** 路線の経路。路線ツールを使っている間だけ出す。 */
+  private readonly lineMesh: Mesh;
+  /** 区画に建った建物。 */
+  private readonly buildingMesh: Mesh;
   private readonly propGroup = new Group();
   private readonly grading: TerrainGrading;
 
@@ -282,6 +314,31 @@ export class WorldBuilder {
   private readonly vehicleView = new VehicleView();
   /** 車両を走らせるか。 */
   showVehicles = true;
+  /**
+   * 沿道に塗った用途。
+   *
+   * 区画そのものは毎回ネットワークから作り直すが、「どこに何を塗ったか」は
+   * ここに残る。道路を引き直しても塗りが消えない。
+   */
+  readonly zones = new ZoneMap();
+  /** 区画のマス目を表示するか (区画ツールを使っている間)。 */
+  showZones = false;
+  /**
+   * 引いた路線。
+   *
+   * 区画と同じで、持っているのは「どの駅にどの順で停まるか」だけ。経路は
+   * 敷き直すたびに引き直すので、線路を付け替えても路線は生き続ける。
+   */
+  readonly lines = new LineMap();
+  /** 直近の rebuild で引いた運転計画。 */
+  linePlans: LinePlan[] = [];
+  /** 路線の経路を表示するか (路線ツールを使っている間)。 */
+  showLines = false;
+  /** 地下ビューの最中か。地上の表示を出すかどうかの判断に使う。 */
+  private undergroundView = false;
+  /** 直近の rebuild で割り付けた区画。 */
+  zoneCells: ZoneCell[] = [];
+  lots: Lot[] = [];
   /** 選択色で塗る車両の番号 (乗る車両を選んでいるとき)。 */
   highlightVehicle: number | null = null;
 
@@ -317,6 +374,7 @@ export class WorldBuilder {
     );
     this.undergroundShadowMesh.name = 'underground-shadows';
     this.undergroundShadowMesh.renderOrder = 4;
+    this.undergroundShadowMesh.visible = false;
     this.undergroundHighlightMesh = new Mesh(
       new MeshBuilder().build(),
       new MeshBasicMaterial({
@@ -331,6 +389,42 @@ export class WorldBuilder {
     this.undergroundHighlightMesh.name = 'underground-xray';
     this.undergroundHighlightMesh.renderOrder = 12;
     this.undergroundHighlightMesh.visible = false;
+    this.zoneGridMesh = new Mesh(
+      new MeshBuilder().build(),
+      new MeshBasicMaterial({
+        vertexColors: true,
+        transparent: true,
+        opacity: 0.55,
+        depthWrite: false,
+        polygonOffset: true,
+        polygonOffsetFactor: 0,
+        polygonOffsetUnits: -10,
+        side: DoubleSide,
+      }),
+    );
+    this.zoneGridMesh.name = 'zones';
+    this.zoneGridMesh.renderOrder = 5;
+    this.zoneGridMesh.visible = false;
+    this.lineMesh = new Mesh(
+      new MeshBuilder().build(),
+      new MeshBasicMaterial({
+        vertexColors: true,
+        transparent: true,
+        opacity: 0.95,
+        depthWrite: false,
+        polygonOffset: true,
+        polygonOffsetFactor: 0,
+        polygonOffsetUnits: -14,
+        side: DoubleSide,
+      }),
+    );
+    this.lineMesh.name = 'lines';
+    this.lineMesh.renderOrder = 6;
+    this.lineMesh.visible = false;
+    this.buildingMesh = new Mesh(new MeshBuilder().build(), createPropMaterial());
+    this.buildingMesh.name = 'buildings';
+    this.buildingMesh.castShadow = true;
+    this.buildingMesh.receiveShadow = true;
     this.propGroup.name = 'props';
 
     this.group.add(
@@ -339,20 +433,40 @@ export class WorldBuilder {
       this.structureMesh,
       this.undergroundShadowMesh,
       this.undergroundHighlightMesh,
+      this.zoneGridMesh,
+      this.lineMesh,
+      this.buildingMesh,
       this.propGroup,
       this.vehicleView.group,
     );
   }
 
+  /** 区画のマス目の表示を切り替える。 */
+  setZoneView(active: boolean): void {
+    this.showZones = active;
+    // 地下を見ている間は地上の表示を伏せる (地下ビューを抜けたら戻す)。
+    this.zoneGridMesh.visible = active && !this.undergroundView;
+  }
+
+  /** 路線の経路の表示を切り替える。 */
+  setLineView(active: boolean): void {
+    this.showLines = active;
+    this.lineMesh.visible = active && !this.undergroundView;
+  }
+
   /** 地形を透かし、地下区間だけを実際の深さで強調する。 */
   setUndergroundView(active: boolean): void {
+    this.undergroundView = active;
     this.terrainMesh.setUndergroundView(active);
-    this.undergroundShadowMesh.visible = !active;
+    this.undergroundShadowMesh.visible = active;
     this.undergroundHighlightMesh.visible = active;
 
     setMeshFade(this.surfaceMesh, active ? 0.24 : 1, active);
     setMeshFade(this.overlayMesh, active ? 0.18 : 1, active);
     setMeshFade(this.structureMesh, active ? 0.28 : 1, active);
+    this.buildingMesh.visible = !active;
+    this.zoneGridMesh.visible = this.showZones && !active;
+    this.lineMesh.visible = this.showLines && !active;
     this.propGroup.visible = !active;
     this.vehicleView.group.visible = !active;
   }
@@ -497,8 +611,8 @@ export class WorldBuilder {
       crossingZones.set(rail.segment, list);
     }
 
-    this.applyGrading(junctions, structures, crossingZones, blends);
-    this.terrainMesh.update();
+    // 整地は「触った範囲」を返す。地形メッシュもそこだけ書き換える。
+    this.terrainMesh.update(this.applyGrading(junctions, structures, crossingZones, blends));
 
     // 小物を置く前に、どこが道路・線路・交差点に覆われているかを索引にする。
     this.occupancy = new Occupancy(network, {
@@ -520,6 +634,7 @@ export class WorldBuilder {
       turnouts: 0,
       levelCrossings: 0,
       stations: network.stations.size,
+      lines: 0,
       bridgeLength: 0,
       tunnelLength: 0,
       totalLength: 0,
@@ -527,6 +642,8 @@ export class WorldBuilder {
       roadNetworks: 0,
       railNetworks: 0,
       powerNetworks: 0,
+      zoneCells: 0,
+      buildings: 0,
     };
     const diagnostics = new Map<SegmentId, SegmentDiagnostics>();
 
@@ -603,6 +720,16 @@ export class WorldBuilder {
       });
     }
 
+    // 継ぎ目で平面線形が切れている所 (線路)。レールは曲がり角にも曲率の
+    // 飛びにも折り合えないので、残っていたら同じように報せる。
+    for (const brk of findCurveBreaks(network)) {
+      warnings.push({
+        message: curveBreakMessage(brk),
+        position: brk.pos.clone(),
+        severity: 'warning',
+      });
+    }
+
     for (const junction of junctions.values()) {
       const branch = junction.approaches[0]?.branch.segment;
       this.buildJunction(
@@ -635,6 +762,25 @@ export class WorldBuilder {
       this.buildCrossing(overlay, group, structures, stats);
     }
 
+    // 沿道の区画と建物。道路・線路・交差点の索引ができたあとに割り付ける。
+    const zoneGrid = new MeshBuilder();
+    const buildings = new MeshBuilder();
+    const zoning = planZoning({
+      network,
+      structures,
+      ranges,
+      occupancy: this.occupancy,
+      field: this.field,
+      zones: this.zones,
+    });
+    this.zoneCells = zoning.cells;
+    this.lots = zoning.lots;
+    const groundAt = (x: number, z: number): number => this.field.heightAt(x, z);
+    buildZoneGrid(zoneGrid, this.zoneCells, groundAt);
+    for (const lot of this.lots) buildBuilding(buildings, lot, groundAt);
+    stats.zoneCells = this.zoneCells.length;
+    stats.buildings = this.lots.length;
+
     const power = this.buildPower(structure, structures, ranges);
     const powerNetworks = countPowerNetworks(power.poles, power.spans);
     stats.roadNetworks = connectivity.components.filter((c) => c.kind === 'road').length;
@@ -646,6 +792,8 @@ export class WorldBuilder {
     this.replaceGeometry(this.structureMesh, structure);
     this.replaceGeometry(this.undergroundShadowMesh, undergroundShadow);
     this.replaceGeometry(this.undergroundHighlightMesh, undergroundHighlight);
+    this.replaceGeometry(this.zoneGridMesh, zoneGrid);
+    this.replaceGeometry(this.buildingMesh, buildings);
 
     // 車線グラフは形が変わるたびに作り直す。走っている車両は捨てる
     // (通れなくなった車線に取り残された車が残り続けるのを防ぐ)。
@@ -658,6 +806,16 @@ export class WorldBuilder {
     this.vehicleView.clear();
     this.structureRuns = structures;
 
+    // 路線の経路は車線グラフの上に引くので、グラフを組み立てたあとに引き直す。
+    // 撤去された駅は停車駅から落とす。
+    this.lines.prune(new Set(network.stations.keys()));
+    this.linePlans = planLines(this.laneGraph, this.lines.all, network.stations);
+    this.traffic.setLines(this.linePlans);
+    stats.lines = this.linePlans.length;
+    const lineOverlay = new MeshBuilder();
+    buildLineOverlay(lineOverlay, this.linePlans, this.laneGraph, network.stations);
+    this.replaceGeometry(this.lineMesh, lineOverlay);
+
     return {
       warnings,
       stats,
@@ -669,6 +827,9 @@ export class WorldBuilder {
       power,
       blends,
       parallelGroups,
+      zoneCells: this.zoneCells,
+      lots: this.lots,
+      lines: this.linePlans,
     };
   }
 
@@ -1102,7 +1263,7 @@ export class WorldBuilder {
     /** 踏切のまわりで整地目標を道路側に寄せる範囲。 */
     crossingZones: Map<SegmentId, CrossingZone[]>,
     blends: Map<SegmentId, SurfaceBlend[]>,
-  ): void {
+  ): GridRegion | null {
     const grading = this.grading;
     grading.reset();
 
@@ -1188,6 +1349,8 @@ export class WorldBuilder {
               grading.stampQuad(quad[0], quad[1], quad[2], quad[3], {
                 ignoreProtected: cls.kind === 'road',
                 distance: bandDistance(o0, o1),
+                // footprint の外周は路肩の余裕幅 (margins) が持っている。
+                interior: true,
               });
             } else {
               margins.push({ quad });
@@ -1237,7 +1400,7 @@ export class WorldBuilder {
       });
     }
 
-    grading.apply();
+    return grading.apply();
   }
 
   /**
@@ -1286,10 +1449,20 @@ export class WorldBuilder {
         const quad = [a[i], a[j], b[j], b[i]];
         // いちばん外側の帯は路肩の余裕幅なので、他の舗装より後で焼く。
         if (k === 0) margins.push({ quad });
-        else grading.stampQuad(quad[0], quad[1], quad[2], quad[3], { ignoreProtected, distance });
+        else {
+          grading.stampQuad(quad[0], quad[1], quad[2], quad[3], {
+            ignoreProtected,
+            distance,
+            interior: true,
+          });
+        }
       }
     }
-    grading.stampPolygon(bands[bands.length - 1], { ignoreProtected, distance: 0 });
+    grading.stampPolygon(bands[bands.length - 1], {
+      ignoreProtected,
+      distance: 0,
+      interior: true,
+    });
   }
 
   // ------------------------------------------------------------ セグメント
@@ -1710,7 +1883,10 @@ export class WorldBuilder {
   private propGroundY(x: number, z: number, surfaceY: number): number {
     const terrain = this.field.heightAt(x, z);
     if (surfaceY - terrain > 1.5) return surfaceY - 0.05;
-    return terrain - 0.05;
+    // 路肩の地形は、格子の粗さを吸収するぶんだけ路面より低く均してある
+    // (`gradingSectionPoints` の shift)。そこへ素直に立てると、勾配のきつい
+    // 道路で小物だけが路面から取り残される。路肩として自然な範囲で止める。
+    return Math.max(terrain - 0.05, surfaceY - PROP_MAX_DROP);
   }
 
   // ---------------------------------------------------------------- 踏切

@@ -13,6 +13,7 @@ import { WorldBuilder } from '../src/render/worldBuilder';
 import { DEFAULT_TERRAIN, generateTerrain } from '../src/terrain/generator';
 import { TerrainMesh } from '../src/terrain/terrainMesh';
 import { Heightfield } from '../src/terrain/heightfield';
+import { testField } from './support/field';
 
 /**
  * 敷設ツールの操作。
@@ -22,7 +23,7 @@ import { Heightfield } from '../src/terrain/heightfield';
  */
 
 function flatField(y = 0): Heightfield {
-  const field = new Heightfield();
+  const field = testField();
   field.base.fill(y);
   field.resetWork();
   return field;
@@ -578,7 +579,7 @@ describe('確認モードの読み取り', () => {
   it('描画側を渡すと、構造形式とカントも読める', () => {
     // 実際に組み立てた世界で確かめる。カントも構造形式も、線形だけからは
     // 決まらない (描画側が持っている) ため。
-    const field = new Heightfield();
+    const field = testField();
     generateTerrain(field, DEFAULT_TERRAIN);
     const network = new Network();
     buildDemoNetwork(network, field);
