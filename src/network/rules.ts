@@ -165,6 +165,10 @@ function evaluate(ctx: PlacementContext): string[] {
  * 見るのは折り返しだけ。ヘアピンのように鋭く曲がる繋ぎ方 (折れ点) は
  * 交差点の側で扱えるので、`MAX_FOLD_ANGLE` までは通す。
  *
+ * 指した所に**届いていない**線形は止めない。円弧の掃引角の制限で届かない
+ * ことはあるので、そのときは届いた所で終わらせる (`placeSegment` が、
+ * 届いていない相手には繋がない)。
+ *
  * 途中接続 (`bidirectional`) は正逆どちらへも出られるので見ない。向きは
  * `computePlacement` がカーソル側に合わせて選んでいる。
  */
@@ -183,22 +187,8 @@ function checkDirection(ctx: PlacementContext): string[] {
       out.push(REVERSED);
     }
   }
-
-  // 真後ろに近い所を指すと、接線に接する円弧が大きく回り込む。掃引角の
-  // 制限で線形はそこまで届かず、**指した所とは違う道**ができるので置かせない。
-  const tip = alignment.sampleAt(alignment.length).pos;
-  const gap = Math.hypot(tip.x - ctx.end.pos.x, tip.z - ctx.end.pos.z);
-  if (gap > MAX_REACH_GAP) {
-    out.push(`指した所まで届きません (${gap.toFixed(0)} m 手前で終わっています)。`);
-  }
   return out;
 }
-
-/**
- * 線形の終点が指した所からずれてよい距離 [m]。
- * 平行スナップは既存ノードに 2 m まで寄せて繋ぐので、そこは許す。
- */
-const MAX_REACH_GAP = 5;
 
 const REVERSED = '接続先の向きと逆に折り返しています (既存の線形の上に重なります)。';
 

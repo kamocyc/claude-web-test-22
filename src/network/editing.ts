@@ -66,6 +66,13 @@ export interface PlacementPreview {
 const REACH = 0.05;
 
 /**
+ * 解いた線形の終点が、指した相手からここまで離れていても繋ぐ距離 [m]。
+ *
+ * 平行スナップは既存ノードに 2 m まで寄せて繋ぐので、そこは許す。
+ */
+const SNAP_REACH = 5;
+
+/**
  * 始点の接線を保ったまま、カーソル位置まで伸びる線形を求める。
  *
  * 既存の線形に接続しているときは接線と勾配を引き継ぐので、繋いだ所で
@@ -543,7 +550,12 @@ export function placeSegment(
   preview: PlacementPreview,
 ): PlaceResult {
   const startNode = resolveAnchor(network, start);
-  const endAnchor: Anchor = { ...end, pos: preview.end };
+  // 線形が指した所まで届かないことがある (真後ろに近い所を指すと、接線に
+  // 接する円弧が大きく回り込んで掃引角の制限にかかる)。届いた所で終わらせ、
+  // そこまで来ていない相手には繋がない。無理に繋ぐと、相手のノードまで
+  // 線形が引き伸ばされて、プレビューと違う形になってしまう。
+  const reached = preview.end.distanceTo(end.pos) <= SNAP_REACH;
+  const endAnchor: Anchor = reached ? { ...end, pos: preview.end } : { pos: preview.end };
   const endNode = resolveAnchor(network, endAnchor);
 
   const segment = network.addSegment({

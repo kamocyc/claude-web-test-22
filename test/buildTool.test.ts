@@ -349,13 +349,24 @@ describe('引いてきた道の上への折り返し', () => {
     expect(network.segments.size).toBe(before);
   });
 
-  it('少し外して指しても、指した所まで届かない線形は置けない', () => {
-    // 真後ろに近い所は、接線に接する円弧が何百 m も回り込む。
-    const { tool } = drawn();
-    tool.update(new Vector3(60, 0, 12), { straight: false, noSnap: false });
+  it('指した所まで届かなくても、届いた所まで置ける', () => {
+    // 真後ろに近い所は、接線に接する円弧が何百 m も回り込む。掃引角の
+    // 制限でそこまでは届かないが、届いた所で終わらせて置ける。
+    const { tool, network } = drawn();
+    const target = new Vector3(60, 0, 12);
+    tool.update(target, { straight: false, noSnap: false });
     const status = tool.status();
     expect(status.length).toBeGreaterThan(400);
-    expect(status.blockers.join(' ')).toContain('届きません');
+    expect(status.blockers).toEqual([]);
+
+    const before = new Set(network.nodes.keys());
+    const segments = network.segments.size;
+    tool.click();
+    expect(network.segments.size).toBe(segments + 1);
+    // 終点は指した所ではなく、線形が届いた所。
+    const added = [...network.nodes.values()].filter((n) => !before.has(n.id));
+    expect(added).toHaveLength(1);
+    expect(added[0].pos.distanceTo(target)).toBeGreaterThan(5);
   });
 
   it('前へ続けるのはそのまま置ける', () => {
@@ -393,6 +404,30 @@ describe('引いてきた道の上への折り返し', () => {
     expect(tool.status().blockers).toEqual([]);
     tool.click();
     expect(network.segments.size).toBeGreaterThan(2);
+  });
+});
+
+describe('建設プレビューの見え方', () => {
+  /**
+   * 掘割やトンネルを敷くときは、線形が地面の下に入る。前後関係のまま
+   * 描くと何を引いているのか見えなくなるので、プレビューだけは地形に
+   * 隠されない。
+   */
+  it('地形の下になっても表示される', () => {
+    const network = new Network();
+    const tool = new BuildTool(network, flatField(), () => {});
+    tool.setClass('rail_single');
+    clickAt(tool, 0, 0);
+    tool.update(new Vector3(0, -20, 120), MODS);
+
+    const meshes: Mesh[] = [];
+    tool.previewGroup.traverse((obj) => {
+      if (obj instanceof Mesh) meshes.push(obj);
+    });
+    const preview = meshes[0];
+    expect(preview.material).toHaveProperty('depthTest', false);
+    // 地形より後に描く (スナップ表示・案内線はさらに上)。
+    expect(preview.renderOrder).toBeGreaterThan(0);
   });
 });
 

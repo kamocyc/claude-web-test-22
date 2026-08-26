@@ -21,6 +21,7 @@ import {
   lerp,
   smoothstep,
 } from '../core/units';
+import { computeTurnoutLevels } from '../build/turnout';
 import {
   GENTLE_CROSSING_LIFT,
   applySurfaceBlend,
@@ -486,6 +487,13 @@ export class WorldBuilder {
     // 踏切に合わせた道路側の高さ補正をセグメントごとにまとめる。
     // 交差点の断面もこの高さで作る必要があるので、交差点を解く前に用意する。
     const blends = this.collectCrossingBlends(crossings, warnings);
+    // 分岐器のまわりで、分かれた枝を本線の高さに合わせる補正も同じ所へ
+    // 混ぜる。レールが重なっている間に、高さの違う面が 2 枚できないように。
+    for (const [segment, list] of computeTurnoutLevels(network)) {
+      const existing = blends.get(segment);
+      if (existing) existing.push(...list);
+      else blends.set(segment, list);
+    }
     this.blends = blends;
     // 帯・交差点の取り付き断面・標示・当たり判定が、みな同じ点を通るように
     // 「描画に使う高さの補正」をここ 1 か所から配る。

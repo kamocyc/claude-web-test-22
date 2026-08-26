@@ -57,6 +57,8 @@ export function createSurfaceMaterial(options?: {
   transparent?: boolean;
   opacity?: number;
   depthWrite?: boolean;
+  /** 前後関係を見ずに描く (地形に隠れないプレビュー・案内表示)。 */
+  depthTest?: boolean;
   polygonOffsetUnits?: number;
   side?: typeof DoubleSide | undefined;
   /** 診断表示の on/off を制御する uniform。既定は全体共有のもの。 */
@@ -71,6 +73,7 @@ export function createSurfaceMaterial(options?: {
     transparent: options?.transparent ?? false,
     opacity: options?.opacity ?? 1,
     depthWrite: options?.depthWrite ?? true,
+    depthTest: options?.depthTest ?? true,
     polygonOffset: true,
     // 傾き係数は 0 にする。視線に対して浅い角度で見た面では傾き係数の項が
     // 巨大になり、路面が数十 cm 手前に寄ってしまう。踏切のレールのように
@@ -244,6 +247,9 @@ export function createPropMaterial(): MeshStandardMaterial {
 /**
  * 建設プレビュー用の半透明マテリアル。規格違反がすぐ分かるよう、
  * 全体設定にかかわらず常に診断色で表示する。
+ *
+ * 地形に隠れない (`depthTest: false`)。掘割やトンネルを敷くときは線形が
+ * 地面の下に入るので、そのままでは何を引いているのか見えなくなる。
  */
 /** 敷設できないプレビューを赤く塗るための uniform。 */
 const previewBlocked = { value: 0 };
@@ -253,6 +259,7 @@ export function createPreviewMaterial(): MeshStandardMaterial {
     transparent: true,
     opacity: 0.75,
     depthWrite: false,
+    depthTest: false,
     polygonOffsetUnits: -16,
     diagnostics: { value: 1 },
     blocked: previewBlocked,

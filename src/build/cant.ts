@@ -1,9 +1,9 @@
-import type { XZ } from '../core/curve';
 import { RAIL_GAUGE, clamp } from '../core/units';
 import type { NetworkClass } from '../network/classes';
 import { turnoutTangentLength } from '../network/junction';
 import type { Branch, Network, NodeId, SegmentId } from '../network/network';
 import type { Crossing } from '../network/crossings';
+import { separationReach } from './turnout';
 
 /**
  * 線路のカント (曲線で外側のレールを高くする量)。
@@ -30,9 +30,6 @@ const FACE_MARGIN = 2;
 
 /** 交差点の面が広がる長さの上限 [m] (`rules.ts` のトリム上限と同じ)。 */
 const MAX_FACE = 40;
-
-/** 分かれた 2 本の重なりを追う刻み [m]。 */
-const OVERLAP_STEP = 2;
 
 /** 重なりを追う長さの上限 [m]。これより長く重なる分岐は想定しない。 */
 const MAX_OVERLAP = 140;
@@ -72,26 +69,9 @@ export type CantProfile = (s: number) => number;
  * 離れきるまでは 1 つの構造物なので、そこに違うカントを付けると、同じ場所に
  * 高さの違う面が 2 枚できてしまう。実物でも、分岐器とその先の重なりが
  * 解けるまでは水平な 1 枚の面に載せる。
- *
- * 同じ弧長の点どうしの距離を追い、道床の幅ぶん離れた所を重なりの終わりと
- * みなす。
  */
 function overlapReach(network: Network, a: Branch, b: Branch): number {
-  const need = a.cls.halfWidth + b.cls.halfWidth;
-  const als = [network.alignmentOf(a.segment), network.alignmentOf(b.segment)];
-  const brs = [a, b];
-  const limit = Math.min(MAX_OVERLAP, als[0].length, als[1].length);
-  const at = (i: number, s: number): XZ => {
-    const L = als[i].length;
-    return als[i].horizontal.pointAt(brs[i].atStart ? Math.min(s, L) : Math.max(0, L - s));
-  };
-  let s = 0;
-  for (; s < limit; s = Math.min(s + OVERLAP_STEP, limit)) {
-    const next = Math.min(s + OVERLAP_STEP, limit);
-    if (at(0, next).distanceTo(at(1, next)) >= need) return next;
-    if (next >= limit) break;
-  }
-  return limit;
+  return separationReach(network, a, b, a.cls.halfWidth + b.cls.halfWidth, MAX_OVERLAP);
 }
 
 /**
