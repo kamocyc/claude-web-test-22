@@ -845,6 +845,60 @@ describe('踏切', () => {
  * ことになる。始点の隣から終点の隣まで、線路のルートをたどって一度に敷ける
  * ようにしたのがここ。
  */
+/**
+ * 線路の分岐。
+ *
+ * 線路の交差点には中身が無いので、折れたまま枝が集まると角がそのまま残る。
+ * 交差点の中で振り分ける余地が無く、置いてから直せないので、置く前に止める。
+ */
+describe('線路の分岐', () => {
+  function railLine(): { tool: BuildTool; network: Network } {
+    const network = new Network();
+    const tool = new BuildTool(network, flatField(), () => {});
+    tool.setClass('rail_single');
+    for (const x of [-200, 200]) {
+      tool.update(new Vector3(x, 0, 0), MODS);
+      tool.click();
+    }
+    tool.cancel();
+    return { tool, network };
+  }
+
+  it('直線モードで斜めに分けようとすると止まる', () => {
+    const { tool } = railLine();
+    tool.update(new Vector3(0, 0, 0), MODS);
+    expect(tool.status().snap).toBe('segment');
+    tool.click();
+    tool.update(new Vector3(120, 0, -120), MODS);
+    expect(tool.status().blockers.some((b) => b.includes('分岐角'))).toBe(true);
+  });
+
+  it('接線に沿って分ければ置ける', () => {
+    const { tool, network } = railLine();
+    const soft = { straight: false, noSnap: false };
+    tool.update(new Vector3(0, 0, 0), soft);
+    tool.click();
+    tool.update(new Vector3(120, 0, -120), soft);
+    expect(tool.status().blockers).toEqual([]);
+    tool.click();
+    tool.cancel();
+    const node = junctionNode(network);
+    expect(network.branchesAt(node.id).length).toBe(3);
+  });
+
+  it('端点から続けて引くぶんには、折れても止めない (継ぎ目は均される)', () => {
+    const { tool, network } = railLine();
+    // 東の端点から北東へ。2 枝の継ぎ目なので `smoothJoint` が折れを均す。
+    tool.update(new Vector3(200, 0, 0), MODS);
+    tool.click();
+    tool.update(new Vector3(300, 0, -60), MODS);
+    expect(tool.status().blockers).toEqual([]);
+    tool.click();
+    tool.cancel();
+    expect(network.segments.size).toBe(2);
+  });
+});
+
 describe('ルートに沿った平行敷設', () => {
   const GAP = 4.6; // parallelSpacing(rail_single)
 
@@ -932,35 +986,39 @@ describe('ルートに沿った平行敷設', () => {
     expect(laid(network, 3)).toEqual(['(-140,4.6)->(-50,4.6)', '(-50,4.6)->(20,4.6)']);
   });
 
-  it('分岐のあるノードの真横では区切らず、交差点の面の外まで伸ばす', () => {
+  /**
+   * 線路の交差点には面が無いので、分岐器のノードの真横で区切ってよい。
+   * (面があった頃は、そこに端点を置くと「交差点の中に端点があります」で
+   *  止まり、分岐器を 1 つ越えるだけで複線化できなかった。)
+   */
+  it('分岐器の真横でも、基準と同じ位置で区切って敷ける', () => {
     const { tool, network } = line([-150, 0, 150]);
-    // 原点から南東へ側線を分ける (原点が分岐器になる)。
-    tool.update(new Vector3(0, 0, 0), MODS);
+    // 原点から南東へ側線を分ける (原点が分岐器になる)。線路の分岐は接線に
+    // 沿ってしか作れないので、曲線モードで引く。
+    const soft = { straight: false, noSnap: false };
+    tool.update(new Vector3(0, 0, 0), soft);
     tool.click();
-    tool.update(new Vector3(120, 0, -120), MODS);
+    tool.update(new Vector3(120, 0, -120), soft);
+    expect(tool.status().blockers).toEqual([]);
     tool.click();
     tool.cancel();
     const base = network.segments.size;
     const node = [...network.nodes.values()].find((n) => Math.hypot(n.pos.x, n.pos.z) < 1)!;
     expect(network.branchesAt(node.id).length).toBe(3);
-    const reach = junctionReach(network, node.id);
-    expect(reach).toBeGreaterThan(GAP);
+    expect(junctionReach(network, node.id)).toBe(0);
 
     // 分岐と反対側 (北) に、分岐器を越えて敷く。
     tool.update(new Vector3(-140, 0, GAP), MODS);
     tool.click();
     tool.update(new Vector3(140, 0, GAP), MODS);
-    // 区切りが交差点の面の中に入っていれば「交差点の中に端点があります」で
-    // 止まる。面の外までずらしているので、そのまま置ける。
     expect(tool.status().blockers).toEqual([]);
     tool.click();
 
     const placed = [...network.segments.values()].slice(base);
     expect(placed.length).toBe(2);
+    // 区切りは基準のノードの真横。
     const joint = network.getNode(placed[0].b).pos;
-    expect(joint.distanceTo(node.pos)).toBeGreaterThan(reach);
-    // ずらすのは面から出るのに要るぶんだけ。遠くまで引きずらない。
-    expect(joint.x).toBeLessThan(reach + 5);
+    expect(Math.abs(joint.x - node.pos.x)).toBeLessThan(1);
   });
 
   it('曲がった線路でも、間隔と終点の接線が基準に揃う', () => {

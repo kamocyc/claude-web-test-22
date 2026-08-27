@@ -397,8 +397,5 @@ export function getClass(id: string): NetworkClass {
   return c;
 }
 
-/** 分岐器で許容する最大の分岐角。これを超える線路接続は警告になる。 */
-export const MAX_TURNOUT_ANGLE = 20 * DEG;
-
 /** 交差点で「直進」とみなす最大偏角。 */
 export const STRAIGHT_THROUGH_ANGLE = 35 * DEG;

@@ -1,4 +1,4 @@
-import { Vector3 } from 'three';
+import { Vector2, Vector3 } from 'three';
 import type { Alignment } from '../core/alignment';
 import {
   CLEARANCE_OVER_RAIL,
@@ -11,8 +11,14 @@ import {
 import { MAX_CROSSING_LIFT } from '../build/crossing';
 import type { NetworkClass } from './classes';
 import { intersectPolylines, toPolyline, type PolylinePoint } from './crossings';
-import type { Anchor } from './editing';
-import { CORNER_MARGIN, requiredTrims, type BranchLike } from './junction';
+import { MIN_SMOOTHED_DEFLECTION, type Anchor } from './editing';
+import {
+  CORNER_MARGIN,
+  pairTrackBranches,
+  railBranchMessage,
+  requiredTrims,
+  type BranchLike,
+} from './junction';
 import type { Branch, Network, NodeId, SegmentId } from './network';
 import { classify } from './structure';
 import { checkAlignmentAgainstStations } from './stationPlacement';
@@ -127,6 +133,7 @@ export function checkPlacement(ctx: PlacementContext): PlacementCheck {
   const connected = new Set<SegmentId>([...sides[0], ...sides[1]]);
   if (ctx.ignore !== undefined) connected.add(ctx.ignore);
 
+  blockers.push(...checkRailBranches(ctx));
   blockers.push(...checkOverlaps(ctx, connected));
   blockers.push(...checkRunningAlong(ctx, sides[0], sides[1]));
   blockers.push(...checkJunctionSpacing(ctx));
@@ -210,6 +217,62 @@ interface Candidate {
   hits: ReturnType<typeof intersectPolylines>;
   /** 中心線どうしの粗い当たり判定に使う距離 [m]。 */
   reach: number;
+}
+
+/**
+ * 線路の分岐が、既存の線路の接線に合っているか。
+ *
+ * 線路の交差点には中身が無い (`junction.ts` の冒頭の説明) ので、折れたまま
+ * 枝が集まると、その角がそのまま残る。交差点の中で振り分ける余地が無く、
+ * 置いてから直すことができないので、置く前に止める。
+ *
+ * 見るのは**枝が 3 本以上になる所**だけ。2 本で終わる継ぎ目の折れは、置いた
+ * 直後に `smoothJoint` が両側を振って均す。
+ */
+function checkRailBranches(ctx: PlacementContext): string[] {
+  const { network, cls, alignment } = ctx;
+  if (cls.kind !== 'rail') return [];
+  const out: string[] = [];
+
+  const ends: [Anchor, boolean][] = [
+    [ctx.start, true],
+    [ctx.end, false],
+  ];
+  for (const [anchor, atStart] of ends) {
+    // ノードから外向きに見た、これから敷く線形の向き。
+    const mine = atStart
+      ? alignment.sampleAt(0).forwardXZ.clone()
+      : alignment.sampleAt(alignment.length).forwardXZ.clone().negate();
+
+    const dirs: Vector2[] = [];
+    if (anchor.node !== undefined) {
+      for (const branch of network.branchesAt(anchor.node)) {
+        if (branch.segment === ctx.ignore) continue;
+        if (branch.cls.kind !== 'rail') continue;
+        dirs.push(branch.dir.clone());
+      }
+    } else if (anchor.split) {
+      const seg = network.segments.get(anchor.split.segment);
+      if (!seg || network.classOf(seg).kind !== 'rail') continue;
+      const split = network.alignmentOf(anchor.split.segment);
+      const tangent = split.sampleAt(clamp(anchor.split.s, 0, split.length)).forwardXZ;
+      // 分割すると、切った点から前後へ 1 本ずつの枝ができる。
+      dirs.push(tangent.clone(), tangent.clone().negate());
+    } else {
+      continue;
+    }
+    if (dirs.length < 2) continue;
+
+    // 交差点を解くときと同じ組み方で、自分が加わる進路の分岐角を見る。
+    const index = dirs.length;
+    dirs.push(mine);
+    for (const pair of pairTrackBranches(dirs)) {
+      if (pair.i !== index && pair.j !== index) continue;
+      if (pair.deflection <= MIN_SMOOTHED_DEFLECTION) continue;
+      out.push(railBranchMessage(pair.deflection));
+    }
+  }
+  return out;
 }
 
 /**

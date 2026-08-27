@@ -5,21 +5,15 @@ import { RAIL_GAUGE, SURFACE_LIFT, clamp } from '../core/units';
 import type { Approach, Junction, TrackConnection } from '../network/junction';
 import type { SegmentId } from '../network/network';
 import { addBox } from './primitives';
-import {
-  RAIL_HEAD_HALF_WIDTH,
-  RAIL_HEIGHT,
-  interpolateSample,
-  trackConnectionSamples,
-  type TrackConnectionOptions,
-} from './rail';
+import { RAIL_HEAD_HALF_WIDTH, RAIL_HEIGHT, interpolateSample } from './rail';
 import type { RGB } from './surface';
 import { RAIL_TOP_TO_BALLAST } from './surface';
 
 /**
  * 分岐器 (ターンアウト) の造作。
  *
- * レールそのものは軌道の描画 (`buildTrack` と `buildTrackConnection`) が引く
- * もので、ここでは**一切触らない**。分岐器らしく見えるのに足りない金物 —
+ * レールそのものは軌道の描画 (`buildTrack`) が引くもので、ここでは
+ * **一切触らない**。分岐器らしく見えるのに足りない金物 —
  * トングレール・転てつ機・クロッシング・ガードレール — を、そのレールの上に
  * 足すだけにする。
  *
@@ -250,7 +244,7 @@ function solveFrog(
   return { at: hit.at, throughDir: hit.dirA, divergingDir: hit.dirB, guards };
 }
 
-export interface TurnoutOptions extends TrackConnectionOptions {
+export interface TurnoutOptions {
   /**
    * 枝のセグメントを、ノードから外向きに `distance` [m] たどった点列
    * (先頭がノード側)。**実際にレールを描いたのと同じ線形**を渡すこと。
@@ -318,34 +312,15 @@ function routeFromToe(
   const other = approachOf(forward ? conn.to : conn.from);
   if (!other) return null;
 
-  // 交差点の中は接続曲線。点列は必ず「保存されている向き」で作る。逆から
-  // 引き直すと刻みがずれ、道床への持ち上げの効き方が変わって、描かれた
-  // レールから外れる。
-  const inside = trackConnectionSamples(
-    forward ? toe : other,
-    forward ? other : toe,
-    options,
-  );
-  const route = inside ? (forward ? rebase(inside) : reverseSamples(inside)) : [];
-  const reach = TURNOUT_REACH - (route.length > 0 ? last(route).s : 0);
-  if (reach > 0.5) appendPath(route, options.branchPath?.(other, reach) ?? []);
+  // 線路の交差点には中身が無い (枝の帯がノードまで通っている) ので、
+  // 進路はそのまま枝の続きになる。
+  const route = rebase(options.branchPath?.(other, TURNOUT_REACH) ?? []);
   return route.length >= 2 ? route : null;
-}
-
-/** 点列を継ぎ足す (弧長を繋ぎ、重なった点は落とす)。 */
-function appendPath(route: AlignmentSample[], more: AlignmentSample[]): void {
-  if (more.length === 0) return;
-  const base = route.length > 0 ? last(route).s : 0;
-  const start = more[0].s;
-  for (const sample of more) {
-    const s = base + (sample.s - start);
-    if (route.length > 0 && s - last(route).s < 1e-6) continue;
-    route.push({ ...sample, s });
-  }
 }
 
 /** 弧長の起点を 0 にそろえる。 */
 function rebase(samples: AlignmentSample[]): AlignmentSample[] {
+  if (samples.length === 0) return samples;
   const s0 = samples[0].s;
   return s0 === 0 ? samples : samples.map((sample) => ({ ...sample, s: sample.s - s0 }));
 }

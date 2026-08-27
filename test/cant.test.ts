@@ -42,20 +42,12 @@ function turnoutOnCurve(): Scene {
       { x: -200, z: 220, y: 20 },
       { x: 40, z: 300, y: 20 },
     ]);
-    // 継ぎ目から引くと本線の接線に沿って分かれる (角度の付かない分岐器に
-    // なる) ので、交差点の面を作りたいここでは直線で角度を付けて分ける。
+    // 本線の接線に沿って分かれる (線路の分岐はこれしか作れない)。
     blockers.push(
-      ...drawBranch(
-        net,
-        field,
-        'rail_yard',
-        new Vector3(-236, 20, 185),
-        [
-          { x: -140, z: 140, y: 20 },
-          { x: 0, z: 60, y: 20 },
-        ],
-        { straight: true },
-      ),
+      ...drawBranch(net, field, 'rail_yard', new Vector3(-236, 20, 185), [
+        { x: -140, z: 140, y: 20 },
+        { x: 0, z: 60, y: 20 },
+      ]),
     );
     return blockers;
   });
@@ -119,24 +111,22 @@ describe('カントの付き方', () => {
 });
 
 describe('分岐器とカント', () => {
-  it('交差点の面に取り付く断面が水平になる (道床がねじれない)', () => {
+  it('分岐器の足元ではカントが抜ける (重なった道床がねじれない)', () => {
     const scene = turnoutOnCurve();
     let checked = 0;
     for (const junction of scene.world.junctions.values()) {
-      if (junction.rings.length === 0) continue;
+      if (junction.approaches.length < 3) continue;
       for (const ap of junction.approaches) {
         const range = scene.result.ranges.get(ap.branch.segment)!;
         const s = ap.branch.atStart ? range.s0 : range.s1;
         expect(Math.abs(scene.world.cantAt(ap.branch.segment, s))).toBeLessThan(1e-9);
-        // 断面の左右の端が同じ高さ (= 水平)。
-        expect(Math.abs(ap.edgePrev.y - ap.edgeNext.y)).toBeLessThan(1e-6);
         checked++;
       }
     }
     expect(checked).toBeGreaterThan(2);
   });
 
-  it('カントの付いた曲線でも、交差点の面と帯の継ぎ目が開かない', () => {
+  it('カントの付いた曲線から分けても、帯の継ぎ目が開かない', () => {
     const scene = turnoutOnCurve();
     expect(scene.blocked).toEqual([]);
     expect(scene.result.stats.turnouts).toBeGreaterThan(0);
@@ -281,17 +271,27 @@ describe('車両とカント', () => {
     expect(outward).toBe(0);
   });
 
-  it('交差点の中の進路は水平 (面がねじれない所を走る)', () => {
+  /**
+   * 線路の交差点には中身が無いので、進路は交差点の中で別の線を描かず、
+   * 枝の車線どうしが直に繋がる。繋がりが切れていないことも一緒に見る。
+   */
+  it('分岐器では車線が直に繋がる (交差点の中に別の進路ができない)', () => {
     const scene = turnoutOnCurve();
-    let connectors = 0;
-    for (const lane of scene.world.laneGraph.lanes) {
-      if (lane.kind !== 'connector') continue;
-      for (let i = 0; i <= 4; i++) {
-        expect(lane.path.poseAt((i / 4) * lane.path.length).roll).toBe(0);
-      }
-      connectors++;
+    const lanes = scene.world.laneGraph.lanes;
+    expect(lanes.filter((lane) => lane.kind === 'connector')).toHaveLength(0);
+    const junctions = [...scene.world.junctions.values()].filter(
+      (j) => j.approaches.length >= 3,
+    );
+    expect(junctions.length).toBeGreaterThan(0);
+    for (const junction of junctions) {
+      // 分岐器に集まる枝の車線から、必ず別の枝の車線へ進める。
+      const here = lanes.filter(
+        (lane) =>
+          lane.kind === 'segment' &&
+          junction.approaches.some((ap) => ap.branch.segment === lane.segment),
+      );
+      expect(here.some((lane) => lane.next.length > 0)).toBe(true);
     }
-    expect(connectors).toBeGreaterThan(0);
   });
 });
 
