@@ -1234,6 +1234,7 @@ export class BuildTool {
     const plan = this.crossingPlan!;
     // 引き直しで自分の区間を拾わないように覚えておく。
     const placed = new Set<SegmentId>();
+    const laid: { segment: SegmentId; preview: PlacementPreview }[] = [];
     let start: Anchor = this.anchor!;
     let result: PlaceResult | null = null;
 
@@ -1241,21 +1242,33 @@ export class BuildTool {
       const preview = previewFromAlignment(leg.alignment);
       let end: Anchor;
       if (!leg.joint) {
-        end = index === plan.legs.length - 1 ? this.endAnchor ?? { pos: preview.end } : { pos: preview.end };
+        end =
+          index === plan.legs.length - 1
+            ? this.endAnchor ?? { pos: preview.end }
+            : { pos: preview.end };
       } else {
+        // 先に相手を分割して、できたノードへ向けて敷く。位置を平均で寄せる
+        // `mergeNodes` を通らないので、交点の高さが既存の線形のまま残る。
         const node = splitAtCrossing(this.network, leg.joint, placed);
         end = node ? { pos: node.pos.clone(), node: node.id } : { pos: preview.end.clone() };
       }
       result = this.place(start, end, preview);
       placed.add(result.segment);
-      // 枝が 2 本しかない継ぎ目 (踏切になる所) では `smoothGradeJoint` が
-      // 勾配を動かす。交点の高さに合わせて解いた勾配を入れ直す。
-      this.network.updateSegment(result.segment, {
-        gradeA: preview.startGrade,
-        gradeB: preview.endGrade,
-      });
+      laid.push({ segment: result.segment, preview });
       const node = this.network.nodes.get(result.endNode);
       start = node ? { pos: node.pos.clone(), node: node.id } : { pos: preview.end.clone() };
+    }
+
+    // 区間どうしの継ぎ目が枝 2 本だけになる所 (道路を交点で分けただけの所)
+    // では `smoothGradeJoint` が勾配を動かす。交点の高さに合わせて解いた
+    // 勾配を入れ直す。全部敷き終わってからでないと、次の区間を敷いたときに
+    // また動かされる。区間の**外側**の端は既存の線形へ繋がるので、均して
+    // もらったままにする。
+    for (const [index, { segment, preview }] of laid.entries()) {
+      this.network.updateSegment(segment, {
+        ...(index > 0 ? { gradeA: preview.startGrade } : {}),
+        ...(index < laid.length - 1 ? { gradeB: preview.endGrade } : {}),
+      });
     }
 
     // 既設の道路を曲げるのは最後。敷く場所には影響しない。

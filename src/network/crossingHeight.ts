@@ -100,7 +100,12 @@ interface RawHit {
  * 弧長がそのまま分割位置 = ノードの位置になるので、曲線の上では効いてくる。
  * 2 本の接線で 2 元 1 次を解き、ずれを詰める向きへ進める。
  */
-function refineHit(mine: Alignment, other: Alignment, s0: number, t0: number): { s: number; t: number } {
+function refineHit(
+  mine: Alignment,
+  other: Alignment,
+  s0: number,
+  t0: number,
+): { s: number; t: number } {
   let s = s0;
   let t = t0;
   for (let i = 0; i < REFINE_STEPS; i++) {
@@ -123,7 +128,10 @@ function refineHit(mine: Alignment, other: Alignment, s0: number, t0: number): {
 }
 
 /** 端点で既に繋がっている相手 (交点として扱わない)。 */
-function connectedSegments(network: Network, nodes: readonly (NodeId | undefined)[]): Set<SegmentId> {
+function connectedSegments(
+  network: Network,
+  nodes: readonly (NodeId | undefined)[],
+): Set<SegmentId> {
   const out = new Set<SegmentId>();
   for (const id of nodes) {
     if (id === undefined) continue;
@@ -208,7 +216,13 @@ function gradeMessage(cls: NetworkClass, grade: number): string {
 function chainMaxGrade(heights: number[], lengths: number[], grades: number[]): number {
   let worst = 0;
   for (let i = 0; i < lengths.length; i++) {
-    const profile = new VerticalProfile(heights[i], heights[i + 1], grades[i], grades[i + 1], lengths[i]);
+    const profile = new VerticalProfile(
+      heights[i],
+      heights[i + 1],
+      grades[i],
+      grades[i + 1],
+      lengths[i],
+    );
     worst = Math.max(worst, profile.maxGrade(32));
   }
   return worst;
@@ -271,8 +285,9 @@ export function planCrossingHeights(
       cls,
     );
     if (!solved.feasible) {
-      // 合わせられないなら、脚に分けず元の 1 本を返す (`rules.ts` の一般的な
-      // 勾配の文言と二重に出さないため、理由はここだけで出す)。
+      // 合わせられないなら、脚には分けず元の 1 本を返す。理由をここで足すので、
+      // 「合わせようとしたが勾配が足りない」と「そのままでは桁下が足りない」の
+      // 2 つが並ぶ。どちらも本当のことで、直し方 (高さを変える) も同じ。
       return {
         legs: [{ alignment, matched: [] }],
         roadEdits: [],
@@ -303,15 +318,15 @@ export function planCrossingHeights(
       // ならなくなる。道路の方は交点で分けて高さを合わせるだけでよい。
       const joint: MatchedCrossing | undefined =
         hit && hit.kind === cls.kind
-        ? {
-            segment: hit.segment,
-            kind: hit.kind,
-            sOther: hit.sOther,
-            point: new Vector3(hit.point.x, hit.otherY, hit.point.z),
-            y: hit.otherY,
-            grade: hit.otherGrade,
-          }
-        : undefined;
+          ? {
+              segment: hit.segment,
+              kind: hit.kind,
+              sOther: hit.sOther,
+              point: new Vector3(hit.point.x, hit.otherY, hit.point.z),
+              y: hit.otherY,
+              grade: hit.otherGrade,
+            }
+          : undefined;
       // この脚に載る交点は、始端 (前の脚との境目) と終端 (自分の交点)。
       const matched: MatchedCrossingHint[] = [];
       if (i > 0) {
@@ -333,13 +348,12 @@ export function planCrossingHeights(
 
   // --- 既設の道路を曲げる分 -------------------------------------------------
   for (const hit of railOverRoad) {
-    // 合わせた後のレールの高さ。脚に分かれていれば、その脚から読み直す。
-    const leg = legs.findIndex((_, i) => hit.s <= stations[i + 1] + 1e-6);
-    const index = leg < 0 ? legs.length - 1 : leg;
-    const local = Math.max(
-      0,
-      Math.min(legs[index].alignment.length, hit.s - stations[index]),
-    );
+    // 合わせる高さは、**解き終わった後の**レールの高さ。同じ線形が線路とも
+    // 道路とも交わるときは、線路との交点に合わせて縦断が変わっているので、
+    // 元の線形から読むと合わない。
+    const found = legs.findIndex((_, i) => hit.s <= stations[i + 1] + 1e-6);
+    const index = found < 0 ? legs.length - 1 : found;
+    const local = Math.max(0, Math.min(legs[index].alignment.length, hit.s - stations[index]));
     const railY = legs[index].alignment.sampleAt(local).pos.y;
 
     const roadAlignment = network.alignmentOf(hit.segment);
@@ -368,7 +382,11 @@ export function planCrossingHeights(
       y: railY,
       grade: solved.grades[1],
     };
-    roadEdits.push({ target, y: railY, grades: [solved.grades[0], solved.grades[1], solved.grades[2]] });
+    roadEdits.push({
+      target,
+      y: railY,
+      grades: [solved.grades[0], solved.grades[1], solved.grades[2]],
+    });
     // 判定は「合わせた後の道路」で行う。合わせる前の高低差で見ると、必ず
     // 「桁下が足りません」になってしまう。
     const hint: MatchedCrossingHint = {

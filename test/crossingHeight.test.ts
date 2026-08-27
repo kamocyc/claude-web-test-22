@@ -3,7 +3,12 @@ import { Vector2, Vector3 } from 'three';
 import { Alignment } from '../src/core/alignment';
 import { HorizontalCurve } from '../src/core/curve';
 import { VerticalProfile } from '../src/core/profile';
-import { anchorFromNode, computePlacement, placeSegment, solveChainProfile } from '../src/network/editing';
+import {
+  anchorFromNode,
+  computePlacement,
+  placeSegment,
+  solveChainProfile,
+} from '../src/network/editing';
 import { planCrossingHeights } from '../src/network/crossingHeight';
 import { getClass } from '../src/network/classes';
 import { Network, type NetNode } from '../src/network/network';
@@ -519,5 +524,113 @@ describe('線路と道路の交差で高さを合わせる', () => {
     for (const grade of outer) {
       expect(Math.abs(grade)).toBeCloseTo(Math.abs(before.gradeA), 6);
     }
+  });
+});
+
+describe('道路どうしの交差で高さを合わせる', () => {
+  it('あとから引いた道路が既設の高さで交わり、交差点になる', () => {
+    const { tool, network } = scene('road_medium', 'road_medium', 1.5);
+    clickAt(tool, 0, -220);
+    clickAt(tool, 0, 220);
+    tool.cancel();
+
+    const nodes = crossingNodes(network);
+    expect(nodes).toHaveLength(1);
+    expect(nodes[0].pos.y).toBeCloseTo(1.5, 6);
+    const junctions = [...solveJunctions(network).junctions.values()];
+    expect(junctions.filter((j) => j.kind === 'intersection')).toHaveLength(1);
+    expect(junctions.flatMap((j) => j.warnings)).toEqual([]);
+  });
+
+  it('交差点の取り付き長が取れない所では、今までどおり止まる', () => {
+    // 既設の道路の端のすぐ内側で交わらせる。交差点の面が既存の端まで届く。
+    const { tool } = scene('road_medium', 'road_medium', 1);
+    tool.update(new Vector3(-247, 0, -150), MODS);
+    tool.click();
+    tool.update(new Vector3(-247, 0, 150), MODS);
+    expect(tool.status().blockers.join(' ')).toContain('交差点が近すぎます');
+  });
+});
+
+describe('組み立てた世界', () => {
+  it('高さを合わせた線路の交差で、交差の警告が出ない', () => {
+    const { tool, network, field } = scene('rail_single', 'rail_single', 1.2);
+    clickAt(tool, 0, -220);
+    clickAt(tool, 0, 220);
+    tool.cancel();
+    const world = new WorldBuilder(network, field, new TerrainMesh(field, new MeshBasicMaterial()));
+    const result = world.rebuild();
+    // 「同一平面で交差しています」も「桁下が足りません」も出ない。
+    expect(result.warnings.map((w) => w.message)).toEqual([]);
+  });
+
+  it('道路を線路の上に引いた踏切で、交差の警告が出ない', () => {
+    const { tool, network, field } = scene('rail_single', 'road_medium', 1.2);
+    clickAt(tool, 0, -220);
+    clickAt(tool, 0, 220);
+    tool.cancel();
+    const world = new WorldBuilder(network, field, new TerrainMesh(field, new MeshBasicMaterial()));
+    const result = world.rebuild();
+    expect(result.stats.levelCrossings).toBe(1);
+    expect(result.warnings.map((w) => w.message)).toEqual([]);
+  });
+});
+
+/** その場所を通っている線路の高さ [m]。 */
+function railHeightAt(network: Network, x: number, z: number): number {
+  let best = { y: 0, distance: Infinity };
+  for (const seg of network.segments.values()) {
+    if (network.classOf(seg).kind !== 'rail') continue;
+    const alignment = network.alignmentOf(seg.id);
+    for (const sample of alignment.sample(1)) {
+      const distance = Math.hypot(sample.pos.x - x, sample.pos.z - z);
+      if (distance < best.distance) best = { y: sample.pos.y, distance };
+    }
+  }
+  return best.y;
+}
+
+describe('線路と道路の両方を横切る', () => {
+  it('線路とは高さを合わせて分かれ、道路の方は曲げる', () => {
+    const network = new Network();
+    const field = flatField();
+    const tool = new BuildTool(network, field, () => {});
+    // 東西の線路 (高さ 1.5 m) と、その南に東西の道路 (高さ 1.5 m)。
+    tool.setClass('rail_single');
+    tool.adjustElevation(0.5);
+    clickAt(tool, -250, 0);
+    clickAt(tool, 250, 0);
+    tool.cancel();
+    tool.setClass('road_medium');
+    clickAt(tool, -250, -120);
+    clickAt(tool, 250, -120);
+    tool.cancel();
+    tool.adjustElevation(-0.5);
+
+    // 南北の線路を引いて、両方を横切る。
+    tool.setClass('rail_single');
+    clickAt(tool, 0, -260);
+    clickAt(tool, 0, 220);
+    tool.cancel();
+
+    // 既設の線路とは交点を共有する (枝 4 本)。
+    const shared = crossingNodes(network);
+    expect(shared).toHaveLength(1);
+    expect(shared[0].pos.y).toBeCloseTo(1.5, 6);
+
+    // 道路は交点で分かれ、そのノードがレールの高さまで下りている。
+    const roadJoint = [...network.nodes.values()].find(
+      (n) => n.segments.length === 2 && Math.abs(n.pos.x) < 2 && Math.abs(n.pos.z + 120) < 2,
+    );
+    expect(roadJoint).toBeDefined();
+    // 合わせる高さは、その場所での**引いた線路**の高さ (既設の線路との
+    // 交点へ向かって上っている途中なので、端の高さとは違う)。
+    const railY = railHeightAt(network, 0, -120);
+    expect(roadJoint!.pos.y).toBeCloseTo(railY, 2);
+
+    const world = new WorldBuilder(network, field, new TerrainMesh(field, new MeshBasicMaterial()));
+    const result = world.rebuild();
+    expect(result.stats.levelCrossings).toBe(1);
+    expect(result.warnings.map((w) => w.message)).toEqual([]);
   });
 });
