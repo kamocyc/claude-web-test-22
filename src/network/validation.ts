@@ -104,6 +104,35 @@ export function evaluateAlignment(alignment: Alignment, cls: NetworkClass): Segm
   };
 }
 
+/**
+ * 続けて敷く区間の診断をまとめる。
+ *
+ * 長さは合計、それ以外は**いちばん悪い所**を採る。1 回の操作で何本か
+ * まとめて敷くとき (ルートに沿った平行敷設)、パネルに出るのは「その操作
+ * ぜんぶ」の値であってほしいため。
+ */
+export function worstDiagnostics(parts: readonly SegmentDiagnostics[]): SegmentDiagnostics | null {
+  if (parts.length === 0) return null;
+  if (parts.length === 1) return parts[0];
+  const messages: string[] = [];
+  for (const part of parts) {
+    for (const message of part.messages) if (!messages.includes(message)) messages.push(message);
+  }
+  return {
+    length: parts.reduce((sum, part) => sum + part.length, 0),
+    minRadius: Math.min(...parts.map((p) => p.minRadius)),
+    maxGrade: Math.max(...parts.map((p) => p.maxGrade)),
+    minVerticalRadius: Math.min(...parts.map((p) => p.minVerticalRadius)),
+    radiusOk: parts.every((p) => p.radiusOk),
+    gradeOk: parts.every((p) => p.gradeOk),
+    verticalOk: parts.every((p) => p.verticalOk),
+    radiusRisk: Math.max(...parts.map((p) => p.radiusRisk)),
+    gradeRisk: Math.max(...parts.map((p) => p.gradeRisk)),
+    verticalRisk: Math.max(...parts.map((p) => p.verticalRisk)),
+    messages,
+  };
+}
+
 /** 表示用に 0..1 に丸めた危険度。1 に近いほど規格ぎりぎり。 */
 export function riskLevel(diag: SegmentDiagnostics): number {
   return clamp(Math.max(diag.radiusRisk, diag.gradeRisk, diag.verticalRisk), 0, 2) / 2;

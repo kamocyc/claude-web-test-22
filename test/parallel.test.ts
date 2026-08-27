@@ -12,6 +12,7 @@ import {
   findParallelReference,
   offsetCurve,
   parallelAlignment,
+  parallelRoute,
   parallelSpacing,
 } from '../src/network/parallel';
 import { computeStructureProfile } from '../src/network/structure';
@@ -546,5 +547,89 @@ describe('セグメントの反転', () => {
     // 端点の勾配は入れ替わって符号が反転する。
     expect(after.vertical.m0).toBeCloseTo(-0.06, 6);
     expect(after.vertical.m1).toBeCloseTo(-0.02, 6);
+  });
+});
+
+/**
+ * ルートの追跡。
+ *
+ * 「どこまで一度に敷けるか」は、基準の線形が何本に分かれているかではなく、
+ * 線路のルートで決まってほしい。分岐では指している向きへ進み、来た向きから
+ * 大きく折れる枝や駅の構内線へは入らない。
+ */
+describe('平行に敷くルート', () => {
+  /** 西から東へ引いた線路を、途中のノードで分けて作る。 */
+  function mainLine(network: Network, xs: number[]): void {
+    draw(
+      network,
+      flatField(),
+      'rail_single',
+      xs.map((x) => ({ x, z: 0 })),
+      { straight: true },
+    );
+  }
+
+  function routeFrom(network: Network, from: Vector3, to: Vector3) {
+    const cls = getClass('rail_single');
+    const reference = findParallelReference(network, cls, from);
+    expect(reference).not.toBeNull();
+    return parallelRoute(network, cls, reference!, from, to);
+  }
+
+  it('繋がっているセグメントを、指した所までたどる', () => {
+    const network = new Network();
+    mainLine(network, [-150, -50, 50, 150]);
+    const gap = parallelSpacing(getClass('rail_single'));
+    const legs = routeFrom(network, new Vector3(-140, 0, gap), new Vector3(140, 0, gap));
+    expect(traced(legs)).toEqual([1, 2, 3]);
+    const total = legs.reduce((sum, leg) => sum + leg.alignment.length, 0);
+    expect(total).toBeCloseTo(280, 0);
+  });
+
+  it('たどる長さには上限がある (1 回のドラッグで町を横断しない)', () => {
+    const network = new Network();
+    mainLine(network, [-600, -400, -200, 0, 200, 400, 600]);
+    const gap = parallelSpacing(getClass('rail_single'));
+    const cls = getClass('rail_single');
+    const from = new Vector3(-590, 0, gap);
+    const reference = findParallelReference(network, cls, from)!;
+    const legs = parallelRoute(network, cls, reference, from, new Vector3(590, 0, gap), {
+      maxLength: 300,
+    });
+    const total = legs.reduce((sum, leg) => sum + leg.alignment.length, 0);
+    expect(total).toBeGreaterThan(100);
+    expect(total).toBeLessThan(500);
+  });
+
+  /** たどった基準セグメント (交差点をよけて 2 本にまたがる区間は 1 回だけ数える)。 */
+  function traced(legs: { references: SegmentId[] }[]): SegmentId[] {
+    return [...new Set(legs.flatMap((leg) => leg.references))];
+  }
+
+  it('分岐では、指している向きの枝へ進む', () => {
+    const network = new Network();
+    mainLine(network, [-150, 0, 150]);
+    // 原点から南東へ側線。原点が 3 枝のノードになる。
+    draw(network, flatField(), 'rail_single', [{ x: 0, z: 0 }, { x: 120, z: -120 }], {
+      straight: true,
+    });
+    const gap = parallelSpacing(getClass('rail_single'));
+    const from = new Vector3(-140, 0, gap);
+
+    // 本線の先を指せば本線 (1 → 2)。
+    expect(traced(routeFrom(network, from, new Vector3(140, 0, gap)))).toEqual([1, 2]);
+    // 側線の先を指せば側線 (1 → 3)。
+    expect(traced(routeFrom(network, from, new Vector3(110, 0, -115)))).toEqual([1, 3]);
+  });
+
+  it('行き止まりでは折り返さない', () => {
+    const network = new Network();
+    mainLine(network, [-150, -50, 50, 150]);
+    const gap = parallelSpacing(getClass('rail_single'));
+    // 端のさらに先を指しても、たどるのは端まで。
+    const legs = routeFrom(network, new Vector3(-140, 0, gap), new Vector3(400, 0, gap));
+    expect(traced(legs)).toEqual([1, 2, 3]);
+    const end = legs[legs.length - 1].alignment;
+    expect(end.sampleAt(end.length).pos.x).toBeCloseTo(150, 0);
   });
 });

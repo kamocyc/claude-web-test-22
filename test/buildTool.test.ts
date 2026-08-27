@@ -14,6 +14,9 @@ import { DEFAULT_TERRAIN, generateTerrain } from '../src/terrain/generator';
 import { TerrainMesh } from '../src/terrain/terrainMesh';
 import { Heightfield } from '../src/terrain/heightfield';
 import { testField } from './support/field';
+import { stationOf } from '../src/network/parallel';
+import { junctionReach } from '../src/network/rules';
+import { DEG } from '../src/core/units';
 
 /**
  * 敷設ツールの操作。
@@ -831,5 +834,178 @@ describe('踏切', () => {
     tool.adjustElevation(-1);
     tool.update(new Vector3(0, 0, 3), MODS);
     expect(tool.status().snap).toBe('crossing');
+  });
+});
+
+/**
+ * ルートに沿った平行敷設。
+ *
+ * 既存の複線は、橋・踏切・分岐のたびにノードが入って何本にも分かれている。
+ * 基準の 1 本ぶんで止まってしまうと、その隣を敷くのに何度もクリックし直す
+ * ことになる。始点の隣から終点の隣まで、線路のルートをたどって一度に敷ける
+ * ようにしたのがここ。
+ */
+describe('ルートに沿った平行敷設', () => {
+  const GAP = 4.6; // parallelSpacing(rail_single)
+
+  /** 途中にノードのある線路を引く (経由点ごとに 1 本ずつのセグメントになる)。 */
+  function line(xs: number[], straight = true): { tool: BuildTool; network: Network } {
+    const network = new Network();
+    const tool = new BuildTool(network, flatField(), () => {});
+    tool.setClass('rail_single');
+    tool.setParallelSnap(true);
+    const mods = { straight, noSnap: false };
+    for (const x of xs) {
+      tool.update(new Vector3(x, 0, 0), mods);
+      tool.click();
+    }
+    tool.cancel();
+    return { tool, network };
+  }
+
+  /** 敷いた区間を「(始点)->(終点)」の並びにする。 */
+  function laid(network: Network, from: number): string[] {
+    return [...network.segments.values()].slice(from).map((seg) => {
+      const a = network.getNode(seg.a).pos;
+      const b = network.getNode(seg.b).pos;
+      return `(${a.x.toFixed(0)},${a.z.toFixed(1)})->(${b.x.toFixed(0)},${b.z.toFixed(1)})`;
+    });
+  }
+
+  it('途中で分かれている線路の隣を、一度に端から端まで敷ける', () => {
+    const { tool, network } = line([-150, -50, 50, 150]);
+    expect(network.segments.size).toBe(3);
+
+    tool.update(new Vector3(-140, 0, GAP), MODS);
+    expect(tool.status().snap).toBe('parallel');
+    tool.click();
+    tool.update(new Vector3(140, 0, GAP), MODS);
+    const status = tool.status();
+    expect(status.snap).toBe('parallel');
+    expect(status.blockers).toEqual([]);
+    // 長さは基準をたどった全長 (1 本ぶんの 100 m ではない)。
+    expect(status.length).toBeCloseTo(280, 0);
+
+    tool.click();
+    // 基準と同じ位置で区切られる。橋・トンネルの境目が隣どうしで揃う。
+    expect(laid(network, 3)).toEqual([
+      '(-140,4.6)->(-50,4.6)',
+      '(-50,4.6)->(50,4.6)',
+      '(50,4.6)->(140,4.6)',
+    ]);
+  });
+
+  it('引く向きも基準の向きも、敷く側を変えない', () => {
+    for (const reverseMiddle of [false, true]) {
+      for (const backwards of [false, true]) {
+        const name = `rev=${reverseMiddle} back=${backwards}`;
+        const { tool, network } = line([-150, -50, 50, 150]);
+        // 真ん中だけ線形の向きを入れ替える (弧長の向きが逆になる)。
+        if (reverseMiddle) network.reverseSegment(2);
+        const [from, to] = backwards ? [140, -140] : [-140, 140];
+
+        tool.update(new Vector3(from, 0, GAP), MODS);
+        tool.click();
+        tool.update(new Vector3(to, 0, GAP), MODS);
+        expect(tool.status().blockers, name).toEqual([]);
+        tool.click();
+
+        const placed = laid(network, 3);
+        expect(placed.length, name).toBe(3);
+        // どう引いても、同じ側 (z = +4.6) に同じ位置で区切られる。
+        for (const seg of [...network.segments.values()].slice(3)) {
+          for (const node of [seg.a, seg.b]) {
+            expect(network.getNode(node).pos.z, `${name} ${placed}`).toBeCloseTo(GAP, 1);
+          }
+        }
+      }
+    }
+  });
+
+  it('基準の途中で止めれば、そこまでで区切って敷ける', () => {
+    const { tool, network } = line([-150, -50, 50, 150]);
+    tool.update(new Vector3(-140, 0, GAP), MODS);
+    tool.click();
+    tool.update(new Vector3(20, 0, GAP), MODS);
+    expect(tool.status().length).toBeCloseTo(160, 0);
+    tool.click();
+    expect(laid(network, 3)).toEqual(['(-140,4.6)->(-50,4.6)', '(-50,4.6)->(20,4.6)']);
+  });
+
+  it('分岐のあるノードの真横では区切らず、交差点の面の外まで伸ばす', () => {
+    const { tool, network } = line([-150, 0, 150]);
+    // 原点から南東へ側線を分ける (原点が分岐器になる)。
+    tool.update(new Vector3(0, 0, 0), MODS);
+    tool.click();
+    tool.update(new Vector3(120, 0, -120), MODS);
+    tool.click();
+    tool.cancel();
+    const base = network.segments.size;
+    const node = [...network.nodes.values()].find((n) => Math.hypot(n.pos.x, n.pos.z) < 1)!;
+    expect(network.branchesAt(node.id).length).toBe(3);
+    const reach = junctionReach(network, node.id);
+    expect(reach).toBeGreaterThan(GAP);
+
+    // 分岐と反対側 (北) に、分岐器を越えて敷く。
+    tool.update(new Vector3(-140, 0, GAP), MODS);
+    tool.click();
+    tool.update(new Vector3(140, 0, GAP), MODS);
+    // 区切りが交差点の面の中に入っていれば「交差点の中に端点があります」で
+    // 止まる。面の外までずらしているので、そのまま置ける。
+    expect(tool.status().blockers).toEqual([]);
+    tool.click();
+
+    const placed = [...network.segments.values()].slice(base);
+    expect(placed.length).toBe(2);
+    const joint = network.getNode(placed[0].b).pos;
+    expect(joint.distanceTo(node.pos)).toBeGreaterThan(reach);
+    // ずらすのは面から出るのに要るぶんだけ。遠くまで引きずらない。
+    expect(joint.x).toBeLessThan(reach + 5);
+  });
+
+  it('曲がった線路でも、間隔と終点の接線が基準に揃う', () => {
+    const network = new Network();
+    const tool = new BuildTool(network, flatField(), () => {});
+    tool.setClass('rail_single');
+    tool.setParallelSnap(true);
+    const soft = { straight: false, noSnap: false };
+    for (const [x, z] of [[-200, 0], [-60, 0], [60, 60], [200, 180]] as [number, number][]) {
+      tool.update(new Vector3(x, 0, z), soft);
+      tool.click();
+    }
+    tool.cancel();
+    const base = network.segments.size;
+    expect(base).toBe(3);
+
+    tool.update(new Vector3(-190, 0, -GAP), soft);
+    expect(tool.status().snap).toBe('parallel');
+    tool.click();
+    tool.update(new Vector3(150, 0, 130 - GAP), soft);
+    expect(tool.status().blockers).toEqual([]);
+    tool.click();
+
+    const placed = [...network.segments.values()].slice(base);
+    expect(placed.length).toBeGreaterThan(1);
+    // 間隔はどこでも一定。
+    for (const seg of placed) {
+      const own = network.alignmentOf(seg.id);
+      for (let i = 0; i <= 8; i++) {
+        const p = own.sampleAt((own.length * i) / 8).pos;
+        let nearest = Infinity;
+        for (let id = 1; id <= base; id++) {
+          const ref = network.alignmentOf(id);
+          const s = stationOf(ref, p.x, p.z);
+          nearest = Math.min(nearest, ref.sampleAt(s).pos.distanceTo(p));
+        }
+        expect(Math.abs(nearest - GAP)).toBeLessThan(0.6);
+      }
+    }
+    // 終点の接線は、その所の基準の接線と揃う。
+    const last = placed[placed.length - 1];
+    const own = network.alignmentOf(last.id);
+    const end = own.sampleAt(own.length);
+    const reference = network.alignmentOf(base);
+    const at = reference.sampleAt(stationOf(reference, end.pos.x, end.pos.z));
+    expect(end.forwardXZ.dot(at.forwardXZ)).toBeGreaterThan(Math.cos(2 * DEG));
   });
 });
