@@ -13,7 +13,15 @@ import type { NetworkClass } from './classes';
 import type { Branch, Network, NetNode, NodeId, SegmentId } from './network';
 
 /** 自動的に交差点にまとめる高低差の上限 [m]。 */
-const AUTO_JUNCTION_TOLERANCE = 0.4;
+export const AUTO_JUNCTION_TOLERANCE = 0.4;
+
+/**
+ * 交点でセグメントを分割してよい、端からの最小距離 [m]。
+ *
+ * これより端に寄った所で分けると、極端に短いセグメントが残って交差点の形が
+ * 保てない。自動交差点も、交点の高さ合わせも、同じ足切りを使う。
+ */
+export const CROSSING_END_MARGIN = 2;
 
 /** 建設時の接続先。 */
 export interface Anchor {
@@ -317,6 +325,154 @@ export function solveVerticalTangents(
   hi = Math.min(hi, byCurve);
   const d = lo > hi ? 0 : clamp(inheritedGrade - average, lo, hi);
   return { startGrade: average + d, endGrade: average };
+}
+
+/**
+ * 縦断が規格をどれだけ割っているか。0 以下なら規格に収まっている。
+ *
+ * 最大勾配と縦曲線半径を、それぞれ「規格に対する超過の割合」に直して
+ * 大きい方を取る。単位を揃えるので、片方だけを見て他方を壊すことがない。
+ */
+function standardViolation(
+  profile: VerticalProfile,
+  standard: { maxGrade: number; minVerticalRadius: number },
+): number {
+  const byGrade = profile.maxGrade(32) / standard.maxGrade - 1;
+  const radius = profile.minVerticalRadius();
+  const byCurve =
+    !Number.isFinite(standard.minVerticalRadius) || standard.minVerticalRadius <= 0
+      ? -1
+      : standard.minVerticalRadius / Math.max(radius, 1e-6) - 1;
+  return Math.max(byGrade, byCurve);
+}
+
+/**
+ * 節点の勾配 `g` を動かしたときの、その節点に接する区間の違反量。
+ *
+ * `heights` は動かさないので、`g` について違反量は**凸**になる
+ * (区間内の勾配も 2 階微分も `g` について 1 次で、その絶対値の最大は凸)。
+ */
+function knotViolation(
+  g: number,
+  legs: readonly { y0: number; y1: number; other: number; length: number; atStart: boolean }[],
+  standard: { maxGrade: number; minVerticalRadius: number },
+): number {
+  let worst = -Infinity;
+  for (const leg of legs) {
+    const m0 = leg.atStart ? g : leg.other;
+    const m1 = leg.atStart ? leg.other : g;
+    const profile = new VerticalProfile(leg.y0, leg.y1, m0, m1, leg.length);
+    worst = Math.max(worst, standardViolation(profile, standard));
+  }
+  return worst;
+}
+
+/** 凸関数の最小点を 3 分探索で求める。 */
+function minimizeConvex(f: (x: number) => number, lo: number, hi: number): number {
+  let a = lo;
+  let b = hi;
+  for (let i = 0; i < 48; i++) {
+    const p = a + (b - a) / 3;
+    const q = b - (b - a) / 3;
+    if (f(p) <= f(q)) b = q;
+    else a = p;
+  }
+  return (a + b) / 2;
+}
+
+/** 凸関数が 0 以下になる区間の端を、`from` (0 以下) と `to` の間で二分探索する。 */
+function feasibleEdge(f: (x: number) => number, from: number, to: number): number {
+  if (f(to) <= 0) return to;
+  let inside = from;
+  let outside = to;
+  for (let i = 0; i < 40; i++) {
+    const mid = (inside + outside) / 2;
+    if (f(mid) <= 0) inside = mid;
+    else outside = mid;
+  }
+  return inside;
+}
+
+/**
+ * 高さの決まった節点を順に通る縦断を解く。
+ *
+ * 交点の高さに合わせるときは、節点の高さが**全部先に決まっている**。
+ * `solveVerticalTangents` の「終点勾配 = 平均勾配」は、終点の高さが未知の
+ * 区間を繋いでいくときの約束なので、ここでは使えない。あれを区間ごとに
+ * 繋ぐと、クランプが効いた所で節点の勾配が食い違う。しかも高さを合わせて
+ * できるノードは枝が 4 本あるため、`smoothGradeJoint` も `findGradeBreaks`
+ * も 2 枝しか見ず、折れが均されも警告されもせずに残ってしまう。
+ *
+ * ここでは節点ごとに**勾配を 1 つだけ**持ち、両側の区間で共有する。
+ * 節点で縦断が折れないことが式の形から保証される。
+ *
+ * 初期値は区間長で重み付けした平均勾配 (ベッセル接線)。相手の区間長で
+ * 重み付けするので、短い区間の勾配が勝ち、短い区間が暴れない。そこから
+ * 規格に収まる範囲へ挟み込む。規格の条件は `g` について凸なので、
+ * 最小点を 3 分探索で出し、そこから両側へ二分探索すれば区間が取れる。
+ *
+ * @param heights 節点の高さ [m] (区間数 + 1 個)
+ * @param lengths 各区間の水平長 [m]
+ * @param ends    両端の勾配。`end` が null なら平均勾配に任せる
+ */
+export function solveChainProfile(
+  heights: readonly number[],
+  lengths: readonly number[],
+  ends: { start: number; end: number | null },
+  standard: { maxGrade: number; minVerticalRadius: number },
+): { grades: number[]; feasible: boolean } {
+  const n = lengths.length;
+  const average = lengths.map((L, i) => (L > 1e-6 ? (heights[i + 1] - heights[i]) / L : 0));
+  const grades = new Array<number>(n + 1).fill(0);
+  grades[0] = ends.start;
+  grades[n] = ends.end ?? average[n - 1];
+  // 内側の節点は、両隣の平均勾配を**相手の区間長**で重み付けした値から始める。
+  for (let k = 1; k < n; k++) {
+    const w = lengths[k - 1] + lengths[k];
+    grades[k] =
+      w > 1e-6
+        ? (average[k - 1] * lengths[k] + average[k] * lengths[k - 1]) / w
+        : average[k - 1];
+  }
+
+  // 内側の節点を、両隣を固定したまま規格に収まる範囲へ挟み込む。可行域は
+  // 両隣の**高さ**だけで決まり、隣の勾配には (その節点を解く間) 依らないので、
+  // 左右 1 往復すれば落ち着く。
+  const limit = standard.maxGrade * 3;
+  for (const pass of [0, 1]) {
+    const order = pass === 0 ? [...Array(n - 1).keys()].map((i) => i + 1) : [];
+    if (pass === 1) for (let k = n - 1; k >= 1; k--) order.push(k);
+    for (const k of order) {
+      const legs = [
+        {
+          y0: heights[k - 1],
+          y1: heights[k],
+          other: grades[k - 1],
+          length: lengths[k - 1],
+          atStart: false,
+        },
+        { y0: heights[k], y1: heights[k + 1], other: grades[k + 1], length: lengths[k], atStart: true },
+      ];
+      const f = (g: number): number => knotViolation(g, legs, standard);
+      const best = minimizeConvex(f, -limit, limit);
+      if (f(best) > 0) {
+        grades[k] = best;
+        continue;
+      }
+      const lo = feasibleEdge(f, best, -limit);
+      const hi = feasibleEdge(f, best, limit);
+      grades[k] = clamp(grades[k], lo, hi);
+    }
+  }
+
+  const feasible = lengths.every(
+    (L, i) =>
+      standardViolation(
+        new VerticalProfile(heights[i], heights[i + 1], grades[i], grades[i + 1], L),
+        standard,
+      ) <= 1e-9,
+  );
+  return { grades, feasible };
 }
 
 /** 端点勾配と平均勾配から、区間内の最大勾配 (絶対値) を求める。 */
@@ -661,8 +817,10 @@ function firstConflict(network: Network, id: SegmentId): Conflict | null {
         if (Math.abs(hit.ya - hit.yb) > AUTO_JUNCTION_TOLERANCE) continue;
         // 端点に近すぎる分割は避ける (極端に短いセグメントができるため)。
         const otherLength = network.alignmentOf(other.id).length;
-        if (hit.sb < 2 || hit.sb > otherLength - 2) continue;
-        if (hit.sa < 2 || hit.sa > alignment.length - 2) continue;
+        if (hit.sb < CROSSING_END_MARGIN || hit.sb > otherLength - CROSSING_END_MARGIN) continue;
+        if (hit.sa < CROSSING_END_MARGIN || hit.sa > alignment.length - CROSSING_END_MARGIN) {
+          continue;
+        }
         return { other: other.id, sOther: hit.sb, sMine: hit.sa };
       }
     }

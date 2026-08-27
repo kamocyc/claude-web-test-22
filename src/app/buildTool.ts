@@ -17,6 +17,12 @@ import {
   type PlaceResult,
   type PlacementPreview,
 } from '../network/editing';
+import {
+  applyRoadEdit,
+  planCrossingHeights,
+  splitAtCrossing,
+  type CrossingHeightPlan,
+} from '../network/crossingHeight';
 import type { NetNode, Network, NodeId, SegmentId } from '../network/network';
 import {
   findParallelReference,
@@ -216,6 +222,13 @@ export class BuildTool {
    * 既存の線形の区切りごとに 1 本。空でなければ、確定時はこれを順に敷く。
    */
   private parallelRun: ParallelLeg[] = [];
+  /**
+   * 交点の高さ合わせの立案 (プレビューと同じもの)。
+   *
+   * 既存の線形と交わる所で高さを合わせるときは、そこで区間を分けて縦断を
+   * 解き直す。確定時はこの立案どおりに敷く (プレビューと形が変わらない)。
+   */
+  private crossingPlan: CrossingHeightPlan | null = null;
   /** 確認モードで読み取った、カーソル下の 1 点。 */
   private inspection: PointInspection | null = null;
   private selectedStationId: StationId | null = null;
@@ -340,6 +353,7 @@ export class BuildTool {
     this.blockers = [];
     this.parallel = null;
     this.parallelRun = [];
+    this.crossingPlan = null;
     this.anchorMarker = null;
     this.showMarkers([]);
     this.inspection = null;
@@ -810,6 +824,7 @@ export class BuildTool {
       this.preview = null;
       this.endAnchor = null;
       this.parallelRun = [];
+      this.crossingPlan = null;
       this.showMarkers([target.marker]);
       this.updateElevationGuides([target.anchor.pos]);
       this.updatePreviewMesh();
@@ -826,6 +841,7 @@ export class BuildTool {
     }
 
     this.parallelRun = [];
+    this.crossingPlan = null;
     let end = target.anchor;
     if (this.modifiers.straight && target.snap === 'none') {
       end = { ...end, pos: this.snapAngle(this.anchor.pos, end.pos) };
@@ -854,11 +870,43 @@ export class BuildTool {
       });
     }
     this.endAnchor = reachedAnchor(end, this.preview.end);
+    this.applyCrossingHeights();
     // (角度スナップで位置をずらすのは、どこにも吸い付いていないときだけ
     //  なので、そのときは target.marker が無い。)
     this.showMarkers([this.anchorMarker, short ? null : target.marker]);
     this.updateElevationGuides([this.anchor.pos, this.endAnchor.pos]);
     this.updatePreviewMesh();
+  }
+
+  /**
+   * 既存の線形と交わる所で、交点の高さに合わせた縦断へ組み直す。
+   *
+   * プレビューの時点から入れないと、置いた形とプレビューが食い違う。
+   * 合わせられない (勾配制限を超える) ときは立案が理由を持って返るので、
+   * `updatePreviewMesh` がそれを敷設を止める理由に足す。
+   */
+  private applyCrossingHeights(): void {
+    this.crossingPlan = null;
+    if (!this.preview || !this.anchor) return;
+    const start = reachedAnchor(this.anchor, this.preview.start);
+    const end = this.endAnchor ?? { pos: this.preview.end };
+    const plan = planCrossingHeights(
+      this.network,
+      this.cls,
+      this.previewAlignment(this.preview),
+      {
+        startGrade: this.preview.startGrade,
+        // 到着側が既存の線形に繋がるなら、その勾配を守る。繋がらないなら
+        // 平均勾配に任せる (`computePlacement` と同じ決め方)。
+        endGrade: end.node !== undefined || end.split ? this.preview.endGrade : null,
+      },
+      { startNode: start.node, endNode: end.node },
+    );
+    if (!plan) return;
+    this.crossingPlan = plan;
+    // 区間に分かれても、長さ・最小半径・最大勾配は「引いている区間ぜんぶ」で
+    // 出す。端点・接線はそのままなので、続けて引く所も変わらない。
+    this.preview = previewFromAlignments(plan.legs.map((leg) => leg.alignment));
   }
 
   /** 地表の対応点から実際の敷設高さまでを、目盛付きの垂線で示す。 */
@@ -909,6 +957,7 @@ export class BuildTool {
       this.preview = null;
       this.endAnchor = null;
       this.parallelRun = [];
+      this.crossingPlan = null;
       this.showMarkers([this.anchorMarker]);
       return true;
     }
@@ -965,6 +1014,38 @@ export class BuildTool {
     } else if (this.mode === 'station' && this.stationCandidate) {
       buildStationPreview(mb, this.stationCandidate);
       this.lastDiagnostics = null;
+    } else if (this.crossingPlan && this.anchor) {
+      // 交点で高さを合わせる区間は 1 本ずつ独立したセグメントになるので、
+      // 検査も 1 本ずつ行う。意図した平面交差は `matched` で規則に教える
+      // (合わせる前の高低差で見られると、必ず「桁下が足りません」になる)。
+      const plan = this.crossingPlan;
+      const cls = this.cls;
+      const diagnostics: SegmentDiagnostics[] = [];
+      const blockers: string[] = plan.blockers.map((b) => b.message);
+      this.blockedPlaces.push(...plan.blockers.map((b) => b.at.clone()));
+      let start: Anchor = reachedAnchor(this.anchor, plan.legs[0].alignment.sampleAt(0).pos);
+      for (const [index, leg] of plan.legs.entries()) {
+        const alignment = leg.alignment;
+        const at = previewFromAlignment(alignment);
+        const end =
+          index === plan.legs.length - 1 ? this.endAnchor ?? { pos: at.end } : { pos: at.end };
+        diagnostics.push(evaluateAlignment(alignment, cls));
+        const check = checkPlacement({
+          network: this.network,
+          cls,
+          alignment,
+          start,
+          end,
+          matchedCrossings: leg.matched,
+          field: this.field,
+        });
+        blockers.push(...check.blockers);
+        this.blockedPlaces.push(...check.places);
+        buildRibbon(mb, alignment.sample(2), profileFor(cls), { skirt: false, cls });
+        start = { pos: at.end.clone() };
+      }
+      this.lastDiagnostics = worstDiagnostics(diagnostics);
+      this.blockers = [...new Set(blockers)];
     } else if (this.parallelRun.length > 0 && this.anchor) {
       // 平行に敷く区間は 1 本ずつ独立したセグメントになるので、検査も
       // 1 本ずつ行う。パネルに出す診断だけは全体をまとめたものにする。
@@ -1106,8 +1187,9 @@ export class BuildTool {
     if (this.blockers.length > 0) return;
 
     const preview = this.preview;
-    const result =
-      this.parallelRun.length > 0
+    const result = this.crossingPlan
+      ? this.placeCrossingRun()
+      : this.parallelRun.length > 0
         ? this.placeParallelRun()
         : this.place(this.anchor, this.endAnchor, preview);
     if (!result) return;
@@ -1127,6 +1209,7 @@ export class BuildTool {
     this.preview = null;
     this.endAnchor = null;
     this.parallelRun = [];
+    this.crossingPlan = null;
     this.onChanged();
   }
 
@@ -1134,6 +1217,49 @@ export class BuildTool {
   private place(start: Anchor, end: Anchor, preview: PlacementPreview): PlaceResult {
     const result = placeSegment(this.network, this.classId, start, end, preview);
     this.alignRailDirection(result.segment, result.startNode, result.endNode);
+    return result;
+  }
+
+  /**
+   * 交点で高さを合わせた区間を、交点ごとに 1 本ずつ敷く。
+   *
+   * 交点では**先に相手を分割**して、できたノードへ向けて敷く。あとから
+   * 自動で交差点にまとめる (`resolveAutoJunctions`) 経路と違って、ノードの
+   * 位置を平均で寄せないので、交点の高さが既存の線形のまま残る。
+   *
+   * 相手のセグメント ID は分割のたびに変わるので、立案時の ID ではなく
+   * 位置・種別・高さから引き直す (`splitAtCrossing`)。
+   */
+  private placeCrossingRun(): PlaceResult | null {
+    const plan = this.crossingPlan!;
+    // 引き直しで自分の区間を拾わないように覚えておく。
+    const placed = new Set<SegmentId>();
+    let start: Anchor = this.anchor!;
+    let result: PlaceResult | null = null;
+
+    for (const [index, leg] of plan.legs.entries()) {
+      const preview = previewFromAlignment(leg.alignment);
+      let end: Anchor;
+      if (!leg.joint) {
+        end = index === plan.legs.length - 1 ? this.endAnchor ?? { pos: preview.end } : { pos: preview.end };
+      } else {
+        const node = splitAtCrossing(this.network, leg.joint, placed);
+        end = node ? { pos: node.pos.clone(), node: node.id } : { pos: preview.end.clone() };
+      }
+      result = this.place(start, end, preview);
+      placed.add(result.segment);
+      // 枝が 2 本しかない継ぎ目 (踏切になる所) では `smoothGradeJoint` が
+      // 勾配を動かす。交点の高さに合わせて解いた勾配を入れ直す。
+      this.network.updateSegment(result.segment, {
+        gradeA: preview.startGrade,
+        gradeB: preview.endGrade,
+      });
+      const node = this.network.nodes.get(result.endNode);
+      start = node ? { pos: node.pos.clone(), node: node.id } : { pos: preview.end.clone() };
+    }
+
+    // 既設の道路を曲げるのは最後。敷く場所には影響しない。
+    for (const edit of plan.roadEdits) applyRoadEdit(this.network, edit, placed);
     return result;
   }
 

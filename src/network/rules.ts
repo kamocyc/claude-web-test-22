@@ -48,7 +48,7 @@ const MIN_CROSSING_ANGLE = 20 * DEG;
 const MIN_RAIL_CROSSING_ANGLE = 4 * DEG;
 
 /** 同一平面で交わってよい最小の交差角。線路どうしだけ浅い交差を許す。 */
-function minCrossingAngle(a: NetworkClass, b: NetworkClass): number {
+export function minCrossingAngle(a: NetworkClass, b: NetworkClass): number {
   return a.kind === 'rail' && b.kind === 'rail' ? MIN_RAIL_CROSSING_ANGLE : MIN_CROSSING_ANGLE;
 }
 /** 交差点 1 つが 1 本のセグメントから取れる長さの上限 (区間長に対する比)。 */
@@ -86,6 +86,29 @@ function plain(messages: string[]): Blocker[] {
   return messages.map((message) => ({ message }));
 }
 
+/** 高さを合わせて平面交差にする交点 1 か所 (合わせた後の値)。 */
+export interface MatchedCrossingHint {
+  /** 相手のセグメント。 */
+  segment: SegmentId;
+  /** 敷く線形の側の弧長 [m]。 */
+  s: number;
+  /** 合わせた後の交点の高さ [m]。 */
+  y: number;
+  /** 合わせた後の、相手の側の縦断勾配。 */
+  grade: number;
+}
+
+/** 折れ線の交点が、意図した平面交差かどうか。 */
+const MATCH_REACH = 1.5;
+
+function matchedAt(
+  ctx: PlacementContext,
+  segment: SegmentId,
+  s: number,
+): MatchedCrossingHint | undefined {
+  return ctx.matchedCrossings?.find((m) => m.segment === segment && Math.abs(m.s - s) <= MATCH_REACH);
+}
+
 export interface PlacementContext {
   network: Network;
   cls: NetworkClass;
@@ -94,6 +117,15 @@ export interface PlacementContext {
   end: Anchor;
   /** 判定から外すセグメント (既存の線形を引き直すときの自分自身)。 */
   ignore?: SegmentId;
+  /**
+   * この線形が**意図して**平面交差にする相手 (`planCrossingHeights` の結果)。
+   *
+   * 交点の高さを合わせて敷くときは、合わせた後の高さ・勾配で判定しないと、
+   * 合わせる前の高低差で「桁下が足りません」に振れてしまう。同じ種別どうしの
+   * 交点は敷く区間の**端**になるので、交差点に使える長さも端までの距離では
+   * なく反対の端までで見る。
+   */
+  matchedCrossings?: readonly MatchedCrossingHint[];
   /**
    * 自然地形。渡すと「トンネルの中の交差点」を止められる。
    * 省略した場合はその判定を行わない。
@@ -254,6 +286,8 @@ function polyline(alignment: Alignment, step = 3): Sample[] {
 
 /** 干渉を見る相手 (近くにある既存の線形)。 */
 interface Candidate {
+  /** 相手のセグメント (意図した平面交差かどうかを引くのに使う)。 */
+  segment: SegmentId;
   cls: NetworkClass;
   line: Sample[];
   alignment: Alignment;
@@ -355,7 +389,36 @@ function checkOverlaps(ctx: PlacementContext, connected: Set<SegmentId>): Blocke
       continue;
     }
     const hits = intersectPolylines(mine, line);
-    candidates.push({ cls: other, line, alignment, hits, reach });
+    // 高さを合わせて交差させる相手は、合わせた後の高さで見る。折れ線は縦断
+    // 曲線を弦で近似しているので、合わせてあっても数 cm ずれる。ここで揃えて
+    // おかないと、踏切・交差点になるはずの所が「桁下不足」に振れる。
+    for (const hit of hits) {
+      const match = matchedAt(ctx, seg.id, hit.sA);
+      if (match) hit.yB = match.y;
+    }
+    // 高さを合わせた交点は、この区間の**端**に来ることがある (そこで分けて
+    // 相手と繋ぐため)。折れ線どうしは端で触れるだけになり、交点として拾え
+    // ない。立案が「ここで交わる」と言っているので、交点をここで補う。
+    // こうすると窓も交差角も交差点の取り付き長も、ふつうの交点と同じ規則で
+    // 見られる。
+    for (const match of ctx.matchedCrossings ?? []) {
+      if (match.segment !== seg.id) continue;
+      if (hits.some((hit) => Math.abs(hit.sA - match.s) <= MATCH_REACH)) continue;
+      const at = ctx.alignment.sampleAt(match.s);
+      const near = nearestOn(line, at.pos.x, at.pos.z);
+      if (!near || near.distance > TOUCH) continue;
+      hits.push({
+        sA: match.s,
+        sB: near.s,
+        x: at.pos.x,
+        z: at.pos.z,
+        yA: at.pos.y,
+        yB: match.y,
+        dirA: at.forwardXZ.clone(),
+        dirB: new Vector2(near.dx, near.dz),
+      });
+    }
+    candidates.push({ segment: seg.id, cls: other, line, alignment, hits, reach });
 
     /** s (自分の弧長) のまわりを「交差点・踏切の中」として覚える。 */
     const addWindow = (
@@ -425,6 +488,7 @@ function checkOverlaps(ctx: PlacementContext, connected: Set<SegmentId>): Blocke
     // 交点での高さで判定する。横にずれた点どうしを比べると、勾配のある
     // 道路では実際より低い / 高い桁下を読んでしまう。
     for (const hit of hits) {
+      const match = matchedAt(ctx, candidate.segment, hit.sA);
       const dy = hit.yA - hit.yB;
       const sin = Math.abs(hit.dirA.x * hit.dirB.y - hit.dirA.y * hit.dirB.x);
       if (Math.abs(dy) <= LEVEL_CROSSING_TOLERANCE) {
@@ -440,10 +504,10 @@ function checkOverlaps(ctx: PlacementContext, connected: Set<SegmentId>): Blocke
             sin,
             cls.kind === 'road'
               ? ctx.alignment.vertical.gradeAt(hit.sA)
-              : otherAlignment.vertical.gradeAt(hit.sB),
+              : (match?.grade ?? otherAlignment.vertical.gradeAt(hit.sB)),
             cls.kind === 'rail'
               ? ctx.alignment.vertical.gradeAt(hit.sA)
-              : otherAlignment.vertical.gradeAt(hit.sB),
+              : (match?.grade ?? otherAlignment.vertical.gradeAt(hit.sB)),
           );
           if (need > MAX_CROSSING_LIFT) worstCrossing = Math.max(worstCrossing, need);
         }
@@ -460,10 +524,15 @@ function checkOverlaps(ctx: PlacementContext, connected: Set<SegmentId>): Blocke
           const cos = Math.abs(hit.dirA.x * hit.dirB.x + hit.dirA.y * hit.dirB.y);
           const railPair = cls.kind === 'rail' && other.kind === 'rail';
           const available = (toEnd: number): number => (railPair ? toEnd : roomFor(toEnd, 0));
+          // 高さを合わせた交点は、敷く区間の**端**になる (そこで分けて
+          // ノードを共有する)。端までの距離 (= 0) ではなく、反対の端までが
+          // その側で交差点に使える長さ。反対側は次の区間が同じ判定を受ける。
+          const mySide = match
+            ? Math.max(hit.sA, ctx.alignment.length - hit.sA)
+            : Math.min(hit.sA, ctx.alignment.length - hit.sA);
           const shortfalls: [number, Vector3][] = [
             [
-              crossingRoom(cls, other, sin, cos) -
-                available(Math.min(hit.sA, ctx.alignment.length - hit.sA)),
+              crossingRoom(cls, other, sin, cos) - available(mySide),
               // 自分の側が足りないときは、詰まっている自分の端。
               endNear(ctx.alignment, hit.sA),
             ],
