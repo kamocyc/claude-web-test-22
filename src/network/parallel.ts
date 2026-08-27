@@ -9,11 +9,12 @@ import {
   type XZ,
 } from '../core/curve';
 import { VerticalProfile } from '../core/profile';
-import { clamp } from '../core/units';
+import { DEG, clamp } from '../core/units';
 import type { NetworkClass, NetworkKind } from './classes';
 import type { PlacementPreview } from './editing';
 import type { Network, NodeId, SegmentId } from './network';
 import { junctionReach } from './rules';
+import { CROSSING_END_MARGIN } from './editing';
 
 /**
  * 平行スナップ。
@@ -557,7 +558,7 @@ function groupSpans(network: Network, cls: NetworkClass, spans: RouteSpan[]): Ro
     current.push(span);
     if (span.node === null) break;
 
-    const need = clearanceAt(network, cls, span.node, Math.abs(span.offset));
+    const need = clearanceAt(network, cls, span);
     if (need <= 0) {
       groups.push(current);
       current = [];
@@ -579,22 +580,77 @@ function groupSpans(network: Network, cls: NetworkClass, spans: RouteSpan[]): Ro
   return groups;
 }
 
+/** 交差している枝とみなす角度の下限 (これより一直線に近い枝は線形の続き)。 */
+const CROSSING_BRANCH_SIN = Math.sin(5 * DEG);
+
+/**
+ * そのノードを横切っている線路をよけるのに、ノードの先へどれだけ進めばよいか [m]。
+ *
+ * 線路の交差点は面を持たない (`junctionReach` が 0) ので、面だけを見ていると
+ * 交差点のちょうど真横で区間を切ってしまう。**面が無くても相手の道床は
+ * 横たわっている**ので、平行線の端がその上に落ちる。そこで切ると、端点が
+ * 相手の路面に重なるうえ、交点が区間の端に来るので相手と繋がれない
+ * (`resolveAutoJunctions` も `planCrossingHeights` も端の近くの交点は扱わない)。
+ *
+ * 平行線が相手を横切る所を求め、そこから**道床 2 本分**か
+ * **`CROSSING_END_MARGIN` の内側**か、遠い方だけ先へ進める。前者で端点が
+ * 相手の路面から出て、後者で交点が区間の内側に入るので、あとはふつうの
+ * 交差として分割・接続される。
+ */
+function branchClearance(
+  network: Network,
+  cls: NetworkClass,
+  span: RouteSpan,
+): number {
+  const node = span.node;
+  if (node === null) return 0;
+  const alignment = network.alignmentOf(span.segment);
+  const tangent = alignment.horizontal.tangentAt(span.s1);
+  const normal = perp(tangent);
+  const ahead = Math.sign(span.s1 - span.s0) || 1;
+  let need = 0;
+
+  for (const branch of network.branchesAt(node)) {
+    if (branch.segment === span.segment) continue;
+    if (branch.cls.kind !== cls.kind) continue;
+    const sin = tangent.x * branch.dir.y - tangent.y * branch.dir.x;
+    // 一直線に繋がる枝は「線形の続き」で、横切ってはいない。
+    if (Math.abs(sin) < CROSSING_BRANCH_SIN) continue;
+    // 平行線が相手の中心線を横切る所 (ノードからの弧長、進む向きが正)。
+    const side = normal.x * branch.dir.y - normal.y * branch.dir.x;
+    const at = ahead * -span.offset * (side / sin);
+    // 端点が相手の路面から出て、なおかつ交点が区間の端から
+    // `CROSSING_END_MARGIN` 以上内側に入る距離。
+    const clear = Math.max(
+      (cls.halfWidth + branch.cls.halfWidth) / Math.abs(sin),
+      CROSSING_END_MARGIN + 1,
+    );
+    // 交点がもう区間の中 (区切りから `clear` 以上離れている) なら動かさない。
+    // 浅く交わる所では交点が遠いので、ここで無駄に食い込ませない。
+    if (Math.abs(at) >= clear) continue;
+    need = Math.max(need, at + clear);
+  }
+  return Math.min(Math.max(0, need), ROUTE_CLEARANCE_MAX);
+}
+
 /**
  * その交差点の面から出るのに、ノードの先へどれだけ進めばよいか [m]。
  *
- * 平行線はもともと横に `lateral` [m] 離れているので、面の広がりがそれより
- * 小さければ進まなくてよい。判定は敷設の規則 (`checkJunctionSpacing`) と
- * 同じ半径を見るので、通した所は必ず置ける。
+ * 平行線はもともと横に離れているので、面の広がりがそれより小さければ
+ * 進まなくてよい。判定は敷設の規則 (`checkJunctionSpacing`) と同じ半径を
+ * 見るので、通した所は必ず置ける。面を持たない線路の交差点では、代わりに
+ * 横たわっている道床をよける (`branchClearance`)。
  */
-function clearanceAt(
-  network: Network,
-  cls: NetworkClass,
-  node: NodeId,
-  lateral: number,
-): number {
+function clearanceAt(network: Network, cls: NetworkClass, span: RouteSpan): number {
+  const node = span.node;
+  if (node === null) return 0;
+  const lateral = Math.abs(span.offset);
   const reach = junctionReach(network, node) + cls.halfWidth * 0.5 + 1;
-  if (reach <= lateral) return 0;
-  return Math.min(Math.sqrt(reach * reach - lateral * lateral), ROUTE_CLEARANCE_MAX);
+  const byFace =
+    reach <= lateral
+      ? 0
+      : Math.min(Math.sqrt(reach * reach - lateral * lateral), ROUTE_CLEARANCE_MAX);
+  return Math.max(byFace, branchClearance(network, cls, span));
 }
 
 /** まとまりを 1 本の線形にする。 */

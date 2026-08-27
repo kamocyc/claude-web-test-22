@@ -397,6 +397,28 @@ describe('線路どうしの交差に要る余裕', () => {
   it('交点が相手の端点に重なるほど近ければ止まる', () => {
     expect(check(1, 10 * DEG).join(' ')).toContain('交差点が近すぎます');
   });
+
+  /**
+   * 要る余裕は幅ではなく「そこで分けられるか」で決まる。
+   *
+   * 交点で双方を分けるのは `resolveAutoJunctions` と `splitAtCrossing` で、
+   * どちらも端から `CROSSING_END_MARGIN` 以内では分けない。判定がそれより
+   * 緩いと「置けたのに繋がらない」交差ができ、厳しいと**複線が横切れない**
+   * (交点が複線の間隔 = 半幅の和 + 0.2 m で並ぶため)。
+   */
+  it('複線の間隔だけ離れていれば、直角でも交差できる', () => {
+    const gap = parallelSpacing(getClass('rail_single'));
+    expect(check(gap, 90 * DEG)).toEqual([]);
+  });
+
+  it('分けられないほど端に寄った交点は、直角でも止まる', () => {
+    expect(check(1.5, 90 * DEG).join(' ')).toContain('交差点が近すぎます');
+  });
+
+  it('側線の複線の間隔 (3.8 m) でも交差できる', () => {
+    const gap = parallelSpacing(getClass('rail_yard'));
+    expect(check(gap, 90 * DEG)).toEqual([]);
+  });
 });
 
 /**

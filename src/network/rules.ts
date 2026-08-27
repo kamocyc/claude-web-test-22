@@ -11,7 +11,7 @@ import {
 import { MAX_CROSSING_LIFT } from '../build/crossing';
 import type { NetworkClass } from './classes';
 import { intersectPolylines, toPolyline, type PolylinePoint } from './crossings';
-import { MIN_SMOOTHED_DEFLECTION, type Anchor } from './editing';
+import { CROSSING_END_MARGIN, MIN_SMOOTHED_DEFLECTION, type Anchor } from './editing';
 import {
   CORNER_MARGIN,
   pairTrackBranches,
@@ -475,7 +475,6 @@ function checkOverlaps(ctx: PlacementContext, connected: Set<SegmentId>): Blocke
     const other = candidate.cls;
     const otherLine = candidate.line;
     const otherAlignment = candidate.alignment;
-    const otherLength = otherAlignment.length;
     const hits = candidate.hits;
     const reach = candidate.reach;
 
@@ -526,21 +525,24 @@ function checkOverlaps(ctx: PlacementContext, connected: Set<SegmentId>): Blocke
           const cos = Math.abs(hit.dirA.x * hit.dirB.x + hit.dirA.y * hit.dirB.y);
           const railPair = cls.kind === 'rail' && other.kind === 'rail';
           const available = (toEnd: number): number => (railPair ? toEnd : roomFor(toEnd, 0));
-          // 高さを合わせた交点は、敷く区間の**端**になる (そこで分けて
-          // ノードを共有する)。端までの距離 (= 0) ではなく、反対の端までが
-          // その側で交差点に使える長さ。反対側は次の区間が同じ判定を受ける。
+          // 高さを合わせた線路の交点は、敷く区間の**端でノードを共有する**
+          // (`placeCrossingRun` が先に相手を分割し、そのノードへ向けて敷く)。
+          // そこでは自分を分けないので、差し出す長さは要らない。
+          const sharedNode = railPair && match !== undefined;
+          // 道路の交点は区間の端でも交差点の面を作るので、取り付き長がそのまま
+          // 要る。端までの距離 (= 0) ではなく、反対の端までを見る。
           const mySide = match
             ? Math.max(hit.sA, ctx.alignment.length - hit.sA)
             : Math.min(hit.sA, ctx.alignment.length - hit.sA);
           const shortfalls: [number, Vector3][] = [
             [
-              crossingRoom(cls, other, sin, cos) - available(mySide),
+              (sharedNode ? 0 : crossingRoom(cls, other, sin, cos)) - available(mySide),
               // 自分の側が足りないときは、詰まっている自分の端。
               endNear(ctx.alignment, hit.sA),
             ],
             [
               crossingRoom(other, cls, sin, cos) -
-                available(Math.min(hit.sB, otherLength - hit.sB)),
+                available(Math.min(hit.sB, otherAlignment.length - hit.sB)),
               // 相手の側が足りないときは、相手の近い方の端 (= 既存の交差点)。
               endNear(otherAlignment, hit.sB),
             ],
@@ -1082,11 +1084,26 @@ function crossingRoom(
   sin: number,
   cos: number,
 ): number {
-  if (own.kind === 'rail' && other.kind === 'rail') {
-    return own.halfWidth + other.halfWidth + CORNER_MARGIN;
-  }
+  if (own.kind === 'rail' && other.kind === 'rail') return RAIL_CROSSING_ROOM;
   return crossingTrim(own, other, sin, cos);
 }
+
+/**
+ * 線路の交点を作るのに、端まで要る長さ [m]。
+ *
+ * 線路の交差点は面を持たない (`junction.ts` の冒頭の説明) ので、道路のような
+ * 取り付き長は要らない。要るのは**そこで双方を分けられること**だけで、
+ * 交点で双方を分けるのは `resolveAutoJunctions` と `splitAtCrossing`。
+ * どちらも端から `CROSSING_END_MARGIN` 以内では分けないので、判定も同じ
+ * 足切りで見る (折れ線の弦誤差のぶんだけ厳しくしておく)。ここを緩くすると、
+ * 「置けたのに繋がらず、同一平面で交差しています」と言われる交差ができる。
+ *
+ * **幅から決めてはいけない。** 複線の中心間隔は `parallelSpacing` =
+ * 半幅の和 + 0.2 m なので、半幅の和より長い余裕を求めると、複線を横切った
+ * ときに必ず足りなくなる (交点が複線の間隔で並ぶため)。以前はここが
+ * 半幅の和 + 0.6 m だったので、**複線はどの線路とも交差できなかった**。
+ */
+const RAIL_CROSSING_ROOM = CROSSING_END_MARGIN + 0.5;
 
 /**
  * 同一平面で交差する 2 本のうち、片方が交差点に差し出す長さ [m]。
