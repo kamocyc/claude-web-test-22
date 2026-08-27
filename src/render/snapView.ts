@@ -22,11 +22,13 @@ import { MeshBuilder, UP } from '../core/meshbuilder';
 export type SnapKind = 'none' | 'node' | 'segment' | 'parallel' | 'crossing';
 
 export interface SnapMarker {
-  kind: 'node' | 'segment' | 'parallel' | 'inspect' | 'crossing';
+  kind: 'node' | 'segment' | 'parallel' | 'inspect' | 'crossing' | 'focus';
   /** 吸い付いた点。 */
   pos: Vector3;
   /** 目印の半径 [m] (交差点なら面の広がり)。 */
   radius: number;
+  /** 輪の太さ [m]。省略すると細い既定の太さ。大きな輪を目立たせるのに使う。 */
+  width?: number;
   /** 取り付く相手を横切る棒の半分のベクトル (ここで分割することを示す)。 */
   bar?: Vector2;
   /** 平行スナップの基準線 (中心線をなぞる)。 */
@@ -47,6 +49,8 @@ const COLORS: Record<SnapMarker['kind'], readonly [number, number, number]> = {
   inspect: [0.85, 0.95, 1.0],
   // 踏切。遮断機と同じ赤で、繋ぐ (水色・黄) のではないことを示す。
   crossing: [1.0, 0.45, 0.38],
+  // 警告から飛んできた所。敷設の目印のどれとも混ざらない色にする。
+  focus: [1.0, 0.35, 0.95],
 };
 
 /** 目印を浮かせる高さ [m]。 */
@@ -61,8 +65,8 @@ export class SnapView {
   private readonly mesh: Mesh;
   private readonly material: MeshBasicMaterial;
 
-  constructor() {
-    this.group.name = 'snap';
+  constructor(name = 'snap') {
+    this.group.name = name;
     this.material = new MeshBasicMaterial({
       vertexColors: true,
       transparent: true,
@@ -108,9 +112,12 @@ function addMarker(mb: MeshBuilder, marker: SnapMarker): void {
   if (marker.tie) addPolyline(mb, marker.tie, GUIDE_WIDTH * 0.7, tint);
 
   const radius = Math.max(1.5, marker.radius);
-  addRing(mb, at, radius, RING_WIDTH, tint);
+  const width = Math.max(RING_WIDTH, marker.width ?? RING_WIDTH);
+  addRing(mb, at, radius, width, tint);
   // 中心の点。輪だけだと、広い交差点でどこに付くのか分かりにくい。
-  addRing(mb, at, 0.9, 0.9, tint);
+  // 輪を太くしたときは点も一緒に大きくする (でないと点が消えて見える)。
+  const dot = Math.max(0.9, width);
+  addRing(mb, at, dot, dot, tint);
 
   if (marker.bar && marker.bar.lengthSq() > 1e-6) {
     // 取り付く相手を横切る棒。ここで分割することを示す。

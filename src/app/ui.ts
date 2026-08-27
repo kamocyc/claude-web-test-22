@@ -1,6 +1,7 @@
+import { Vector3 } from 'three';
 import { NETWORK_CLASSES, getClass } from '../network/classes';
 import { riskColor, viewUniforms } from '../render/materials';
-import type { BuildResult } from '../render/worldBuilder';
+import type { BuildResult, WorldWarning } from '../render/worldBuilder';
 import type { ToolMode, ToolStatus } from './buildTool';
 import type { StationToolSettings } from './buildTool';
 import { stationPlatformRange, STATION_LENGTHS, type StationId } from '../network/station';
@@ -52,6 +53,8 @@ export interface UiCallbacks {
   /** インターチェンジのサンプルを置く。 */
   onInterchange: (kind: 'diamond' | 'trumpet') => void;
   onClear: () => void;
+  /** 警告の行から、その場所へ視点を飛ばす。 */
+  onFocus: (position: Vector3) => void;
 }
 
 interface ToggleSpec {
@@ -107,7 +110,7 @@ export class Ui {
     const modes = el('div', 'row');
     for (const [mode, label, hint] of [
       ['build', '敷設', 'B'],
-      ['station', '駅', 'S'],
+      ['station', '駅', 'T'],
       ['zone', '区画', 'Z'],
       ['line', '路線', 'L'],
       ['bulldoze', '撤去', 'X'],
@@ -333,11 +336,11 @@ export class Ui {
       '<b>左クリック</b> 始点 → もう一度で確定 (続けて連結)',
       '<b>右クリック / Esc</b> 中断',
       '<b>Shift</b> 直線・15° スナップ / <b>Ctrl</b> スナップ解除',
-      '<b>S</b> 駅配置 / <b>N・M</b> 駅を回転',
+      '<b>T</b> 駅配置 / <b>N・M</b> 駅を回転',
       '<b>Z</b> 区画 (道路沿いを塗ると建物が建つ)',
       '<b>L</b> 路線 (駅のホームを順にクリックすると列車が走る)',
       '<b>U</b> 地下ビュー (地形を透過)',
-      '<b>右ドラッグ</b> 視点移動 / <b>ホイール</b> 拡大縮小',
+      '<b>W・A・S・D</b> 視点を平行移動 / <b>右ドラッグ</b> 視点移動 / <b>ホイール</b> 拡大縮小',
       '<b>F</b> 乗車 (車両をクリックで選ぶ) / <b>N</b> 次の車両 / 乗車中はドラッグで見回す',
     ]
       .map((line) => `<div>${line}</div>`)
@@ -642,27 +645,89 @@ export class Ui {
       .map(([k, v]) => `<div class="line"><span>${k}</span><b>${v}</b></div>`)
       .join('');
 
-    // 同じ内容の警告は 1 行にまとめる。
-    const counts = new Map<string, { count: number; severity: string }>();
-    for (const warning of result.warnings) {
-      const entry = counts.get(warning.message);
-      if (entry) entry.count++;
-      else counts.set(warning.message, { count: 1, severity: warning.severity });
-    }
-    if (counts.size === 0) {
-      this.warningBody.innerHTML = '<div class="line ok">問題はありません</div>';
+    this.renderWarnings(result.warnings);
+  }
+
+  /** 警告の一覧を描き直す。 */
+  private renderWarnings(warnings: readonly WorldWarning[]): void {
+    const groups = groupWarnings(warnings);
+    this.warningBody.replaceChildren();
+    if (groups.length === 0) {
+      const ok = el('div', 'line ok');
+      ok.textContent = '問題はありません';
+      this.warningBody.append(ok);
       return;
     }
-    this.warningBody.innerHTML = [...counts]
-      .slice(0, 8)
-      .map(
-        ([message, info]) =>
-          `<div class="line ${info.severity === 'error' ? 'bad' : 'warn'}">${escapeHtml(
-            message,
-          )}${info.count > 1 ? ` <b>×${info.count}</b>` : ''}</div>`,
-      )
-      .join('');
+    for (const group of groups.slice(0, MAX_WARNING_LINES)) {
+      this.warningBody.append(this.warningLine(group));
+    }
   }
+
+  private warningLine(group: WarningGroup): HTMLElement {
+    const total = group.places.length;
+    const severity = group.severity === 'error' ? 'bad' : 'warn';
+    // 場所が分かっているものだけ押せる (飛ぶ先が無いと空振りになる)。
+    const line = el(total > 0 ? 'button' : 'div', `line ${severity}`);
+    // 文言は素の文字として入れる (`.readout .line span` は見出し用の
+    // 薄い色なので、包むと警告の色が消えてしまう)。
+    line.append(document.createTextNode(group.message));
+    if (total > 1) {
+      const count = el('b');
+      count.textContent = `×${total}`;
+      line.append(count);
+    }
+    if (total > 0) {
+      line.title = total > 1 ? `クリックで ${total} か所を順に表示` : 'クリックでその場所へ';
+      line.addEventListener('click', () => {
+        const place = nextPlace(group);
+        if (place) this.callbacks.onFocus(place);
+      });
+    }
+    return line;
+  }
+}
+
+/** 警告の一覧に出す行数の上限。 */
+const MAX_WARNING_LINES = 8;
+
+/** 一覧に出す 1 行ぶんの警告 (同じ内容をまとめたもの)。 */
+export interface WarningGroup {
+  message: string;
+  severity: WorldWarning['severity'];
+  /** その警告が出ている場所。行を押すたびに次へ進む。 */
+  places: Vector3[];
+  /** 次に見る場所の番号。 */
+  next: number;
+}
+
+/**
+ * 同じ内容の警告を 1 行にまとめる。
+ *
+ * 場所は捨てずに全部持っておく。同じ文言が何十か所にも出ることがあり、
+ * 「どこの話なのか」は行を押して 1 か所ずつ見て回れるようにするため。
+ * 出た順を保つので、一覧の並びは作り直しても変わらない。
+ */
+export function groupWarnings(warnings: readonly WorldWarning[]): WarningGroup[] {
+  const groups = new Map<string, WarningGroup>();
+  for (const warning of warnings) {
+    let group = groups.get(warning.message);
+    if (!group) {
+      group = { message: warning.message, severity: warning.severity, places: [], next: 0 };
+      groups.set(warning.message, group);
+    }
+    if (warning.position) group.places.push(warning.position.clone());
+    // 同じ文言で重さが混ざったら、重い方の色で出す。
+    if (warning.severity === 'error') group.severity = 'error';
+  }
+  return [...groups.values()];
+}
+
+/** その警告の次の場所 (押すたびに 1 か所ずつ進み、最後まで行くと戻る)。 */
+export function nextPlace(group: WarningGroup): Vector3 | null {
+  if (group.places.length === 0) return null;
+  const place = group.places[group.next % group.places.length];
+  group.next = (group.next + 1) % group.places.length;
+  return place;
 }
 
 function el(tag: string, className = ''): HTMLElement {

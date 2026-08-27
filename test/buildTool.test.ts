@@ -408,6 +408,62 @@ describe('引いてきた道の上への折り返し', () => {
     expect(network.segments.size).toBe(before);
   });
 
+  /** 東西に一定の勾配で下る地形。 */
+  function slopedField(dropPerMetre = 0.05): Heightfield {
+    const field = testField();
+    for (let iz = 0; iz <= field.cells; iz++) {
+      for (let ix = 0; ix <= field.cells; ix++) {
+        field.base[field.index(ix, iz)] = 200 - field.worldX(ix) * dropPerMetre;
+      }
+    }
+    field.resetWork();
+    return field;
+  }
+
+  it('届いた所の高さは、その真下の地形で決める (カーソルの下ではない)', () => {
+    // カーソルと、線形が実際に届く所は何百 m も離れる。カーソルの下の
+    // 高さをそのまま使うと、届いた所が勝手に築堤やトンネルになる。
+    const field = slopedField();
+    const network = new Network();
+    const tool = new BuildTool(network, field, () => {});
+    tool.setClass('road_medium');
+    tool.setParallelSnap(false);
+    tool.update(new Vector3(0, field.heightAt(0, 0), 0), MODS);
+    tool.click();
+    tool.update(new Vector3(150, field.heightAt(150, 0), 0), MODS);
+    tool.click();
+    // 端点から見て後ろ寄り。円弧は掃引角で頭打ちになり、遠くで終わる。
+    tool.update(new Vector3(60, field.heightAt(60, 12), 12), { straight: false, noSnap: false });
+    tool.click();
+
+    const added = network.getSegment([...network.segments.keys()].pop()!);
+    const tip = network.getNode(added.b).pos;
+    expect(Math.hypot(tip.x - 60, tip.z - 12)).toBeGreaterThan(5);
+    // 届いた所の地形に乗っている (高さ設定は 0 なので地表ちょうど)。
+    expect(tip.y).toBeCloseTo(field.heightAt(tip.x, tip.z), 3);
+    // カーソルの下の高さとは、はっきり違う。
+    expect(Math.abs(tip.y - field.heightAt(60, 12))).toBeGreaterThan(5);
+  });
+
+  it('高さ設定 (地下・高架) は届いた所でも保つ', () => {
+    const field = slopedField();
+    const network = new Network();
+    const tool = new BuildTool(network, field, () => {});
+    tool.setClass('road_medium');
+    tool.setParallelSnap(false);
+    tool.update(new Vector3(0, field.heightAt(0, 0), 0), MODS);
+    tool.click();
+    tool.update(new Vector3(150, field.heightAt(150, 0), 0), MODS);
+    tool.click();
+    tool.adjustElevation(2); // +6 m
+    tool.update(new Vector3(60, field.heightAt(60, 12), 12), { straight: false, noSnap: false });
+    tool.click();
+
+    const added = network.getSegment([...network.segments.keys()].pop()!);
+    const tip = network.getNode(added.b).pos;
+    expect(tip.y - field.heightAt(tip.x, tip.z)).toBeCloseTo(6, 3);
+  });
+
   it('少し外して指しても、届く所まで敷ける (警告は出さない)', () => {
     // 真後ろに近い所は、接線に接する円弧が何百 m も回り込む。掃引角の
     // 制限でその円弧は指した所まで届かないが、届く所までは敷ける。

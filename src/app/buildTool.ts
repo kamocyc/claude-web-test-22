@@ -761,6 +761,20 @@ export class BuildTool {
     // 吸い付いていた相手には繋がらないので、その目印も出さない。
     const short =
       Math.hypot(this.preview.end.x - end.pos.x, this.preview.end.z - end.pos.z) > REACH_GAP;
+    if (short) {
+      // 高さも**届いた所**で決め直す。カーソルの下の高さのまま伸ばすと、
+      // 届いた所が尾根でも谷でも「指した所の高さ」になり、頼んでいない
+      // 築堤やトンネルができてしまう。高さ設定 (地下・高架) は保つ。
+      const reached = new Vector3(
+        this.preview.end.x,
+        this.field.heightAt(this.preview.end.x, this.preview.end.z) + this.elevationOffset,
+        this.preview.end.z,
+      );
+      this.preview = computePlacement(this.anchor, { pos: reached }, {
+        straight: this.modifiers.straight,
+        cls: this.cls,
+      });
+    }
     this.endAnchor = reachedAnchor(end, this.preview.end);
     // (角度スナップで位置をずらすのは、どこにも吸い付いていないときだけ
     //  なので、そのときは target.marker が無い。)

@@ -43,6 +43,8 @@ export class Viewport {
   private readonly pointer = new Vector2();
   /** 一人称視点に入る前の視点。降りたときに戻す。 */
   private savedView: { position: Vector3; target: Vector3; near: number } | null = null;
+  /** 進行中の注視点移動 (`panTo`)。 */
+  private flight: { from: Vector3; to: Vector3; start: number; duration: number } | null = null;
 
   constructor(readonly canvas: HTMLCanvasElement) {
     this.renderer = new WebGLRenderer({ canvas, antialias: true });
@@ -155,9 +157,75 @@ export class Viewport {
     this.controls.target.copy(eye).addScaledVector(forward, 40);
   }
 
+  /** 注視点から視点までの距離 [m]。 */
+  get viewDistance(): number {
+    return this.camera.position.distanceTo(this.controls.target);
+  }
+
+  /**
+   * 画面に対して平行移動する (注視点と視点を同じだけ動かす)。
+   *
+   * `forward` は画面の奥へ、`right` は画面の右へ進む距離 [m]。向きは
+   * カメラの視線を水平面に落として決めるので、俯角や方位を変えても
+   * 「W で画面の奥、D で画面の右」が変わらない。
+   *
+   * `MapControls.update()` は注視点からの相対位置でカメラを置き直すので、
+   * 両方を同じだけ動かせば向きも距離もそのまま残る。
+   */
+  panScreen(forward: number, right: number): void {
+    if (forward === 0 && right === 0) return;
+    // 視線を水平面へ落とす。真下を向いていると長さが 0 になるので、
+    // そのときは画面の上向き (カメラの向き) を代わりに使う。
+    const ahead = new Vector3().subVectors(this.controls.target, this.camera.position);
+    ahead.y = 0;
+    if (ahead.lengthSq() < 1e-6) {
+      ahead.set(0, 0, -1).applyQuaternion(this.camera.quaternion);
+      ahead.y = 0;
+    }
+    const delta = screenPanDelta(ahead, forward, right);
+    this.controls.target.add(delta);
+    this.camera.position.add(delta);
+  }
+
+  /**
+   * 注視点を `to` へ滑らかに移す (向きも距離もそのまま)。
+   *
+   * 警告の一覧から飛ぶときに使う。瞬間移動させると、どこから来て
+   * どこへ行ったのかが分からなくなるので、短い時間で滑らせる。
+   */
+  panTo(to: Vector3, seconds = 0.5): void {
+    this.flight = {
+      from: this.controls.target.clone(),
+      to: to.clone(),
+      start: performance.now(),
+      duration: Math.max(1, seconds * 1000),
+    };
+  }
+
+  /** 進行中の注視点移動をやめる (利用者が視点を触ったとき)。 */
+  cancelPan(): void {
+    this.flight = null;
+  }
+
+  private updateFlight(): void {
+    const flight = this.flight;
+    if (!flight) return;
+    const t = Math.min(1, (performance.now() - flight.start) / flight.duration);
+    // 出入りを滑らかにする (smoothstep)。
+    const eased = t * t * (3 - 2 * t);
+    const next = flight.from.clone().lerp(flight.to, eased);
+    const delta = next.sub(this.controls.target);
+    this.controls.target.add(delta);
+    this.camera.position.add(delta);
+    if (t >= 1) this.flight = null;
+  }
+
   render(): void {
     // 一人称視点の間は、カメラを外から置いている。
-    if (this.controls.enabled) this.controls.update();
+    if (this.controls.enabled) {
+      this.updateFlight();
+      this.controls.update();
+    }
     // 空は視点に付いて回る。置いたままにすると、引いたときにドームの縁が
     // 空の中に見えてしまう。
     this.sky.position.copy(this.camera.position);
@@ -194,6 +262,25 @@ export class Viewport {
     const hits = this.raycaster.intersectObjects(targets, false);
     return hits.length > 0 ? hits[0].point.clone() : null;
   }
+}
+
+/**
+ * 画面に対する平行移動量。
+ *
+ * `ahead` は視線の水平成分 (長さは問わない)、`forward` は画面の奥へ、
+ * `right` は画面の右へ進む距離 [m]。
+ *
+ * Y 上・右手系では、水平な視線 `(x, 0, z)` の右手は `(視線 × 上)` =
+ * `(-z, 0, x)`。真上から見下ろす画面では、視線が -Z のとき右が +X に
+ * なる (地図を北向きに見ているときの東)。
+ */
+export function screenPanDelta(ahead: Vector3, forward: number, right: number): Vector3 {
+  const dir = ahead.clone();
+  dir.y = 0;
+  if (dir.lengthSq() < 1e-12) dir.set(0, 0, -1);
+  dir.normalize();
+  const side = new Vector3(-dir.z, 0, dir.x);
+  return dir.multiplyScalar(forward).addScaledVector(side, right);
 }
 
 /** 天頂から地平にかけて色が変わる簡単な空。視点を中心に置いて使う。 */
