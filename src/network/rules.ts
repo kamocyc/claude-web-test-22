@@ -106,7 +106,9 @@ function matchedAt(
   segment: SegmentId,
   s: number,
 ): MatchedCrossingHint | undefined {
-  return ctx.matchedCrossings?.find((m) => m.segment === segment && Math.abs(m.s - s) <= MATCH_REACH);
+  return ctx.matchedCrossings?.find(
+    (m) => m.segment === segment && Math.abs(m.s - s) <= MATCH_REACH,
+  );
 }
 
 export interface PlacementContext {
