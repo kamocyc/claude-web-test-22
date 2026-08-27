@@ -13,12 +13,12 @@ import { RAIL_TOP_TO_BALLAST } from './surface';
 const RAIL_COLOR: RGB = [0.42, 0.4, 0.42];
 const RAIL_HEAD: RGB = [0.68, 0.66, 0.66];
 const SLEEPER_COLOR: RGB = [0.31, 0.26, 0.22];
-const BLADE_COLOR: RGB = [0.55, 0.52, 0.5];
 
 /** レール頭部の半幅 [m]。踏切のフランジ溝の位置決めにも使う。 */
 export const RAIL_HEAD_HALF_WIDTH = 0.035;
 const RAIL_HALF_WIDTH = RAIL_HEAD_HALF_WIDTH;
-const RAIL_HEIGHT = 0.15;
+/** レール頭頂面から底面までの高さ [m]。分岐器の部品もこれに揃える。 */
+export const RAIL_HEIGHT = 0.15;
 const SLEEPER_PITCH = 0.62;
 const SLEEPER_HALF_LENGTH = 1.25;
 const SLEEPER_HALF_THICK = 0.11;
@@ -207,12 +207,11 @@ export function buildTrackConnection(
   mb: MeshBuilder,
   from: Approach,
   to: Approach,
-  through: boolean,
   options: TrackConnectionOptions = {},
 ): void {
-  const alignment = trackConnectionAlignment(from, to);
-  if (!alignment) return;
-  const samples = liftAboveBallast(alignment.sample(1.2), options.ballastY);
+  const samples = trackConnectionSamples(from, to, options);
+  if (!samples) return;
+  const length = samples[samples.length - 1].s;
 
   const fromOffsets = outwardTrackOffsets(from);
   const toOffsets = outwardTrackOffsets(to);
@@ -234,14 +233,32 @@ export function buildTrackConnection(
     // 直線で寄せると両端で横方向に折れるので、両端の傾きが 0 になる
     // なめらかな関数を使う。
     const shifted = samples.map((sample) => {
-      const t = smoothstep(sample.s / Math.max(1e-6, alignment.length));
+      const t = smoothstep(sample.s / Math.max(1e-6, length));
       const offset = oa * (1 - t) + -ob * t;
       return { sample, offset };
     });
     buildShiftedRailPair(mb, shifted);
   }
+}
 
-  if (!through) buildSwitchBlades(mb, samples, fromOffsets[0] ?? 0);
+/** 交差点を通過する軌道を刻む間隔 [m]。 */
+const CONNECTION_STEP = 1.2;
+
+/**
+ * 交差点を通過する軌道の、**実際に描くのに使う**点列。
+ *
+ * 分岐器の部品 (トングレール・クロッシング) は、描かれたレールの上に
+ * 載っていなければ意味がない。レールと同じ点列をここから取れるように
+ * して、部品とレールが必ず同じ線に乗るようにする。
+ */
+export function trackConnectionSamples(
+  from: Approach,
+  to: Approach,
+  options: TrackConnectionOptions = {},
+): AlignmentSample[] | null {
+  const alignment = trackConnectionAlignment(from, to);
+  if (!alignment) return null;
+  return liftAboveBallast(alignment.sample(CONNECTION_STEP), options.ballastY);
 }
 
 /** 外向き方向を基準にした軌道の横オフセット。 */
@@ -321,30 +338,6 @@ function offsetSample(sample: AlignmentSample, offset: number): AlignmentSample 
       sample.pos.z + sample.right.z * offset,
     ),
   };
-}
-
-/** 分岐器のトングレール (可動部) を模した細い板。 */
-function buildSwitchBlades(mb: MeshBuilder, samples: AlignmentSample[], offset: number): void {
-  const up = new Vector3(0, 1, 0);
-  const start = samples[0];
-  if (!start) return;
-  const half = RAIL_GAUGE / 2;
-  for (const side of [-half, half]) {
-    const center = new Vector3(
-      start.pos.x + start.right.x * (offset + side) + start.forward.x * 1.6,
-      start.pos.y - RAIL_HEIGHT * 0.5 + SURFACE_LIFT,
-      start.pos.z + start.right.z * (offset + side) + start.forward.z * 1.6,
-    );
-    addBox(
-      mb,
-      center,
-      start.right,
-      up,
-      start.forward,
-      { x: 0.05, y: RAIL_HEIGHT * 0.45, z: 1.6 },
-      BLADE_COLOR,
-    );
-  }
 }
 
 /** 道床の天端の高さ (線形 Y からのオフセット)。 */

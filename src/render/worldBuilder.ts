@@ -45,6 +45,7 @@ import {
 } from '../build/markings';
 import { buildBuilding, buildZoneGrid } from '../build/buildings';
 import { buildCatenary, buildTrack, buildTrackConnection } from '../build/rail';
+import { TURNOUT_STEP, buildTurnouts, reverseSamples } from '../build/turnout';
 import { buildStation, createStationLabels, stationFootprint } from '../build/station';
 import { computeCant, type CantProfile } from '../build/cant';
 import {
@@ -1155,6 +1156,27 @@ export class WorldBuilder {
     return this.cant.get(segment)?.(s) ?? 0;
   }
 
+  /**
+   * 枝のセグメントを、ノードから外向きに `distance` [m] たどった点列。
+   *
+   * 接線で分かれる分岐器 (交差点のトリムが 0) では、分岐器の造作は交差点の
+   * 中ではなく枝そのものの上に載る。レールを描くのに使ったのと同じ線形・
+   * 同じカントでたどらないと、造作だけがレールから浮いてしまう。
+   */
+  private railPathOutward(approach: Approach, distance: number): AlignmentSample[] {
+    const segment = approach.branch.segment;
+    const alignment = this.network.alignmentOf(segment);
+    // 枝がノードに付いている端から、反対の端へ向かってたどる。
+    const atStart = approach.branch.atStart;
+    const from = atStart ? approach.trim : alignment.length - approach.trim;
+    const to = clamp(atStart ? from + distance : from - distance, 0, alignment.length);
+    const samples = this.withCant(
+      alignmentSamplesInRange(alignment, Math.min(from, to), Math.max(from, to), TURNOUT_STEP),
+      segment,
+    );
+    return atStart ? samples : reverseSamples(samples);
+  }
+
   /** 描画に使った高さ (踏切の補正込み) で線形をたどる経路。標示用。 */
   private surfacePath(segment: SegmentId): SurfacePath {
     const alignment = this.network.alignmentOf(segment);
@@ -1726,8 +1748,16 @@ export class WorldBuilder {
       for (const connection of junction.connections) {
         const from = junction.approaches.find((a) => a.branch.segment === connection.from);
         const to = junction.approaches.find((a) => a.branch.segment === connection.to);
-        if (from && to) buildTrackConnection(structure, from, to, connection.through, { ballastY });
+        if (from && to) buildTrackConnection(structure, from, to, { ballastY });
       }
+      // レールを引いた後に、その上へ分岐器の金物を載せる。接線で分かれる
+      // 分岐器は交差点の中に収まらないので、枝の続きも渡す。
+      buildTurnouts(structure, junction, {
+        ballastY,
+        branchPath: (approach, distance) => this.railPathOutward(approach, distance),
+        canPlace: (x, z, y) =>
+          this.canPlaceProp(x, z, y, junction.approaches.map((a) => a.branch.segment)),
+      });
       return;
     }
 
