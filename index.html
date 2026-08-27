@@ -280,6 +280,28 @@
         line-height: 1.45;
       }
 
+      /* 場所の分かる警告は押せる。押すとその場所へ視点が飛ぶ。 */
+      .warnings button.line {
+        appearance: none;
+        display: block;
+        width: 100%;
+        margin: 0;
+        padding: 3px 0;
+        font: inherit;
+        color: inherit;
+        text-align: left;
+        background: none;
+        border: none;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+        cursor: pointer;
+      }
+
+      .warnings button.line:hover,
+      .warnings button.line:focus-visible {
+        background: rgba(255, 255, 255, 0.08);
+        text-decoration: underline;
+      }
+
       /* 確認モードのグラフ。区間全体の曲率と勾配を 2 段の帯で見せる。 */
       .graph {
         display: block;

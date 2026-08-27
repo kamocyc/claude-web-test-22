@@ -5,7 +5,6 @@ import {
   extrudeSkirt,
   extrudeSkirtTo,
   fillPolygon,
-  polygonHeightSampler,
 } from '../core/meshbuilder';
 import { GRADING_MARGIN, SURFACE_LIFT, SURFACE_SKIRT, TERRAIN_CELL } from '../core/units';
 import type { NetworkClass } from '../network/classes';
@@ -383,15 +382,6 @@ export function buildJunctionSurface(
 
 const SKIRT_COLOR: RGB = [0.3, 0.28, 0.26];
 
-/**
- * 交差点面 (リングを塗り潰した多角形) の、ある一点での高さ。
- *
- * 描画とまったく同じ三角形分割を使うので、「面より上か下か」を確実に
- * 判定できる。分岐器の軌道を道床に埋めないために使う。範囲外なら null。
- */
-export function surfaceHeightAt(ring: Vector3[], x: number, z: number): number | null {
-  return polygonHeightSampler(ring)(x, z);
-}
 
 /** 同じ頂点数の 2 本のリングの間を帯で埋める。 */
 function buildRingBand(

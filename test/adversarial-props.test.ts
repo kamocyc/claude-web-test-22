@@ -1686,7 +1686,6 @@ describe('小物の配置 (敵対的検証)', () => {
     const bad: string[] = [];
     for (const [a, b] of [
       ['rail_single', 'rail_single'],
-      ['rail_single', 'rail_single'],
       ['road_small', 'road_small'],
       ['road_medium', 'road_small'],
       ['road_highway', 'road_medium'],

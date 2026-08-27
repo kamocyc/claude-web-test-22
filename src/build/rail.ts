@@ -1,25 +1,24 @@
-import { Vector2, Vector3 } from 'three';
-import { Alignment, type AlignmentSample } from '../core/alignment';
-import { curveFromTangents } from '../core/curve';
-import { VerticalProfile } from '../core/profile';
+import { Vector3 } from 'three';
+import type { AlignmentSample } from '../core/alignment';
 import { UP, type MeshBuilder } from '../core/meshbuilder';
-import { RAIL_GAUGE, SURFACE_LIFT, smoothstep } from '../core/units';
+import { RAIL_GAUGE, SURFACE_LIFT } from '../core/units';
 import type { NetworkClass } from '../network/classes';
-import type { Approach } from '../network/junction';
 import { addBox, addWire } from './primitives';
 import type { RGB } from './surface';
 import { RAIL_TOP_TO_BALLAST } from './surface';
 
 const RAIL_COLOR: RGB = [0.42, 0.4, 0.42];
 const RAIL_HEAD: RGB = [0.68, 0.66, 0.66];
-const SLEEPER_COLOR: RGB = [0.31, 0.26, 0.22];
-const BLADE_COLOR: RGB = [0.55, 0.52, 0.5];
+/** 枕木の色。 */
+export const SLEEPER_COLOR: RGB = [0.31, 0.26, 0.22];
 
 /** レール頭部の半幅 [m]。踏切のフランジ溝の位置決めにも使う。 */
 export const RAIL_HEAD_HALF_WIDTH = 0.035;
 const RAIL_HALF_WIDTH = RAIL_HEAD_HALF_WIDTH;
-const RAIL_HEIGHT = 0.15;
-const SLEEPER_PITCH = 0.62;
+/** レール頭頂面から底面までの高さ [m]。分岐器の部品もこれに揃える。 */
+export const RAIL_HEIGHT = 0.15;
+/** 枕木を並べる間隔 [m]。 */
+export const SLEEPER_PITCH = 0.62;
 const SLEEPER_HALF_LENGTH = 1.25;
 const SLEEPER_HALF_THICK = 0.11;
 const SLEEPER_HALF_WIDTH = 0.13;
@@ -159,192 +158,6 @@ export function interpolateSample(
     grade: a.grade + (b.grade - a.grade) * t,
     roll: (a.roll ?? 0) + ((b.roll ?? 0) - (a.roll ?? 0)) * t,
   };
-}
-
-/**
- * 交差点 (分岐器・クロッシング) を通過する軌道の線形。
- *
- * 平面は両端の接線を保った 3 次曲線。縦断は**両端の勾配を引き継ぐ**
- * エルミート曲線にする。単純に両端を直線で結ぶと、高低差のある分岐で
- * 枝との継ぎ目に折れ点ができ、勾配がそこだけ跳ね上がる。
- */
-export function trackConnectionAlignment(from: Approach, to: Approach): Alignment | null {
-  const a = new Vector2(from.center.x, from.center.z);
-  const b = new Vector2(to.center.x, to.center.z);
-  if (a.distanceTo(b) < 0.2) return null;
-
-  // ノードへ向かう方向 = 外向きの逆。
-  const ta = from.dir.clone().negate();
-  const tb = to.dir.clone();
-  const horizontal = curveFromTangents(a, ta, b, tb);
-  // 曲線は from の外向きと逆に進むので、始点の勾配は符号が反転する。
-  return new Alignment(
-    horizontal,
-    new VerticalProfile(
-      from.center.y,
-      to.center.y,
-      -from.outwardGrade,
-      to.outwardGrade,
-      horizontal.length,
-    ),
-  );
-}
-
-export interface TrackConnectionOptions {
-  /**
-   * その地点の交差点面 (道床天端) の高さ。軌道がこれより下に潜らないよう
-   * 持ち上げる。高低差のある分岐では、縦断曲線が弦より下に垂れて道床に
-   * 埋まることがある。
-   */
-  ballastY?: (x: number, z: number) => number | null;
-}
-
-/**
- * 交差点 (分岐器・クロッシング) を通過する軌道を作る。
- * 直進側でも分岐側でも同じ処理で扱える。
- */
-export function buildTrackConnection(
-  mb: MeshBuilder,
-  from: Approach,
-  to: Approach,
-  through: boolean,
-  options: TrackConnectionOptions = {},
-): void {
-  const alignment = trackConnectionAlignment(from, to);
-  if (!alignment) return;
-  const samples = liftAboveBallast(alignment.sample(1.2), options.ballastY);
-
-  const fromOffsets = outwardTrackOffsets(from);
-  const toOffsets = outwardTrackOffsets(to);
-
-  for (let i = 0; i < fromOffsets.length; i++) {
-    const oa = fromOffsets[i];
-    // 相手側では左右が反転するので、-oa に最も近い軌道と繋ぐ。
-    let best = 0;
-    let bestDelta = Infinity;
-    for (let j = 0; j < toOffsets.length; j++) {
-      const delta = Math.abs(toOffsets[j] + oa);
-      if (delta < bestDelta) {
-        bestDelta = delta;
-        best = j;
-      }
-    }
-    const ob = toOffsets[best];
-    // 接続曲線に沿って、始点で oa・終点で -ob になるようレールを寄せる。
-    // 直線で寄せると両端で横方向に折れるので、両端の傾きが 0 になる
-    // なめらかな関数を使う。
-    const shifted = samples.map((sample) => {
-      const t = smoothstep(sample.s / Math.max(1e-6, alignment.length));
-      const offset = oa * (1 - t) + -ob * t;
-      return { sample, offset };
-    });
-    buildShiftedRailPair(mb, shifted);
-  }
-
-  if (!through) buildSwitchBlades(mb, samples, fromOffsets[0] ?? 0);
-}
-
-/** 外向き方向を基準にした軌道の横オフセット。 */
-function outwardTrackOffsets(approach: Approach): number[] {
-  const cls = approach.branch.cls;
-  const sign = approach.branch.atStart ? 1 : -1;
-  const tracks = cls.tracks.length > 0 ? cls.tracks : [0];
-  return tracks.map((t) => t * sign);
-}
-
-function buildShiftedRailPair(
-  mb: MeshBuilder,
-  path: { sample: AlignmentSample; offset: number }[],
-): void {
-  const half = RAIL_GAUGE / 2;
-  for (const side of [-half, half]) {
-    const shifted = path.map(({ sample, offset }) =>
-      offsetSample(sample, offset + side),
-    );
-    buildRail(mb, shifted, 0);
-  }
-  // 分岐部の枕木。扇形に広がるのが本来だが、経路に直交させて並べる。
-  const up = new Vector3(0, 1, 0);
-  const center = new Vector3();
-  const total = path[path.length - 1].sample.s - path[0].sample.s;
-  const count = Math.floor(total / SLEEPER_PITCH);
-  for (let i = 0; i <= count; i++) {
-    const t = count > 0 ? i / count : 0;
-    const idx = Math.min(path.length - 1, Math.round(t * (path.length - 1)));
-    const { sample, offset } = path[idx];
-    center.set(
-      sample.pos.x + sample.right.x * offset,
-      sample.pos.y + SLEEPER_TOP - SLEEPER_HALF_THICK + SURFACE_LIFT,
-      sample.pos.z + sample.right.z * offset,
-    );
-    addBox(
-      mb,
-      center,
-      sample.right,
-      up,
-      sample.forward,
-      { x: SLEEPER_HALF_LENGTH, y: SLEEPER_HALF_THICK, z: SLEEPER_HALF_WIDTH },
-      SLEEPER_COLOR,
-    );
-  }
-}
-
-/**
- * 交差点の道床より下に潜った所を持ち上げる。
- *
- * 両端は断面がそのまま道床天端なので持ち上げ量が 0 になり、継ぎ目は
- * 開かない。中だるみした所だけが道床の上に出てくる。
- */
-function liftAboveBallast(
-  samples: AlignmentSample[],
-  ballastY?: (x: number, z: number) => number | null,
-): AlignmentSample[] {
-  if (!ballastY) return samples;
-  return samples.map((sample) => {
-    const ground = ballastY(sample.pos.x, sample.pos.z);
-    if (ground === null) return sample;
-    const min = ground + RAIL_TOP_TO_BALLAST;
-    if (sample.pos.y >= min) return sample;
-    return {
-      ...sample,
-      pos: new Vector3(sample.pos.x, min, sample.pos.z),
-    };
-  });
-}
-
-function offsetSample(sample: AlignmentSample, offset: number): AlignmentSample {
-  return {
-    ...sample,
-    pos: new Vector3(
-      sample.pos.x + sample.right.x * offset,
-      sample.pos.y,
-      sample.pos.z + sample.right.z * offset,
-    ),
-  };
-}
-
-/** 分岐器のトングレール (可動部) を模した細い板。 */
-function buildSwitchBlades(mb: MeshBuilder, samples: AlignmentSample[], offset: number): void {
-  const up = new Vector3(0, 1, 0);
-  const start = samples[0];
-  if (!start) return;
-  const half = RAIL_GAUGE / 2;
-  for (const side of [-half, half]) {
-    const center = new Vector3(
-      start.pos.x + start.right.x * (offset + side) + start.forward.x * 1.6,
-      start.pos.y - RAIL_HEIGHT * 0.5 + SURFACE_LIFT,
-      start.pos.z + start.right.z * (offset + side) + start.forward.z * 1.6,
-    );
-    addBox(
-      mb,
-      center,
-      start.right,
-      up,
-      start.forward,
-      { x: 0.05, y: RAIL_HEIGHT * 0.45, z: 1.6 },
-      BLADE_COLOR,
-    );
-  }
 }
 
 /** 道床の天端の高さ (線形 Y からのオフセット)。 */

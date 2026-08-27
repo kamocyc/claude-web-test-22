@@ -4,7 +4,7 @@ import { Mesh } from 'three';
 import { BuildTool } from '../src/app/buildTool';
 import { SnapView } from '../src/render/snapView';
 import { Network } from '../src/network/network';
-import { Vector2, MeshBasicMaterial } from 'three';
+import { Vector2, MeshBasicMaterial, type MeshStandardMaterial } from 'three';
 import { getClass } from '../src/network/classes';
 import { anchorFromNode, computePlacement, placeSegment } from '../src/network/editing';
 import { formatRadius } from '../src/app/inspect';
@@ -14,6 +14,9 @@ import { DEFAULT_TERRAIN, generateTerrain } from '../src/terrain/generator';
 import { TerrainMesh } from '../src/terrain/terrainMesh';
 import { Heightfield } from '../src/terrain/heightfield';
 import { testField } from './support/field';
+import { stationOf } from '../src/network/parallel';
+import { junctionReach } from '../src/network/rules';
+import { DEG } from '../src/core/units';
 
 /**
  * 敷設ツールの操作。
@@ -309,6 +312,65 @@ describe('高さで選ぶスナップ', () => {
   });
 });
 
+describe('地形に隠れたプレビュー', () => {
+  /** 地下へ 1 段下げた線路を引きかけの状態にする。 */
+  function underground(): BuildTool {
+    const network = new Network();
+    const tool = new BuildTool(network, flatField(10), () => {});
+    tool.setClass('rail_single');
+    tool.setParallelSnap(false);
+    // 地表 (標高 10 m) より下を通す。
+    tool.adjustElevation(-2);
+    clickAt(tool, -60, 0);
+    tool.update(new Vector3(60, 0, 0), MODS);
+    return tool;
+  }
+
+  function meshes(tool: BuildTool): { surface: Mesh; xray: Mesh } {
+    return {
+      surface: tool.previewGroup.getObjectByName('preview-surface') as Mesh,
+      xray: tool.previewGroup.getObjectByName('preview-xray') as Mesh,
+    };
+  }
+
+  it('地形の下でも見えるよう、深度試験なしの面を重ねて描く', () => {
+    const { surface, xray } = meshes(underground());
+    const material = xray.material as MeshStandardMaterial;
+    // 深度試験をしないので、地形やその他の物に隠れても必ず描かれる。
+    expect(material.depthTest).toBe(false);
+    expect(material.transparent).toBe(true);
+    // 地表に出ている所は本体が上から塗り直せるよう、先に描く。
+    expect(xray.renderOrder).toBeLessThan(surface.renderOrder);
+    expect((surface.material as MeshStandardMaterial).depthTest).toBe(true);
+  });
+
+  it('透ける面は本体と同じ形 (プレビューが二重にずれない)', () => {
+    const tool = underground();
+    const { surface, xray } = meshes(tool);
+    expect(surface.geometry.getAttribute('position').count).toBeGreaterThan(0);
+    expect(xray.geometry).toBe(surface.geometry);
+
+    // 引き直しても同じ形を指したままにする。
+    tool.update(new Vector3(40, 0, 30), MODS);
+    expect(xray.geometry).toBe(surface.geometry);
+  });
+
+  it('置けないときは本体も透ける面も赤く濃くなる', () => {
+    const tool = underground();
+    const { surface, xray } = meshes(tool);
+    const open = {
+      surface: (surface.material as MeshStandardMaterial).opacity,
+      xray: (xray.material as MeshStandardMaterial).opacity,
+    };
+    // 短い区間で一気に持ち上げると、最大勾配を超えて置けなくなる。
+    tool.adjustElevation(20);
+    tool.update(new Vector3(-40, 0, 0), MODS);
+    expect(tool.status().blockers.length).toBeGreaterThan(0);
+    expect((surface.material as MeshStandardMaterial).opacity).toBeGreaterThan(open.surface);
+    expect((xray.material as MeshStandardMaterial).opacity).toBeGreaterThan(open.xray);
+  });
+});
+
 describe('引いてきた道の上への折り返し', () => {
   /** 東西の道路を 1 本引いて、終点に居る (続きを引ける) 状態にする。 */
   function drawn(mods = MODS): { tool: BuildTool; network: Network } {
@@ -349,13 +411,80 @@ describe('引いてきた道の上への折り返し', () => {
     expect(network.segments.size).toBe(before);
   });
 
-  it('少し外して指しても、指した所まで届かない線形は置けない', () => {
-    // 真後ろに近い所は、接線に接する円弧が何百 m も回り込む。
-    const { tool } = drawn();
+  /** 東西に一定の勾配で下る地形。 */
+  function slopedField(dropPerMetre = 0.05): Heightfield {
+    const field = testField();
+    for (let iz = 0; iz <= field.cells; iz++) {
+      for (let ix = 0; ix <= field.cells; ix++) {
+        field.base[field.index(ix, iz)] = 200 - field.worldX(ix) * dropPerMetre;
+      }
+    }
+    field.resetWork();
+    return field;
+  }
+
+  it('届いた所の高さは、その真下の地形で決める (カーソルの下ではない)', () => {
+    // カーソルと、線形が実際に届く所は何百 m も離れる。カーソルの下の
+    // 高さをそのまま使うと、届いた所が勝手に築堤やトンネルになる。
+    const field = slopedField();
+    const network = new Network();
+    const tool = new BuildTool(network, field, () => {});
+    tool.setClass('road_medium');
+    tool.setParallelSnap(false);
+    tool.update(new Vector3(0, field.heightAt(0, 0), 0), MODS);
+    tool.click();
+    tool.update(new Vector3(150, field.heightAt(150, 0), 0), MODS);
+    tool.click();
+    // 端点から見て後ろ寄り。円弧は掃引角で頭打ちになり、遠くで終わる。
+    tool.update(new Vector3(60, field.heightAt(60, 12), 12), { straight: false, noSnap: false });
+    tool.click();
+
+    const added = network.getSegment([...network.segments.keys()].pop()!);
+    const tip = network.getNode(added.b).pos;
+    expect(Math.hypot(tip.x - 60, tip.z - 12)).toBeGreaterThan(5);
+    // 届いた所の地形に乗っている (高さ設定は 0 なので地表ちょうど)。
+    expect(tip.y).toBeCloseTo(field.heightAt(tip.x, tip.z), 3);
+    // カーソルの下の高さとは、はっきり違う。
+    expect(Math.abs(tip.y - field.heightAt(60, 12))).toBeGreaterThan(5);
+  });
+
+  it('高さ設定 (地下・高架) は届いた所でも保つ', () => {
+    const field = slopedField();
+    const network = new Network();
+    const tool = new BuildTool(network, field, () => {});
+    tool.setClass('road_medium');
+    tool.setParallelSnap(false);
+    tool.update(new Vector3(0, field.heightAt(0, 0), 0), MODS);
+    tool.click();
+    tool.update(new Vector3(150, field.heightAt(150, 0), 0), MODS);
+    tool.click();
+    tool.adjustElevation(2); // +6 m
+    tool.update(new Vector3(60, field.heightAt(60, 12), 12), { straight: false, noSnap: false });
+    tool.click();
+
+    const added = network.getSegment([...network.segments.keys()].pop()!);
+    const tip = network.getNode(added.b).pos;
+    expect(tip.y - field.heightAt(tip.x, tip.z)).toBeCloseTo(6, 3);
+  });
+
+  it('少し外して指しても、届く所まで敷ける (警告は出さない)', () => {
+    // 真後ろに近い所は、接線に接する円弧が何百 m も回り込む。掃引角の
+    // 制限でその円弧は指した所まで届かないが、届く所までは敷ける。
+    const { tool, network } = drawn();
     tool.update(new Vector3(60, 0, 12), { straight: false, noSnap: false });
     const status = tool.status();
     expect(status.length).toBeGreaterThan(400);
-    expect(status.blockers.join(' ')).toContain('届きません');
+    expect(status.blockers).toEqual([]);
+
+    tool.click();
+    expect(network.segments.size).toBe(2);
+    // 端点は指した所ではなく、線形が実際に届いた所に立つ。プレビューに
+    // 出ていた形のまま残るので、敷いたあとで線形が歪まない。
+    const added = network.getSegment([...network.segments.keys()].pop()!);
+    const alignment = network.alignmentOf(added.id);
+    expect(alignment.length).toBeCloseTo(status.length, 1);
+    const tip = alignment.sampleAt(alignment.length).pos;
+    expect(Math.hypot(tip.x - 60, tip.z - 12)).toBeGreaterThan(5);
   });
 
   it('前へ続けるのはそのまま置ける', () => {
@@ -705,5 +834,290 @@ describe('踏切', () => {
     tool.adjustElevation(-1);
     tool.update(new Vector3(0, 0, 3), MODS);
     expect(tool.status().snap).toBe('crossing');
+  });
+});
+
+/**
+ * ルートに沿った平行敷設。
+ *
+ * 既存の複線は、橋・踏切・分岐のたびにノードが入って何本にも分かれている。
+ * 基準の 1 本ぶんで止まってしまうと、その隣を敷くのに何度もクリックし直す
+ * ことになる。始点の隣から終点の隣まで、線路のルートをたどって一度に敷ける
+ * ようにしたのがここ。
+ */
+/**
+ * 線路の分岐。
+ *
+ * 線路の交差点には中身が無いので、折れたまま枝が集まると角がそのまま残る。
+ * 交差点の中で振り分ける余地が無く、置いてから直せないので、置く前に止める。
+ */
+/**
+ * 交差点への吸い付き。
+ *
+ * 交差点は「そこに繋いでください」と案内される相手なので、面の広さに
+ * 関わらず掴めるようにする。線路の分岐は面を持たないので、これが無いと
+ * ノードのすぐ上を指すしかない。
+ */
+describe('交差点のスナップ', () => {
+  /** 原点で分かれる 3 枝の線路 (原点が分岐器)。 */
+  function turnout(): { tool: BuildTool; network: Network } {
+    const network = new Network();
+    const tool = new BuildTool(network, flatField(), () => {});
+    tool.setClass('rail_single');
+    for (const x of [-200, 200]) {
+      tool.update(new Vector3(x, 0, 0), MODS);
+      tool.click();
+    }
+    tool.cancel();
+    const soft = { straight: false, noSnap: false };
+    tool.update(new Vector3(0, 0, 0), soft);
+    tool.click();
+    tool.update(new Vector3(150, 0, -80), soft);
+    tool.click();
+    tool.cancel();
+    return { tool, network };
+  }
+
+  it('線形から外れた 12 m 先を指しても、交差点に吸い付く', () => {
+    const { tool, network } = turnout();
+    expect(network.branchesAt(junctionNode(network).id).length).toBe(3);
+    // 本線からも側線からも外れた所 (北 12 m)。
+    tool.update(new Vector3(0, 0, 12), MODS);
+    const status = tool.status();
+    expect(status.snap).toBe('node');
+    expect(status.markers[0].pos.length()).toBeLessThan(0.01);
+  });
+
+  it('離れすぎた所 (20 m) では吸い付かない', () => {
+    const { tool } = turnout();
+    tool.update(new Vector3(0, 0, 20), MODS);
+    expect(tool.status().snap).toBe('none');
+  });
+
+  /**
+   * 線形の上を指しているときは今までどおり分割する。ここまで交差点に
+   * 吸わせると、分岐器のすぐ先に渡り線を作れなくなる。
+   */
+  it('線形の上を指したときは、交差点の近くでも分割する', () => {
+    const { tool } = turnout();
+    tool.update(new Vector3(12, 0, 0), MODS);
+    expect(tool.status().snap).toBe('segment');
+  });
+});
+
+describe('線路の分岐', () => {
+  function railLine(): { tool: BuildTool; network: Network } {
+    const network = new Network();
+    const tool = new BuildTool(network, flatField(), () => {});
+    tool.setClass('rail_single');
+    for (const x of [-200, 200]) {
+      tool.update(new Vector3(x, 0, 0), MODS);
+      tool.click();
+    }
+    tool.cancel();
+    return { tool, network };
+  }
+
+  it('直線モードで斜めに分けようとすると止まる', () => {
+    const { tool } = railLine();
+    tool.update(new Vector3(0, 0, 0), MODS);
+    expect(tool.status().snap).toBe('segment');
+    tool.click();
+    tool.update(new Vector3(120, 0, -120), MODS);
+    expect(tool.status().blockers.some((b) => b.includes('分岐角'))).toBe(true);
+  });
+
+  it('接線に沿って分ければ置ける', () => {
+    const { tool, network } = railLine();
+    const soft = { straight: false, noSnap: false };
+    tool.update(new Vector3(0, 0, 0), soft);
+    tool.click();
+    tool.update(new Vector3(120, 0, -120), soft);
+    expect(tool.status().blockers).toEqual([]);
+    tool.click();
+    tool.cancel();
+    const node = junctionNode(network);
+    expect(network.branchesAt(node.id).length).toBe(3);
+  });
+
+  it('端点から続けて引くぶんには、折れても止めない (継ぎ目は均される)', () => {
+    const { tool, network } = railLine();
+    // 東の端点から北東へ。2 枝の継ぎ目なので `smoothJoint` が折れを均す。
+    tool.update(new Vector3(200, 0, 0), MODS);
+    tool.click();
+    tool.update(new Vector3(300, 0, -60), MODS);
+    expect(tool.status().blockers).toEqual([]);
+    tool.click();
+    tool.cancel();
+    expect(network.segments.size).toBe(2);
+  });
+});
+
+describe('ルートに沿った平行敷設', () => {
+  const GAP = 4.6; // parallelSpacing(rail_single)
+
+  /** 途中にノードのある線路を引く (経由点ごとに 1 本ずつのセグメントになる)。 */
+  function line(xs: number[], straight = true): { tool: BuildTool; network: Network } {
+    const network = new Network();
+    const tool = new BuildTool(network, flatField(), () => {});
+    tool.setClass('rail_single');
+    tool.setParallelSnap(true);
+    const mods = { straight, noSnap: false };
+    for (const x of xs) {
+      tool.update(new Vector3(x, 0, 0), mods);
+      tool.click();
+    }
+    tool.cancel();
+    return { tool, network };
+  }
+
+  /** 敷いた区間を「(始点)->(終点)」の並びにする。 */
+  function laid(network: Network, from: number): string[] {
+    return [...network.segments.values()].slice(from).map((seg) => {
+      const a = network.getNode(seg.a).pos;
+      const b = network.getNode(seg.b).pos;
+      return `(${a.x.toFixed(0)},${a.z.toFixed(1)})->(${b.x.toFixed(0)},${b.z.toFixed(1)})`;
+    });
+  }
+
+  it('途中で分かれている線路の隣を、一度に端から端まで敷ける', () => {
+    const { tool, network } = line([-150, -50, 50, 150]);
+    expect(network.segments.size).toBe(3);
+
+    tool.update(new Vector3(-140, 0, GAP), MODS);
+    expect(tool.status().snap).toBe('parallel');
+    tool.click();
+    tool.update(new Vector3(140, 0, GAP), MODS);
+    const status = tool.status();
+    expect(status.snap).toBe('parallel');
+    expect(status.blockers).toEqual([]);
+    // 長さは基準をたどった全長 (1 本ぶんの 100 m ではない)。
+    expect(status.length).toBeCloseTo(280, 0);
+
+    tool.click();
+    // 基準と同じ位置で区切られる。橋・トンネルの境目が隣どうしで揃う。
+    expect(laid(network, 3)).toEqual([
+      '(-140,4.6)->(-50,4.6)',
+      '(-50,4.6)->(50,4.6)',
+      '(50,4.6)->(140,4.6)',
+    ]);
+  });
+
+  it('引く向きも基準の向きも、敷く側を変えない', () => {
+    for (const reverseMiddle of [false, true]) {
+      for (const backwards of [false, true]) {
+        const name = `rev=${reverseMiddle} back=${backwards}`;
+        const { tool, network } = line([-150, -50, 50, 150]);
+        // 真ん中だけ線形の向きを入れ替える (弧長の向きが逆になる)。
+        if (reverseMiddle) network.reverseSegment(2);
+        const [from, to] = backwards ? [140, -140] : [-140, 140];
+
+        tool.update(new Vector3(from, 0, GAP), MODS);
+        tool.click();
+        tool.update(new Vector3(to, 0, GAP), MODS);
+        expect(tool.status().blockers, name).toEqual([]);
+        tool.click();
+
+        const placed = laid(network, 3);
+        expect(placed.length, name).toBe(3);
+        // どう引いても、同じ側 (z = +4.6) に同じ位置で区切られる。
+        for (const seg of [...network.segments.values()].slice(3)) {
+          for (const node of [seg.a, seg.b]) {
+            expect(network.getNode(node).pos.z, `${name} ${placed}`).toBeCloseTo(GAP, 1);
+          }
+        }
+      }
+    }
+  });
+
+  it('基準の途中で止めれば、そこまでで区切って敷ける', () => {
+    const { tool, network } = line([-150, -50, 50, 150]);
+    tool.update(new Vector3(-140, 0, GAP), MODS);
+    tool.click();
+    tool.update(new Vector3(20, 0, GAP), MODS);
+    expect(tool.status().length).toBeCloseTo(160, 0);
+    tool.click();
+    expect(laid(network, 3)).toEqual(['(-140,4.6)->(-50,4.6)', '(-50,4.6)->(20,4.6)']);
+  });
+
+  /**
+   * 線路の交差点には面が無いので、分岐器のノードの真横で区切ってよい。
+   * (面があった頃は、そこに端点を置くと「交差点の中に端点があります」で
+   *  止まり、分岐器を 1 つ越えるだけで複線化できなかった。)
+   */
+  it('分岐器の真横でも、基準と同じ位置で区切って敷ける', () => {
+    const { tool, network } = line([-150, 0, 150]);
+    // 原点から南東へ側線を分ける (原点が分岐器になる)。線路の分岐は接線に
+    // 沿ってしか作れないので、曲線モードで引く。
+    const soft = { straight: false, noSnap: false };
+    tool.update(new Vector3(0, 0, 0), soft);
+    tool.click();
+    tool.update(new Vector3(120, 0, -120), soft);
+    expect(tool.status().blockers).toEqual([]);
+    tool.click();
+    tool.cancel();
+    const base = network.segments.size;
+    const node = [...network.nodes.values()].find((n) => Math.hypot(n.pos.x, n.pos.z) < 1)!;
+    expect(network.branchesAt(node.id).length).toBe(3);
+    expect(junctionReach(network, node.id)).toBe(0);
+
+    // 分岐と反対側 (北) に、分岐器を越えて敷く。
+    tool.update(new Vector3(-140, 0, GAP), MODS);
+    tool.click();
+    tool.update(new Vector3(140, 0, GAP), MODS);
+    expect(tool.status().blockers).toEqual([]);
+    tool.click();
+
+    const placed = [...network.segments.values()].slice(base);
+    expect(placed.length).toBe(2);
+    // 区切りは基準のノードの真横。
+    const joint = network.getNode(placed[0].b).pos;
+    expect(Math.abs(joint.x - node.pos.x)).toBeLessThan(1);
+  });
+
+  it('曲がった線路でも、間隔と終点の接線が基準に揃う', () => {
+    const network = new Network();
+    const tool = new BuildTool(network, flatField(), () => {});
+    tool.setClass('rail_single');
+    tool.setParallelSnap(true);
+    const soft = { straight: false, noSnap: false };
+    for (const [x, z] of [[-200, 0], [-60, 0], [60, 60], [200, 180]] as [number, number][]) {
+      tool.update(new Vector3(x, 0, z), soft);
+      tool.click();
+    }
+    tool.cancel();
+    const base = network.segments.size;
+    expect(base).toBe(3);
+
+    tool.update(new Vector3(-190, 0, -GAP), soft);
+    expect(tool.status().snap).toBe('parallel');
+    tool.click();
+    tool.update(new Vector3(150, 0, 130 - GAP), soft);
+    expect(tool.status().blockers).toEqual([]);
+    tool.click();
+
+    const placed = [...network.segments.values()].slice(base);
+    expect(placed.length).toBeGreaterThan(1);
+    // 間隔はどこでも一定。
+    for (const seg of placed) {
+      const own = network.alignmentOf(seg.id);
+      for (let i = 0; i <= 8; i++) {
+        const p = own.sampleAt((own.length * i) / 8).pos;
+        let nearest = Infinity;
+        for (let id = 1; id <= base; id++) {
+          const ref = network.alignmentOf(id);
+          const s = stationOf(ref, p.x, p.z);
+          nearest = Math.min(nearest, ref.sampleAt(s).pos.distanceTo(p));
+        }
+        expect(Math.abs(nearest - GAP)).toBeLessThan(0.6);
+      }
+    }
+    // 終点の接線は、その所の基準の接線と揃う。
+    const last = placed[placed.length - 1];
+    const own = network.alignmentOf(last.id);
+    const end = own.sampleAt(own.length);
+    const reference = network.alignmentOf(base);
+    const at = reference.sampleAt(stationOf(reference, end.pos.x, end.pos.z));
+    expect(end.forwardXZ.dot(at.forwardXZ)).toBeGreaterThan(Math.cos(2 * DEG));
   });
 });

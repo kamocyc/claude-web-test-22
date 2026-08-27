@@ -130,10 +130,21 @@ describe('線路の分岐', () => {
     expect(junction.connections.filter((c) => c.through)).toHaveLength(1);
   });
 
-  it('急な分岐角には警告が出る', () => {
+  /**
+   * 線路の交差点には中身が無いので、折れたまま集まった枝はそのまま角として
+   * 残る。直せないのでエラーとして知らせる (敷設は `checkPlacement` が止める)。
+   */
+  it('接線で分かれていない分岐はエラーになる', () => {
     const { network, center } = star('rail_single', [0, Math.PI, Math.PI * 0.55]);
     const junction = solveJunctions(network).junctions.get(center)!;
-    expect(junction.warnings.some((w) => w.includes('分岐器'))).toBe(true);
+    expect(junction.errors.some((m) => m.includes('分岐角'))).toBe(true);
+  });
+
+  it('接線で分かれる分岐はエラーにならない', () => {
+    // 3 本目が本線の片方とほぼ同じ向きに出ていく = 接点で分かれる分岐器。
+    const { network, center } = star('rail_single', [0, Math.PI, Math.PI * 0.002]);
+    const junction = solveJunctions(network).junctions.get(center)!;
+    expect(junction.errors).toEqual([]);
   });
 
   it('4 叉路は直進 2 組のクロッシングになる', () => {
@@ -141,6 +152,16 @@ describe('線路の分岐', () => {
     const junction = solveJunctions(network).junctions.get(center)!;
     expect(junction.kind).toBe('railCrossing');
     expect(junction.connections.filter((c) => c.through)).toHaveLength(2);
+    // 直進 2 組なので折れは無い。
+    expect(junction.errors).toEqual([]);
+  });
+
+  it('線路の交差点はトリムも面も持たない', () => {
+    const { network, center } = star('rail_single', [0, Math.PI, Math.PI * 0.002]);
+    const junction = solveJunctions(network).junctions.get(center)!;
+    for (const ap of junction.approaches) expect(ap.trim).toBe(0);
+    expect(junction.ring).toEqual([]);
+    expect(junction.rings).toEqual([]);
   });
 
   it('道路と線路が同じノードに繋がると不正として扱われる', () => {

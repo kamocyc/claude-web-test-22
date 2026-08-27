@@ -7,10 +7,12 @@ import { buildRibbon, profileFor } from '../build/surface';
 import { buildStationPreview } from '../build/station';
 import { getClass, type NetworkClass } from '../network/classes';
 import {
+  REACH_GAP,
   anchorFromNode,
   anchorFromSegment,
   computePlacement,
   placeSegment,
+  reachedAnchor,
   type Anchor,
   type PlaceResult,
   type PlacementPreview,
@@ -18,9 +20,11 @@ import {
 import type { NetNode, Network, NodeId, SegmentId } from '../network/network';
 import {
   findParallelReference,
-  parallelAlignment,
+  parallelRoute,
   previewFromAlignment,
+  previewFromAlignments,
   stationOf,
+  type ParallelLeg,
   type ParallelReference,
 } from '../network/parallel';
 import { checkPlacement, junctionReach } from '../network/rules';
@@ -38,8 +42,17 @@ import type { LineId, LineMap } from '../network/line';
 import { checkStationPlacement } from '../network/stationPlacement';
 import { ZONE_COLORS, ZONE_EMPTY_COLOR } from '../build/buildings';
 import type { ZoneMap, ZoneType } from '../network/zoning';
-import { evaluateAlignment, type SegmentDiagnostics } from '../network/validation';
-import { createPreviewMaterial, riskTint, setPreviewBlocked } from '../render/materials';
+import {
+  evaluateAlignment,
+  worstDiagnostics,
+  type SegmentDiagnostics,
+} from '../network/validation';
+import {
+  createPreviewMaterial,
+  createPreviewXrayMaterial,
+  riskTint,
+  setPreviewBlocked,
+} from '../render/materials';
 import {
   ELEVATION_GUIDE_STEP,
   ElevationGuideView,
@@ -142,6 +155,15 @@ const CROSS_REACH = 20;
  */
 const CROSSING_SNAP_HEIGHT = 2.5;
 
+/**
+ * 交差点に吸い付く範囲の下限 [m]。
+ *
+ * 面の広さ (`junctionReach`) に任せると、面を持たない線路の分岐では
+ * ノードのすぐ上を指さないと掴めない。交差点は「繋いでください」と
+ * 案内される相手なので、外した所からでも掴めるだけ広く取る。
+ */
+const JUNCTION_SNAP = 15;
+
 /** カーソルが構造物 (橋の路面) に当たっているとみなす、地形との差 [m]。 */
 const ON_STRUCTURE = 2;
 const ANGLE_SNAP = 15 * DEG;
@@ -168,6 +190,9 @@ export class BuildTool {
   private readonly elevationGuideView = new ElevationGuideView();
   private readonly previewMesh: Mesh;
   private readonly previewMaterial: MeshStandardMaterial;
+  /** 地形などに隠れた所を透かして出す、プレビューのもう 1 枚。 */
+  private readonly previewXrayMesh: Mesh;
+  private readonly previewXrayMaterial: MeshStandardMaterial;
   private anchor: Anchor | null = null;
   private cursor: Vector3 | null = null;
   private preview: PlacementPreview | null = null;
@@ -176,13 +201,21 @@ export class BuildTool {
   /** 引き始めた点の目印 (確定済み)。 */
   private anchorMarker: SnapMarker | null = null;
   private markers: SnapMarker[] = [];
+  /** スナップの目印 (原因の交差点を除いたもの)。 */
+  private snapMarkers: SnapMarker[] = [];
   private hoverSegment: SegmentId | null = null;
   private lastDiagnostics: SegmentDiagnostics | null = null;
   private blockers: string[] = [];
+  /** 敷設を止めている原因の場所 (既存の交差点)。目印で囲って示す。 */
+  private blockedPlaces: Vector3[] = [];
   /** いま平行に敷こうとしている基準の線形。 */
   private parallel: ParallelReference | null = null;
-  /** 平行スナップで組み立てた線形 (プレビューと同じもの)。 */
-  private parallelAlignmentPreview: Alignment | null = null;
+  /**
+   * 平行スナップで組み立てた区間の列 (プレビューと同じもの)。
+   *
+   * 既存の線形の区切りごとに 1 本。空でなければ、確定時はこれを順に敷く。
+   */
+  private parallelRun: ParallelLeg[] = [];
   /** 確認モードで読み取った、カーソル下の 1 点。 */
   private inspection: PointInspection | null = null;
   private selectedStationId: StationId | null = null;
@@ -219,8 +252,23 @@ export class BuildTool {
     this.previewGroup.name = 'preview';
     this.previewMaterial = createPreviewMaterial();
     this.previewMesh = new Mesh(new MeshBuilder().build(), this.previewMaterial);
+    this.previewMesh.name = 'preview-surface';
     this.previewMesh.frustumCulled = false;
-    this.previewGroup.add(this.previewMesh, this.snapView.group, this.elevationGuideView.group);
+    // トンネルや丘の陰でプレビューが消えないよう、同じ形をもう 1 枚、
+    // 深度試験なしで**先に**描く。地表に出ている所はこのあと
+    // `previewMesh` が上から塗り直すので、隠れている所だけが薄く透ける。
+    this.previewXrayMaterial = createPreviewXrayMaterial();
+    this.previewXrayMesh = new Mesh(this.previewMesh.geometry, this.previewXrayMaterial);
+    this.previewXrayMesh.name = 'preview-xray';
+    this.previewXrayMesh.frustumCulled = false;
+    this.previewXrayMesh.renderOrder = 14;
+    this.previewMesh.renderOrder = 15;
+    this.previewGroup.add(
+      this.previewXrayMesh,
+      this.previewMesh,
+      this.snapView.group,
+      this.elevationGuideView.group,
+    );
   }
 
   get cls(): NetworkClass {
@@ -291,7 +339,7 @@ export class BuildTool {
     this.lastDiagnostics = null;
     this.blockers = [];
     this.parallel = null;
-    this.parallelAlignmentPreview = null;
+    this.parallelRun = [];
     this.anchorMarker = null;
     this.showMarkers([]);
     this.inspection = null;
@@ -524,7 +572,7 @@ export class BuildTool {
       candidates.push({
         anchor: { pos: parallel.pos.clone() },
         snap: 'parallel',
-        marker: this.parallelMarker(parallel, parallel.pos),
+        marker: this.parallelMarker([parallel.segment], parallel.pos),
         distance: Math.hypot(parallel.pos.x - cursor.x, parallel.pos.z - cursor.z),
       });
     }
@@ -536,12 +584,12 @@ export class BuildTool {
 
   // ---------------------------------------------------------- 目印
 
-  /** 交差点・端点に繋ぐ目印。輪の大きさは交差点の面の広がりに合わせる。 */
+  /** 交差点・端点に繋ぐ目印。輪の大きさは吸い付く範囲に合わせる。 */
   private nodeMarker(node: NetNode): SnapMarker {
     return {
       kind: 'node',
       pos: node.pos.clone(),
-      radius: Math.max(junctionReach(this.network, node.id), this.cls.halfWidth * 0.8),
+      radius: Math.max(this.junctionSnapRange(node), this.cls.halfWidth * 0.8),
     };
   }
 
@@ -622,28 +670,62 @@ export class BuildTool {
     return profile;
   }
 
-  /** 平行に敷く目印。基準の線形をなぞり、間隔を渡り線で示す。 */
-  private parallelMarker(reference: ParallelReference, at: Vector3): SnapMarker {
-    const alignment = this.network.alignmentOf(reference.segment);
+  /**
+   * 平行に敷く目印。基準の線形をなぞり、間隔を渡り線で示す。
+   *
+   * ルートに沿って何本かをまたぐときは、そのぜんぶをなぞる。どこまでを
+   * 基準にしているのかが一目で分かるようにするため。
+   */
+  private parallelMarker(references: readonly SegmentId[], at: Vector3): SnapMarker {
     const guide: Vector3[] = [];
-    const steps = Math.max(2, Math.ceil(alignment.length / 4));
-    for (let i = 0; i <= steps; i++) {
-      guide.push(alignment.sampleAt((alignment.length * i) / steps).pos.clone());
+    for (const segment of references) {
+      const alignment = this.network.alignmentOf(segment);
+      const steps = Math.max(2, Math.ceil(alignment.length / 4));
+      for (let i = 0; i <= steps; i++) {
+        const p = alignment.sampleAt((alignment.length * i) / steps).pos;
+        // 継ぎ目の点は前の区間と重なるので落とす (帯がねじれる)。
+        if (guide.length > 0 && guide[guide.length - 1].distanceToSquared(p) < 1e-6) continue;
+        guide.push(p.clone());
+      }
     }
-    const s = clamp(stationOf(alignment, at.x, at.z), 0, alignment.length);
+    const last = this.network.alignmentOf(references[references.length - 1]);
+    const s = clamp(stationOf(last, at.x, at.z), 0, last.length);
     return {
       kind: 'parallel',
       pos: at.clone(),
       radius: Math.max(1.8, this.cls.halfWidth * 0.4),
       guide,
-      tie: [alignment.sampleAt(s).pos.clone(), at.clone()],
+      tie: [last.sampleAt(s).pos.clone(), at.clone()],
     };
   }
 
   /** 目印を描き直す。引き始めた点は常に出す。 */
   private showMarkers(markers: readonly (SnapMarker | null)[]): void {
-    this.markers = markers.filter((m): m is SnapMarker => m !== null);
+    this.snapMarkers = markers.filter((m): m is SnapMarker => m !== null);
+    this.syncMarkers();
+  }
+
+  /**
+   * 目印を描き直す。
+   *
+   * スナップの目印は `refreshPreview` が、止めている原因の交差点はその後の
+   * `updatePreviewMesh` (判定を通す所) が決めるので、両方をここで合わせる。
+   */
+  private syncMarkers(): void {
+    this.markers = [
+      ...this.snapMarkers,
+      ...this.blockedPlaces.map((pos) => this.blockedMarker(pos)),
+    ];
     this.snapView.update(this.markers);
+  }
+
+  /** 敷設を止めている交差点の目印。 */
+  private blockedMarker(pos: Vector3): SnapMarker {
+    const node = this.network.findNodeNear(pos, 1);
+    const radius = node
+      ? Math.max(junctionReach(this.network, node.id), this.cls.halfWidth)
+      : this.cls.halfWidth;
+    return { kind: 'blocked', pos: pos.clone(), radius, width: 1.1 };
   }
 
   /** その種別を繋いでよいノードか (線路のノードに道路は繋がない)。 */
@@ -653,10 +735,26 @@ export class BuildTool {
   }
 
   /**
+   * その交差点に吸い付く範囲 [m]。
+   *
+   * 下限は「そこに端点を置くと止められる範囲」(`checkJunctionSpacing` と
+   * 同じ式)。指せる所と置ける所が食い違わないようにする。そのうえで
+   * 3 枝以上の交差点は、面が無くても掴めるよう `JUNCTION_SNAP` まで広げる。
+   */
+  private junctionSnapRange(node: NetNode): number {
+    const blocked = junctionReach(this.network, node.id) + this.cls.halfWidth * 0.5;
+    return this.network.branchesAt(node.id).length >= 3
+      ? Math.max(JUNCTION_SNAP, blocked)
+      : blocked;
+  }
+
+  /**
    * 既存の線形の `s` 地点が交差点の面の中なら、その交差点のノード。
    *
-   * 面の広がりは敷設の判定と同じ `junctionReach` で測る。指せる所と
-   * 置ける所が同じ範囲になるので、「指せるのに置けない」所ができない。
+   * ここは `junctionSnapRange` ではなく**面の広さそのもの**で測る。広げると
+   * 交差点の近くで線形を分割できなくなり、分岐器のすぐ先に渡り線を作る、
+   * といった引き方ができなくなる。線形から外れた所を指したときの吸い付き
+   * (`junctionUnder`) だけを広げる。
    */
   private junctionAt(segment: SegmentId, s: number): NetNode | null {
     const seg = this.network.getSegment(segment);
@@ -673,7 +771,12 @@ export class BuildTool {
     return null;
   }
 
-  /** カーソルが交差点の面の中にあれば、その交差点のノード。 */
+  /**
+   * カーソルが交差点の吸い付く範囲にあれば、その交差点のノード。
+   *
+   * 候補はいちばん近いものが勝つので、範囲を広げても線形の上 (距離 ≒ 0) の
+   * 分割や平行スナップを奪わない。効くのは「線形から外れた所を指したとき」。
+   */
   private junctionUnder(cursor: Vector3, y: number): { node: NetNode; distance: number } | null {
     let best: { node: NetNode; distance: number } | null = null;
     for (const node of this.network.nodes.values()) {
@@ -681,7 +784,7 @@ export class BuildTool {
       const distance = Math.hypot(node.pos.x - cursor.x, node.pos.z - cursor.z);
       if (distance > 60 || (best && distance >= best.distance)) continue;
       if (!this.canJoin(node)) continue;
-      if (distance > junctionReach(this.network, node.id)) continue;
+      if (distance > this.junctionSnapRange(node)) continue;
       best = { node, distance };
     }
     return best;
@@ -706,7 +809,7 @@ export class BuildTool {
     if (!this.anchor) {
       this.preview = null;
       this.endAnchor = null;
-      this.parallelAlignmentPreview = null;
+      this.parallelRun = [];
       this.showMarkers([target.marker]);
       this.updateElevationGuides([target.anchor.pos]);
       this.updatePreviewMesh();
@@ -722,21 +825,39 @@ export class BuildTool {
       return;
     }
 
-    this.parallelAlignmentPreview = null;
+    this.parallelRun = [];
     let end = target.anchor;
     if (this.modifiers.straight && target.snap === 'none') {
       end = { ...end, pos: this.snapAngle(this.anchor.pos, end.pos) };
     }
 
-    this.endAnchor = end;
     this.preview = computePlacement(this.anchor, end, {
       straight: this.modifiers.straight,
       cls: this.cls,
     });
+    // 掃引角の制限で指した所まで届かないときは、届いた所を終点にして敷く。
+    // 吸い付いていた相手には繋がらないので、その目印も出さない。
+    const short =
+      Math.hypot(this.preview.end.x - end.pos.x, this.preview.end.z - end.pos.z) > REACH_GAP;
+    if (short) {
+      // 高さも**届いた所**で決め直す。カーソルの下の高さのまま伸ばすと、
+      // 届いた所が尾根でも谷でも「指した所の高さ」になり、頼んでいない
+      // 築堤やトンネルができてしまう。高さ設定 (地下・高架) は保つ。
+      const reached = new Vector3(
+        this.preview.end.x,
+        this.field.heightAt(this.preview.end.x, this.preview.end.z) + this.elevationOffset,
+        this.preview.end.z,
+      );
+      this.preview = computePlacement(this.anchor, { pos: reached }, {
+        straight: this.modifiers.straight,
+        cls: this.cls,
+      });
+    }
+    this.endAnchor = reachedAnchor(end, this.preview.end);
     // (角度スナップで位置をずらすのは、どこにも吸い付いていないときだけ
     //  なので、そのときは target.marker が無い。)
-    this.showMarkers([this.anchorMarker, target.marker]);
-    this.updateElevationGuides([this.anchor.pos, end.pos]);
+    this.showMarkers([this.anchorMarker, short ? null : target.marker]);
+    this.updateElevationGuides([this.anchor.pos, this.endAnchor.pos]);
     this.updatePreviewMesh();
   }
 
@@ -759,26 +880,20 @@ export class BuildTool {
   /**
    * 平行スナップのプレビューを組み立てる。
    *
-   * 始点・カーソルをそれぞれ基準線形に投影し、その間を横にずらした線形に
-   * する。カーソルが基準の端を越えたらそこで止まるので、既存の線形の
-   * 区切り (ノード) と同じ位置で区切って敷ける。
+   * 始点の隣からカーソルの隣まで、既存の線形の**ルートをたどって**横に
+   * ずらした線形を並べる。基準の線形の端で止まらないので、途中で分割された
+   * 複線 (橋・踏切・分岐でノードが入っている) の隣も一度に敷ける。区切りは
+   * 基準と同じ位置に入るので、橋・トンネルの境目が隣どうしで揃う。
    */
   private parallelPreview(): boolean {
     const anchor = this.anchor;
     const reference = this.parallel;
     if (!reference || !anchor || !this.network.segments.has(reference.segment)) return false;
 
-    const solve = (ref: ParallelReference): Alignment | null => {
-      const alignment = this.network.alignmentOf(ref.segment);
-      const s0 = stationOf(alignment, anchor.pos.x, anchor.pos.z);
-      const s1 = stationOf(alignment, this.cursor!.x, this.cursor!.z);
-      return parallelAlignment(alignment, s0, s1, ref.offset);
-    };
-
-    let parallel = solve(reference);
-    if (!parallel) {
-      // 基準の端に来ている。引こうとしている向きに続く線形へ乗り換える
-      // (既存の複線を、区切りを跨いで続けて引ける)。
+    let legs = parallelRoute(this.network, this.cls, reference, anchor.pos, this.cursor!);
+    if (legs.length === 0) {
+      // 基準の端に来ていて、そこから先へは繋がっていない。引こうとしている
+      // 向きに並んでいる別の線形へ乗り換える (線形が途切れていても続けられる)。
       const direction = new Vector2(
         this.cursor!.x - anchor.pos.x,
         this.cursor!.z - anchor.pos.z,
@@ -787,19 +902,19 @@ export class BuildTool {
         direction.lengthSq() > 1e-6 ? this.findParallel(anchor.pos, direction.normalize()) : null;
       if (next && next.segment !== reference.segment) {
         this.parallel = next;
-        parallel = solve(next);
+        legs = parallelRoute(this.network, this.cls, next, anchor.pos, this.cursor!);
       }
     }
-    if (!parallel) {
+    if (legs.length === 0) {
       this.preview = null;
       this.endAnchor = null;
-      this.parallelAlignmentPreview = null;
+      this.parallelRun = [];
       this.showMarkers([this.anchorMarker]);
       return true;
     }
 
-    this.parallelAlignmentPreview = parallel;
-    this.preview = previewFromAlignment(parallel);
+    this.parallelRun = legs;
+    this.preview = previewFromAlignments(legs.map((leg) => leg.alignment));
     // 既に敷いてある平行線の端に届いたら、そこへ繋ぐ。
     const node = this.network.findNodeNear(this.preview.end, 2);
     this.endAnchor = node
@@ -809,7 +924,7 @@ export class BuildTool {
     // 何に平行なのか・どこまで来ているのかを目印で出す。
     this.showMarkers([
       this.anchorMarker,
-      this.parallelMarker(this.parallel ?? reference, this.preview.end),
+      this.parallelMarker(legs.flatMap((leg) => leg.references), this.preview.end),
       node && this.canJoin(node) ? this.nodeMarker(node) : null,
     ]);
     return true;
@@ -824,9 +939,8 @@ export class BuildTool {
     return new Vector3(from.x + Math.cos(angle) * len, to.y, from.z + Math.sin(angle) * len);
   }
 
-  /** いま敷こうとしている線形。 */
+  /** いま敷こうとしている線形 (平行スナップでないとき)。 */
   private previewAlignment(preview: PlacementPreview): Alignment {
-    if (this.parallelAlignmentPreview) return this.parallelAlignmentPreview;
     return new Alignment(
       preview.horizontal,
       new VerticalProfile(
@@ -843,6 +957,7 @@ export class BuildTool {
   private updatePreviewMesh(): void {
     const mb = new MeshBuilder();
     const preview = this.preview;
+    this.blockedPlaces = [];
     if (this.mode === 'zone') {
       if (this.cursor) buildZoneBrush(mb, this.cursor, this.field, this.zoneType);
       this.lastDiagnostics = null;
@@ -850,28 +965,72 @@ export class BuildTool {
     } else if (this.mode === 'station' && this.stationCandidate) {
       buildStationPreview(mb, this.stationCandidate);
       this.lastDiagnostics = null;
+    } else if (this.parallelRun.length > 0 && this.anchor) {
+      // 平行に敷く区間は 1 本ずつ独立したセグメントになるので、検査も
+      // 1 本ずつ行う。パネルに出す診断だけは全体をまとめたものにする。
+      const cls = this.cls;
+      const diagnostics: SegmentDiagnostics[] = [];
+      const blockers: string[] = [];
+      // 最初の区間の始点だけは、吸い付いていた相手に繋がる (`placeSegment`
+      // が同じ `reachedAnchor` で端点を決める)。
+      let start: Anchor = reachedAnchor(this.anchor, this.parallelRun[0].alignment.sampleAt(0).pos);
+      for (const [index, leg] of this.parallelRun.entries()) {
+        const alignment = leg.alignment;
+        const at = previewFromAlignment(alignment);
+        const end =
+          index === this.parallelRun.length - 1
+            ? this.endAnchor ?? { pos: at.end }
+            : { pos: at.end };
+        diagnostics.push(evaluateAlignment(alignment, cls));
+        const check = checkPlacement({
+          network: this.network,
+          cls,
+          alignment,
+          start,
+          end,
+          field: this.field,
+        });
+        blockers.push(...check.blockers);
+        this.blockedPlaces.push(...check.places);
+        buildRibbon(mb, alignment.sample(2), profileFor(cls), { skirt: false, cls });
+        start = { pos: at.end.clone() };
+      }
+      this.lastDiagnostics = worstDiagnostics(diagnostics);
+      this.blockers = [...new Set(blockers)];
     } else if (preview && this.anchor) {
       const cls = this.cls;
       const alignment = this.previewAlignment(preview);
       this.lastDiagnostics = evaluateAlignment(alignment, cls);
       // 置けるかどうかはクリック前に分かるようにする。
-      this.blockers = checkPlacement({
+      const check = checkPlacement({
         network: this.network,
         cls,
         alignment,
-        start: this.anchor,
+        // 届かなかった端は接続を諦めて敷くので、判定もその形で行う
+        // (`placeSegment` が同じ `reachedAnchor` で端点を決める)。
+        start: reachedAnchor(this.anchor, preview.start),
         end: this.endAnchor ?? { pos: preview.end },
         field: this.field,
-      }).blockers;
+      });
+      this.blockers = check.blockers;
+      this.blockedPlaces = check.places;
       buildRibbon(mb, alignment.sample(2), profileFor(cls), { skirt: false, cls });
     } else if (this.mode !== 'station') {
       this.lastDiagnostics = null;
       this.blockers = [];
     }
+    // 原因の交差点は目印で示す (文言だけでは、どの交差点の話か分からない)。
+    this.syncMarkers();
     // 置けないときはプレビューを赤くする。
-    setPreviewBlocked({ material: this.previewMaterial }, this.blockers.length > 0);
+    setPreviewBlocked(
+      { preview: this.previewMaterial, xray: this.previewXrayMaterial },
+      this.blockers.length > 0,
+    );
     const old = this.previewMesh.geometry;
-    this.previewMesh.geometry = mb.build();
+    // 透視用の面は同じ形を使い回す (作り直すのは 1 つだけ)。
+    const geometry = mb.build();
+    this.previewMesh.geometry = geometry;
+    this.previewXrayMesh.geometry = geometry;
     old.dispose();
   }
 
@@ -947,8 +1106,11 @@ export class BuildTool {
     if (this.blockers.length > 0) return;
 
     const preview = this.preview;
-    const result = placeSegment(this.network, this.classId, this.anchor, this.endAnchor, preview);
-    this.alignRailDirection(result.segment, result.startNode, result.endNode);
+    const result =
+      this.parallelRun.length > 0
+        ? this.placeParallelRun()
+        : this.place(this.anchor, this.endAnchor, preview);
+    if (!result) return;
 
     // 終点を始点にして続けて引けるようにする。接線は敷設後の線形から
     // 取り直す (折れをなめらかにした分だけ、プレビューとずれるため)。
@@ -964,8 +1126,38 @@ export class BuildTool {
         : null;
     this.preview = null;
     this.endAnchor = null;
-    this.parallelAlignmentPreview = null;
+    this.parallelRun = [];
     this.onChanged();
+  }
+
+  /** 1 本敷いて、線路の向きを揃える。 */
+  private place(start: Anchor, end: Anchor, preview: PlacementPreview): PlaceResult {
+    const result = placeSegment(this.network, this.classId, start, end, preview);
+    this.alignRailDirection(result.segment, result.startNode, result.endNode);
+    return result;
+  }
+
+  /**
+   * ルートに沿った平行区間を、区切りごとに 1 本ずつ敷く。
+   *
+   * 途中の継ぎ目は新しいノードになり、次の区間はそこから続く。基準の線形と
+   * 同じ位置で区切られるので、橋・トンネルの境目や踏切が隣どうしで揃う。
+   * 最後の区間だけは、吸い付いていた相手 (既設の平行線の端など) へ繋ぐ。
+   */
+  private placeParallelRun(): PlaceResult | null {
+    let start = this.anchor!;
+    let result: PlaceResult | null = null;
+    for (const [index, leg] of this.parallelRun.entries()) {
+      const preview = previewFromAlignment(leg.alignment);
+      const end =
+        index === this.parallelRun.length - 1
+          ? this.endAnchor ?? { pos: preview.end }
+          : { pos: preview.end.clone() };
+      result = this.place(start, end, preview);
+      const node = this.network.nodes.get(result.endNode);
+      start = node ? { pos: node.pos.clone(), node: node.id } : { pos: preview.end.clone() };
+    }
+    return result;
   }
 
   /**

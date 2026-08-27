@@ -1,15 +1,26 @@
 import { Vector2, Vector3 } from 'three';
 import { perp } from '../core/curve';
-import { clamp, lerp } from '../core/units';
-import { trackConnectionAlignment } from '../build/rail';
+import { DEG, clamp } from '../core/units';
 import { profileFor, type ProfilePoint } from '../build/surface';
-import {
-  MAX_TURNOUT_ANGLE,
-  STRAIGHT_THROUGH_ANGLE,
-  type NetworkClass,
-  type NetworkKind,
-} from './classes';
+import { STRAIGHT_THROUGH_ANGLE, type NetworkClass, type NetworkKind } from './classes';
+import { MIN_SMOOTHED_DEFLECTION } from './editing';
 import type { Branch, Network, NodeId, SegmentId } from './network';
+
+/**
+ * 線路の交差点は**中身を持たない**。
+ *
+ * 道路の交差点は、枝を引っ込めて (トリムして) 空いた所を舗装で塗る。線路で
+ * 同じことをすると、地形に沿う道床の帯とは別に平らな板が現れ、そこを通る
+ * 軌道の枕木も帯とは揃わない。実物の分岐器は道床が一枚に繋がっていて、
+ * 面のような切れ目はない。
+ *
+ * そこで線路ではトリムを取らず、枝の帯をノードまでそのまま通す。分岐器の
+ * 金物は `buildTurnouts` が帯の上に載せる。帯どうしは分かれ際で重なるが、
+ * これは分岐器の先で必ず起きることで、同じ高さの道床なので見え方は乱れない。
+ *
+ * 引き換えに、**接線で分かれていない分岐は繋げなくなる** (交差点の中で
+ * 振り分ける余地が無くなるため)。それは `railJunctionErrors` で報せる。
+ */
 
 export type JunctionKind =
   | 'end' // 行き止まり
@@ -80,6 +91,12 @@ export interface Junction {
   connections: TrackConnection[];
   /** 警告メッセージ。 */
   warnings: string[];
+  /**
+   * 形として成り立っていない繋ぎ方 (直せないもの)。
+   *
+   * 警告と違って「そのうち直る」ものではないので、severity を分けて出す。
+   */
+  errors: string[];
 }
 
 /** セグメント両端のトリム量。 */
@@ -113,6 +130,9 @@ export function requiredTrims(branches: BranchLike[]): number[] {
   const n = branches.length;
   const trims = new Array<number>(n).fill(0);
   if (n < 2) return trims;
+  // 線路どうしの交差点は中身を作らない (冒頭の説明)。トリムすると、そこだけ
+  // 道床の無い穴になる。
+  if (branches.every((b) => b.cls.kind === 'rail')) return trims;
   const angle = (i: number): number => Math.atan2(branches[i].dir.y, branches[i].dir.x);
   const order = branches.map((_, i) => i).sort((a, b) => angle(a) - angle(b));
   for (let k = 0; k < n; k++) {
@@ -178,19 +198,7 @@ export function solveJunctions(
         updateApproachGeometry(network, ap, heightOffset);
       }
     }
-    let built = buildRings(junction, true);
-    // 軌道に沿わせた縁が交差してしまう配置 (極端に鋭い分岐など) では、
-    // 従来どおり弦で結んだ形に戻す。ねじれた面よりは膨らんだ面のほうがよい。
-    if (built.curved && selfIntersects(built.rings[0] ?? [])) {
-      built = buildRings(junction, false);
-    }
-    // 浅いダイヤモンドクロッシングでは、4本の細長い枝の路端交点が
-    // 方位角順の途中で折り返し、外周だけが蝶ネクタイ状になることがある。
-    // 同じ断面番号を保ったまま外周の凸包順へ揃えると、線路の口を残しつつ
-    // シーサス中央の道床を一枚の乱れない面にできる。
-    if (junction.kind === 'railCrossing' && selfIntersects(built.rings[0] ?? [])) {
-      built = convexifyRings(built);
-    }
+    const built = buildRings(junction);
     junction.rings = built.rings;
     junction.ring = built.rings[0] ?? [];
     junction.openEdge = built.openEdge;
@@ -204,71 +212,6 @@ export function solveJunctions(
   }
 
   return { junctions, trims };
-}
-
-function convexifyRings(built: {
-  rings: Vector3[][];
-  openEdge: boolean[];
-  curved: boolean;
-}): { rings: Vector3[][]; openEdge: boolean[]; curved: boolean } {
-  const outer = built.rings[0] ?? [];
-  if (outer.length < 4) return built;
-  const indices = convexHullIndices(outer);
-  if (indices.length < 3) return built;
-  const n = outer.length;
-  const openEdge = indices.map((a, i) => {
-    const b = indices[(i + 1) % indices.length];
-    if ((a + 1) % n === b) return built.openEdge[a] ?? false;
-    if ((b + 1) % n === a) return built.openEdge[b] ?? false;
-    return false;
-  });
-  return {
-    rings: built.rings.map((ring) => indices.map((index) => ring[index].clone())),
-    openEdge,
-    curved: false,
-  };
-}
-
-/** XZ 平面の凸包。返すのは元配列の添字 (反時計回り)。 */
-function convexHullIndices(points: Vector3[]): number[] {
-  const sorted = points
-    .map((point, index) => ({ point, index }))
-    .sort((a, b) => a.point.x - b.point.x || a.point.z - b.point.z);
-  const unique = sorted.filter(
-    (item, index) =>
-      index === 0 ||
-      Math.hypot(
-        item.point.x - sorted[index - 1].point.x,
-        item.point.z - sorted[index - 1].point.z,
-      ) > 1e-5,
-  );
-  if (unique.length <= 2) return unique.map((item) => item.index);
-  const turn = (a: Vector3, b: Vector3, c: Vector3): number =>
-    (b.x - a.x) * (c.z - a.z) - (b.z - a.z) * (c.x - a.x);
-  const lower: typeof unique = [];
-  for (const item of unique) {
-    while (
-      lower.length >= 2 &&
-      turn(lower[lower.length - 2].point, lower[lower.length - 1].point, item.point) <= 0
-    ) {
-      lower.pop();
-    }
-    lower.push(item);
-  }
-  const upper: typeof unique = [];
-  for (let i = unique.length - 1; i >= 0; i--) {
-    const item = unique[i];
-    while (
-      upper.length >= 2 &&
-      turn(upper[upper.length - 2].point, upper[upper.length - 1].point, item.point) <= 0
-    ) {
-      upper.pop();
-    }
-    upper.push(item);
-  }
-  lower.pop();
-  upper.pop();
-  return [...lower, ...upper].map((item) => item.index);
 }
 
 /** セグメント上の弧長に対する、描画高さの補正 (中心線の上下と横断勾配)。 */
@@ -354,32 +297,13 @@ function solveNode(
   });
 
   const connections = kind === 'railSwitch' || kind === 'railCrossing' || kind === 'seam'
-    ? solveTrackConnections(branches, warnings)
+    ? solveTrackConnections(branches)
     : [];
 
-  // 分岐器は、標準半径で振り分けられるだけの長さを交差点に取り込む。
-  // 短いまま繋ぐと、線路とは思えない急な折れ線になってしまう。
-  // (継ぎ目は交差点面を作らないので、トリムするとそこが穴になる。)
-  for (const conn of kind === 'railSwitch' || kind === 'railCrossing' ? connections : []) {
-    if (conn.deflection < 1e-3) continue;
-    const pair = approaches.filter(
-      (ap) => ap.branch.segment === conn.from || ap.branch.segment === conn.to,
-    );
-    // 分岐側の規格で決める。本線の標準半径を使うと、側線が浅い角度で
-    // 分かれるだけで交差点が何十 m にも膨らんでしまう。
-    const radius = Math.min(...pair.map((ap) => ap.branch.cls.smoothRadius));
-    const tangent = turnoutTangentLength(radius, conn.deflection);
-    for (const ap of pair) ap.trim = Math.max(ap.trim, tangent);
-  }
-
-  const needsMargin = kind === 'intersection' || kind === 'railSwitch' || kind === 'railCrossing';
   for (const ap of approaches) {
     const L = network.alignmentOf(ap.branch.segment).length;
-    // シーサス中央の浅いダイヤモンドは、隣の接線分岐までの短い区間の
-    // 大部分がクロッシングそのものになる。両端の合計は後段で按分するので、
-    // railCrossing だけは片端45%の一般上限より広く使ってよい。
-    const maxTrim = Math.min(L * (kind === 'railCrossing' ? 0.8 : 0.45), 40);
-    if (needsMargin && ap.trim > 1e-3) ap.trim += CORNER_MARGIN;
+    const maxTrim = Math.min(L * 0.45, 40);
+    if (kind === 'intersection' && ap.trim > 1e-3) ap.trim += CORNER_MARGIN;
     if (ap.trim > maxTrim) {
       ap.trim = maxTrim;
       warnings.push('交差点に対してセグメントが短すぎます。形状が乱れる場合があります。');
@@ -403,7 +327,39 @@ function solveNode(
     signalized,
     connections,
     warnings,
+    errors: railJunctionErrors(kind, branches, connections),
   };
+}
+
+/**
+ * 接線で分かれていない線路の分岐を挙げる。
+ *
+ * 線路の交差点には中身が無いので (`CORNER_MARGIN` の下の説明)、折れたまま
+ * 集まった枝はそのまま角として残る。直す手立てが無いので、黙って作らずに
+ * 報せる。2 枝の継ぎ目は `smoothJoint` が均し、残った折れは
+ * `findCurveBreaks` が拾うので、ここでは 3 枝以上だけを見る。
+ */
+function railJunctionErrors(
+  kind: JunctionKind,
+  branches: Branch[],
+  connections: TrackConnection[],
+): string[] {
+  if (kind !== 'railSwitch' && kind !== 'railCrossing') return [];
+  if (branches.length < 3) return [];
+  const out: string[] = [];
+  for (const conn of connections) {
+    if (conn.deflection <= MIN_SMOOTHED_DEFLECTION) continue;
+    out.push(railBranchMessage(conn.deflection));
+  }
+  return [...new Set(out)];
+}
+
+/** 接線で分かれていない分岐の説明文 (置く前も置いた後も同じ文言にする)。 */
+export function railBranchMessage(deflection: number): string {
+  return (
+    `分岐角 ${(deflection / DEG).toFixed(0)}° では線路が繋がりません。` +
+    '分岐は既存の線路の接線に合わせてください。'
+  );
 }
 
 function classifyNode(branches: Branch[], kinds: Set<NetworkKind>): JunctionKind {
@@ -545,14 +501,10 @@ function sectionPoint(
  * する 2 次ベジエで隅丸めを入れる。全てのリングは同じ手順・同じ点数で作る
  * ので、隣り合うリングの間を帯で埋めれば交差点の歩道・縁石まで表現できる。
  */
-function buildRings(
-  junction: Junction,
-  /** 軌道の通る区間の縁を、その曲線に沿わせるか。 */
-  followTracks: boolean,
-): { rings: Vector3[][]; openEdge: boolean[]; curved: boolean } {
+function buildRings(junction: Junction): { rings: Vector3[][]; openEdge: boolean[] } {
   const aps = junction.approaches;
   const n = aps.length;
-  const empty = { rings: [], openEdge: [], curved: false };
+  const empty = { rings: [], openEdge: [] };
   if (n < 2 || junction.kind === 'seam' || junction.kind === 'end') return empty;
   if (aps.every((a) => a.trim < 1e-3)) return empty;
 
@@ -568,11 +520,7 @@ function buildRings(
    * 道路自身の路端がそのまま続く所で、丸めるとその分だけ舗装が欠ける。
    * 路端線の交点をそのまま角に使えば、両側の帯と隙間なく繋がる。
    */
-  const sharpCorner =
-    junction.kind === 'joint' ||
-    junction.kind === 'railSwitch' ||
-    junction.kind === 'railCrossing';
-  let curved = false;
+  const sharpCorner = junction.kind === 'joint';
 
   for (let i = 0; i < n; i++) {
     const cur = aps[i];
@@ -588,17 +536,6 @@ function buildRings(
     const outerA = sideOf(cur, 0, 'next');
     const outerB = sideOf(next, 0, 'prev');
     if (outerA.distanceTo(outerB) <= 0.05) continue;
-
-    // この 2 枝の間を軌道が通り抜けるなら、縁もその曲線に沿わせる。
-    const steps = followTracks ? trackedBoundarySteps(junction, cur, next) : 0;
-    if (steps > 0) {
-      for (let k = 0; k < levels; k++) {
-        rings[k].push(...trackedBoundary(cur, next, k, steps));
-      }
-      for (let t = 1; t < steps; t++) openEdge.push(false);
-      curved = true;
-      continue;
-    }
 
     for (let k = 0; k < levels; k++) {
       const a = sideOf(cur, k, 'next');
@@ -618,68 +555,7 @@ function buildRings(
     openEdge.push(...(sharpCorner ? [false] : [false, false, false]));
   }
 
-  return { ...dedupeRings(rings, openEdge), curved };
-}
-
-/** 曲線に沿わせる縁を何分割するか。0 なら隅の処理に任せる。 */
-const TRACKED_BOUNDARY_SPACING = 5;
-
-/**
- * 隣り合う 2 枝の間を軌道が通り抜けるか。通り抜けるなら分割数を返す。
- *
- * 分岐器の道床を、両端の断面を弦で結んだだけの形にすると、軌道が曲がる
- * ぶんだけ道床が外へ膨らみ、線路が道床の真ん中から外れて見える。分岐の
- * 曲線に沿って縁を刻めば、道床は軌道と同じように曲がる。
- */
-function trackedBoundarySteps(junction: Junction, from: Approach, to: Approach): number {
-  if (junction.kind !== 'railSwitch' && junction.kind !== 'railCrossing') return 0;
-  const conn = junction.connections.find(
-    (c) =>
-      (c.from === from.branch.segment && c.to === to.branch.segment) ||
-      (c.to === from.branch.segment && c.from === to.branch.segment),
-  );
-  // ほぼ直線で繋がる区間は弦との差がないので刻まない。
-  if (!conn || conn.deflection < 2 * (Math.PI / 180)) return 0;
-  const span = from.center.distanceTo(to.center);
-  return clamp(Math.round(span / TRACKED_BOUNDARY_SPACING), 2, 12);
-}
-
-/**
- * 2 枝を繋ぐ軌道の曲線に沿った、道床の縁の点列 (両端は含まない)。
- *
- * 曲線は軌道と同じもの (`trackConnectionAlignment`) を使うので、道床は
- * レールと同じように曲がる。横距と高さは両端の断面から補間するので、
- * 種別の違う枝を繋いでも継ぎ目が開かない。
- */
-function trackedBoundary(from: Approach, to: Approach, k: number, steps: number): Vector3[] {
-  const alignment = trackConnectionAlignment(from, to);
-  const a = sideOf(from, k, 'next');
-  const b = sideOf(to, k, 'prev');
-  if (!alignment) return [];
-
-  // 断面端点を「外向き方向から見た横距」と「中心線からの高さ」に直す。
-  const na = perp(from.dir);
-  const nb = perp(to.dir);
-  const oa = (a.x - from.center.x) * na.x + (a.z - from.center.z) * na.y;
-  const ob = -((b.x - to.center.x) * nb.x + (b.z - to.center.z) * nb.y);
-  const ha = a.y - from.center.y;
-  const hb = b.y - to.center.y;
-
-  const out: Vector3[] = [];
-  for (let i = 1; i < steps; i++) {
-    const t = i / steps;
-    const sample = alignment.sampleAt(t * alignment.length);
-    const offset = lerp(oa, ob, t);
-    // 曲線は from の外向きと逆に進むので、from の「次の枝側」は左手側。
-    out.push(
-      new Vector3(
-        sample.pos.x - sample.right.x * offset,
-        sample.pos.y + lerp(ha, hb, t),
-        sample.pos.z - sample.right.z * offset,
-      ),
-    );
-  }
-  return out;
+  return dedupeRings(rings, openEdge);
 }
 
 /** 断面の外側から `k` 番目の点を、指定した側で取り出す。 */
@@ -782,16 +658,34 @@ function dedupeRings(
  * 直進側のうち向かい合う方へ分岐させる。3 枝なら分岐器、4 枝なら
  * 直進 2 組のダイヤモンドクロッシングになる。
  */
-export function solveTrackConnections(branches: Branch[], warnings: string[]): TrackConnection[] {
-  const n = branches.length;
+export function solveTrackConnections(branches: Branch[]): TrackConnection[] {
+  return pairTrackBranches(branches.map((b) => b.dir)).map((pair) => ({
+    from: branches[pair.i].segment,
+    to: branches[pair.j].segment,
+    // 余り物の枝は、相手が既に別の進路を持っているので分岐側にしかなれない。
+    through: !pair.spare && pair.deflection < STRAIGHT_THROUGH_ANGLE,
+    deflection: pair.deflection,
+  }));
+}
+
+/**
+ * 線路ノードに集まる枝 (外向き方向) を進路の組に分ける。
+ *
+ * 敷設規則も、置く前の枝でこれを解いて分岐角を見る。交差点を解くときと
+ * 同じ組み方なので、「置けたのに繋がっていない」形にはならない。
+ */
+export function pairTrackBranches(
+  dirs: Vector2[],
+): { i: number; j: number; deflection: number; spare: boolean }[] {
+  const n = dirs.length;
   if (n < 2) return [];
   const used = new Set<number>();
-  const conns: TrackConnection[] = [];
+  const out: { i: number; j: number; deflection: number; spare: boolean }[] = [];
 
   const pairs: { i: number; j: number; dot: number }[] = [];
   for (let i = 0; i < n; i++) {
     for (let j = i + 1; j < n; j++) {
-      pairs.push({ i, j, dot: branches[i].dir.dot(branches[j].dir) });
+      pairs.push({ i, j, dot: dirs[i].dot(dirs[j]) });
     }
   }
   // dot が -1 に近いほど一直線。
@@ -799,21 +693,14 @@ export function solveTrackConnections(branches: Branch[], warnings: string[]): T
 
   for (const p of pairs) {
     if (used.has(p.i) || used.has(p.j)) continue;
-    const deflection = Math.PI - Math.acos(clamp(p.dot, -1, 1));
-    const through = deflection < STRAIGHT_THROUGH_ANGLE;
     used.add(p.i);
     used.add(p.j);
-    conns.push({
-      from: branches[p.i].segment,
-      to: branches[p.j].segment,
-      through,
-      deflection,
+    out.push({
+      i: p.i,
+      j: p.j,
+      deflection: Math.PI - Math.acos(clamp(p.dot, -1, 1)),
+      spare: false,
     });
-    if (deflection > MAX_TURNOUT_ANGLE && n > 2) {
-      warnings.push(
-        `分岐角 ${(deflection * (180 / Math.PI)).toFixed(0)}° は分岐器としては急すぎます。`,
-      );
-    }
   }
 
   // 余った枝 (奇数本のとき) は、最も向かい合う既接続の枝へ分岐させる。
@@ -823,26 +710,20 @@ export function solveTrackConnections(branches: Branch[], warnings: string[]): T
     let bestDot = Infinity;
     for (let j = 0; j < n; j++) {
       if (j === i) continue;
-      const d = branches[i].dir.dot(branches[j].dir);
+      const d = dirs[i].dot(dirs[j]);
       if (d < bestDot) {
         bestDot = d;
         best = j;
       }
     }
     if (best < 0) continue;
-    const deflection = Math.PI - Math.acos(clamp(bestDot, -1, 1));
-    conns.push({
-      from: branches[i].segment,
-      to: branches[best].segment,
-      through: false,
-      deflection,
+    out.push({
+      i,
+      j: best,
+      deflection: Math.PI - Math.acos(clamp(bestDot, -1, 1)),
+      spare: true,
     });
-    if (deflection > MAX_TURNOUT_ANGLE) {
-      warnings.push(
-        `分岐角 ${(deflection * (180 / Math.PI)).toFixed(0)}° は分岐器としては急すぎます。`,
-      );
-    }
   }
 
-  return conns;
+  return out;
 }

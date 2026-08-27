@@ -12,7 +12,8 @@ import { VerticalProfile } from '../core/profile';
 import { clamp } from '../core/units';
 import type { NetworkClass, NetworkKind } from './classes';
 import type { PlacementPreview } from './editing';
-import type { Network, SegmentId } from './network';
+import type { Network, NodeId, SegmentId } from './network';
+import { junctionReach } from './rules';
 
 /**
  * 平行スナップ。
@@ -127,13 +128,47 @@ export function parallelAlignment(
   );
 }
 
+/**
+ * 続けて敷く線形をまとめて 1 つの敷設プレビューにする (平行スナップ用)。
+ *
+ * 敷くのは線形ごとに 1 本ずつだが、長さ・最小半径・最大勾配といった
+ * 「いま引いている区間ぜんぶ」の値は、まとめて出さないと意味がない。
+ * 平面曲線は制御点をそのまま繋ぐ (継ぎ目の点は共有する)。
+ */
+export function previewFromAlignments(alignments: readonly Alignment[]): PlacementPreview {
+  if (alignments.length === 1) return previewFromAlignment(alignments[0]);
+  const points: XZ[] = [];
+  for (const a of alignments) {
+    const own = a.horizontal.points;
+    points.push(...(points.length === 0 ? own : own.slice(1)));
+  }
+  const horizontal = new HorizontalCurve(points);
+  const first = alignments[0];
+  const last = alignments[alignments.length - 1];
+  const start = first.sampleAt(0).pos;
+  const end = last.sampleAt(last.length).pos;
+  return {
+    horizontal,
+    start: new Vector3(start.x, start.y, start.z),
+    end: new Vector3(end.x, end.y, end.z),
+    startGrade: first.vertical.m0,
+    endGrade: last.vertical.m1,
+    radius: Math.min(...alignments.map((a) => a.horizontal.extremeCurvature(48).minRadius)),
+    grade: Math.max(...alignments.map((a) => a.vertical.maxGrade(32))),
+    endTangent: last.horizontal.tangentAt(last.length),
+    endCurvature: last.horizontal.curvatureAt(last.length),
+  };
+}
+
 /** 線形をそのまま敷設プレビューにする (平行スナップ用)。 */
 export function previewFromAlignment(alignment: Alignment): PlacementPreview {
   const horizontal = alignment.horizontal;
   const length = horizontal.length;
+  const start = alignment.sampleAt(0).pos;
   const end = alignment.sampleAt(length).pos;
   return {
     horizontal,
+    start: new Vector3(start.x, start.y, start.z),
     end: new Vector3(end.x, end.y, end.z),
     startGrade: alignment.vertical.m0,
     endGrade: alignment.vertical.m1,
@@ -307,6 +342,314 @@ function occupiedSlot(
     if (Math.hypot(dx, dz) < reach) return true;
   }
   return false;
+}
+
+// ---------------------------------------------------- ルートに沿った平行線
+
+/** 平行に敷く区間 1 本ぶん。1 本のセグメントとして敷かれる。 */
+export interface ParallelLeg {
+  /** 基準にした既存セグメント (ふつうは 1 本)。 */
+  references: SegmentId[];
+  /** 横にずらした線形。 */
+  alignment: Alignment;
+}
+
+export interface ParallelRouteOptions {
+  /** たどってよい全長 [m]。 */
+  maxLength?: number;
+  /** たどってよい区間数。 */
+  maxLegs?: number;
+}
+
+/** 既定の追跡上限。1 回のドラッグで敷ける長さと本数を抑える。 */
+const ROUTE_MAX_LENGTH = 1200;
+const ROUTE_MAX_LEGS = 16;
+/** 基準の端を「越えている」と認める距離 [m]。 */
+const ROUTE_BEYOND = 0.5;
+/** 隣の枝へ進んでよい向きの一致度 (cos)。折り返しや急な分岐へは入らない。 */
+const ROUTE_STRAIGHT_COS = 0.3;
+/** 交差点の面をよけるために、その先へ食い込ませてよい長さの上限 [m]。 */
+const ROUTE_CLEARANCE_MAX = 40;
+
+/**
+ * 始点の隣から終点の隣まで、既存の線形の**ルートをたどった**平行線。
+ *
+ * 基準にした線形の端まで来たら、そこで止めずにノードの先へ続ける。既存の
+ * 複線が途中で分割されていても (橋・トンネル・踏切・分岐でノードが入る)、
+ * 端から端まで一度に隣を敷ける。
+ *
+ * 返すのは**区間ごとの線形の列**で、1 本には繋げていない。縦断は区間ごとに
+ * 3 次エルミート 1 本なので、全部まとめると途中の高さを拾えないため。区切りは
+ * 基準と同じ位置に入るので、橋・トンネルの境目が隣どうしで揃う。
+ *
+ * 分岐 (枝が 3 本以上のノード) では、カーソルの向きに最も合う枝へ進む。
+ * ただし来た向きから大きく折れる枝には入らないので、引き返すことはない。
+ */
+export function parallelRoute(
+  network: Network,
+  cls: NetworkClass,
+  reference: ParallelReference,
+  from: Vector3,
+  to: Vector3,
+  options: ParallelRouteOptions = {},
+): ParallelLeg[] {
+  const spans = traceRoute(network, cls, reference, from, to, options);
+  const legs: ParallelLeg[] = [];
+  for (const group of groupSpans(network, cls, spans)) {
+    const alignment = legFromSpans(network, group);
+    if (alignment) legs.push({ references: group.map((span) => span.segment), alignment });
+  }
+  return chainLegs(legs);
+}
+
+/** ルートの 1 区間 (どのセグメントの、どこからどこまでを、どちらへずらすか)。 */
+interface RouteSpan {
+  segment: SegmentId;
+  /** 基準セグメント上の弧長。`s1 < s0` なら基準と逆向きに進む。 */
+  s0: number;
+  s1: number;
+  /** 基準セグメントの弧長方向から見た横距 [m]。 */
+  offset: number;
+  /** この区間の終わりにあるノード (ルートの終端なら null)。 */
+  node: NodeId | null;
+}
+
+/** 既存の線形をたどって、区間の列にする。 */
+function traceRoute(
+  network: Network,
+  cls: NetworkClass,
+  reference: ParallelReference,
+  from: Vector3,
+  to: Vector3,
+  options: ParallelRouteOptions,
+): RouteSpan[] {
+  if (!network.segments.has(reference.segment)) return [];
+  const maxLength = options.maxLength ?? ROUTE_MAX_LENGTH;
+  const maxLegs = options.maxLegs ?? ROUTE_MAX_LEGS;
+
+  const spans: RouteSpan[] = [];
+  const visited = new Set<SegmentId>();
+  let total = 0;
+  let side = 0;
+  let step: RouteStep | null = null;
+
+  for (let guard = 0; guard < maxLegs && total < maxLength; guard++) {
+    const segment: SegmentId = step ? step.segment : reference.segment;
+    if (visited.has(segment)) break;
+    visited.add(segment);
+
+    const alignment = network.alignmentOf(segment);
+    const s0: number = step ? step.s0 : stationOf(alignment, from.x, from.z);
+    const target = stationOf(alignment, to.x, to.z);
+    // 最初の区間だけは、始点とカーソルの投影の前後関係で向きが決まる。
+    const forward: boolean = step ? step.forward : target >= s0;
+    const exit: number = forward ? alignment.length : 0;
+    // 「進む向きの右手が正」で測った敷く側。区間をまたいでも変わらない。
+    if (side === 0) side = (reference.offset >= 0 ? 1 : -1) * (forward ? 1 : -1);
+
+    const spacing = parallelSpacing(cls, network.classOf(network.getSegment(segment)));
+    const offset = side * spacing * (forward ? 1 : -1);
+    const beyond: boolean =
+      Math.abs(target - exit) < ROUTE_BEYOND && aheadOfEnd(alignment, exit, forward, to);
+    const next: RouteStep | null = beyond
+      ? nextStep(network, cls, segment, alignment, exit, forward, to, visited)
+      : null;
+    const seg = network.getSegment(segment);
+    spans.push({
+      segment,
+      s0,
+      s1: beyond ? exit : target,
+      offset,
+      node: next ? (forward ? seg.b : seg.a) : null,
+    });
+    total += Math.abs((beyond ? exit : target) - s0);
+    if (!next) break;
+    step = next;
+  }
+
+  // 長さ 0 の区間 (端ぴったりから引き始めたとき) は捨てる。
+  return spans.filter((span, i) => Math.abs(span.s1 - span.s0) >= 1 || i === spans.length - 1);
+}
+
+/** ルートの次の区間 (どのセグメントへ、どちら向きに入るか)。 */
+interface RouteStep {
+  segment: SegmentId;
+  s0: number;
+  forward: boolean;
+}
+
+/** カーソルが、その端より先まで来ているか。 */
+function aheadOfEnd(
+  alignment: Alignment,
+  exit: number,
+  forward: boolean,
+  to: Vector3,
+): boolean {
+  const sample = alignment.sampleAt(exit);
+  const sign = forward ? 1 : -1;
+  const along =
+    (to.x - sample.pos.x) * sample.forwardXZ.x * sign +
+    (to.z - sample.pos.z) * sample.forwardXZ.y * sign;
+  return along > ROUTE_BEYOND;
+}
+
+/**
+ * 端のノードから続く枝を選ぶ。
+ *
+ * カーソルの向きに最も合う枝へ進む (分岐でどちらへ行きたいかは、指している
+ * 所が決める)。ただし来た向きから大きく折れる枝は候補にしない。駅の構内線
+ * にも入らない — 駅の脇に線路をもう 1 本足すのは、ホームを増やす操作とは
+ * 別のことなので。
+ */
+function nextStep(
+  network: Network,
+  cls: NetworkClass,
+  segment: SegmentId,
+  alignment: Alignment,
+  exit: number,
+  forward: boolean,
+  to: Vector3,
+  visited: ReadonlySet<SegmentId>,
+): RouteStep | null {
+  const seg = network.getSegment(segment);
+  const nodeId = forward ? seg.b : seg.a;
+  const node = network.nodes.get(nodeId);
+  if (!node) return null;
+
+  const tangent = alignment.horizontal.tangentAt(exit);
+  const inDir = forward ? tangent.clone() : tangent.clone().negate();
+  const toCursor = new Vector2(to.x - node.pos.x, to.z - node.pos.z);
+  if (toCursor.lengthSq() > 1e-6) toCursor.normalize();
+  else toCursor.copy(inDir);
+
+  let best: { segment: SegmentId; atStart: boolean } | null = null;
+  let bestScore = -Infinity;
+  for (const branch of network.branchesAt(nodeId)) {
+    if (branch.segment === segment || visited.has(branch.segment)) continue;
+    if (branch.cls.kind !== cls.kind) continue;
+    if (network.getSegment(branch.segment).stationTrack !== undefined) continue;
+    if (branch.dir.dot(inDir) < ROUTE_STRAIGHT_COS) continue;
+    const score = branch.dir.dot(toCursor);
+    if (score > bestScore) {
+      bestScore = score;
+      best = { segment: branch.segment, atStart: branch.atStart };
+    }
+  }
+  if (!best) return null;
+  const next = network.alignmentOf(best.segment);
+  return { segment: best.segment, s0: best.atStart ? 0 : next.length, forward: best.atStart };
+}
+
+/**
+ * 区間をセグメント 1 本ぶんずつのまとまりに分ける。
+ *
+ * ふつうは基準の区切り (ノード) がそのまま区切りになる。ただし**交差点の
+ * ノード**の真横で区切ると、そこにできる端点が交差点の面の中に入ってしまい
+ * 敷けない。そういう所では区切らずに、面から出た所まで次の区間へ食い込ませる。
+ */
+function groupSpans(network: Network, cls: NetworkClass, spans: RouteSpan[]): RouteSpan[][] {
+  const groups: RouteSpan[][] = [];
+  const rest = [...spans];
+  let current: RouteSpan[] = [];
+
+  for (let i = 0; i < rest.length; i++) {
+    const span = rest[i];
+    current.push(span);
+    if (span.node === null) break;
+
+    const need = clearanceAt(network, cls, span.node, Math.abs(span.offset));
+    if (need <= 0) {
+      groups.push(current);
+      current = [];
+      continue;
+    }
+    const next = rest[i + 1];
+    if (!next) break;
+    const room = Math.abs(next.s1 - next.s0);
+    // 次の区間ごと飲み込んでしまうなら、その先の区切りで切る。
+    if (room <= need + 1) continue;
+    const cut = next.s0 + Math.sign(next.s1 - next.s0) * need;
+    current.push({ ...next, s1: cut, node: null });
+    groups.push(current);
+    current = [];
+    rest[i + 1] = { ...next, s0: cut };
+  }
+
+  if (current.length > 0) groups.push(current);
+  return groups;
+}
+
+/**
+ * その交差点の面から出るのに、ノードの先へどれだけ進めばよいか [m]。
+ *
+ * 平行線はもともと横に `lateral` [m] 離れているので、面の広がりがそれより
+ * 小さければ進まなくてよい。判定は敷設の規則 (`checkJunctionSpacing`) と
+ * 同じ半径を見るので、通した所は必ず置ける。
+ */
+function clearanceAt(
+  network: Network,
+  cls: NetworkClass,
+  node: NodeId,
+  lateral: number,
+): number {
+  const reach = junctionReach(network, node) + cls.halfWidth * 0.5 + 1;
+  if (reach <= lateral) return 0;
+  return Math.min(Math.sqrt(reach * reach - lateral * lateral), ROUTE_CLEARANCE_MAX);
+}
+
+/** まとまりを 1 本の線形にする。 */
+function legFromSpans(network: Network, group: RouteSpan[]): Alignment | null {
+  const parts: Alignment[] = [];
+  for (const span of group) {
+    const part = parallelAlignment(network.alignmentOf(span.segment), span.s0, span.s1, span.offset);
+    if (part) parts.push(part);
+  }
+  if (parts.length === 0) return null;
+  if (parts.length === 1) return parts[0];
+
+  // 交差点の面をよけるために繋いだ区間。平面は制御点をそのまま繋ぎ、縦断は
+  // 両端の高さと勾配で 1 本の 3 次エルミートにする (基準の縦断は繋ぎ目で
+  // 勾配が揃えてあるので、途中の高さもほぼそのままなぞる)。
+  const points: XZ[] = [];
+  let at: XZ | null = null;
+  for (const part of parts) {
+    const own = part.horizontal.points.map((p) => p.clone());
+    if (at) own[0] = at.clone();
+    points.push(...(points.length === 0 ? own : own.slice(1)));
+    at = part.horizontal.pointAt(part.length);
+  }
+  const horizontal = new HorizontalCurve(points);
+  const first = parts[0].vertical;
+  const last = parts[parts.length - 1].vertical;
+  return new Alignment(
+    horizontal,
+    new VerticalProfile(first.y0, last.y1, first.m0, last.m1, horizontal.length),
+  );
+}
+
+/**
+ * 区間どうしの継ぎ目を閉じる。
+ *
+ * 基準の線形がノードで少しでも折れていると、その前後の区間は**それぞれの
+ * 接線に直角**にずれるので、平行線の端がわずかに食い違う。敷くときは前の
+ * 区間の終点ノードにそのまま繋がるので、プレビューもそこへ寄せておく。
+ */
+function chainLegs(legs: ParallelLeg[]): ParallelLeg[] {
+  for (let i = 1; i < legs.length; i++) {
+    const before = legs[i - 1].alignment;
+    const at = before.horizontal.pointAt(before.length);
+    legs[i] = { ...legs[i], alignment: withStart(legs[i].alignment, at, before.vertical.y1) };
+  }
+  return legs;
+}
+
+/** 始点を差し替えた線形。 */
+function withStart(alignment: Alignment, at: XZ, y: number): Alignment {
+  const points = alignment.horizontal.points.map((p) => p.clone());
+  points[0] = at.clone();
+  const horizontal = new HorizontalCurve(points);
+  const v = alignment.vertical;
+  return new Alignment(horizontal, new VerticalProfile(y, v.y1, v.m0, v.m1, horizontal.length));
 }
 
 // ------------------------------------------------------------ 平行な組

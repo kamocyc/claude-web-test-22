@@ -44,7 +44,8 @@ import {
   type SurfacePath,
 } from '../build/markings';
 import { buildBuilding, buildZoneGrid } from '../build/buildings';
-import { buildCatenary, buildTrack, buildTrackConnection } from '../build/rail';
+import { buildCatenary, buildTrack } from '../build/rail';
+import { TURNOUT_STEP, buildTurnouts, reverseSamples } from '../build/turnout';
 import { buildStation, createStationLabels, stationFootprint } from '../build/station';
 import { computeCant, type CantProfile } from '../build/cant';
 import {
@@ -72,7 +73,6 @@ import {
   gradingSectionPoints,
   junctionGradingDrop,
   profileFor,
-  surfaceHeightAt,
   type RGB,
 } from '../build/surface';
 import { getClass, type NetworkClass } from '../network/classes';
@@ -1155,6 +1155,27 @@ export class WorldBuilder {
     return this.cant.get(segment)?.(s) ?? 0;
   }
 
+  /**
+   * 枝のセグメントを、ノードから外向きに `distance` [m] たどった点列。
+   *
+   * 接線で分かれる分岐器 (交差点のトリムが 0) では、分岐器の造作は交差点の
+   * 中ではなく枝そのものの上に載る。レールを描くのに使ったのと同じ線形・
+   * 同じカントでたどらないと、造作だけがレールから浮いてしまう。
+   */
+  private railPathOutward(approach: Approach, distance: number): AlignmentSample[] {
+    const segment = approach.branch.segment;
+    const alignment = this.network.alignmentOf(segment);
+    // 枝がノードに付いている端から、反対の端へ向かってたどる。
+    const atStart = approach.branch.atStart;
+    const from = atStart ? approach.trim : alignment.length - approach.trim;
+    const to = clamp(atStart ? from + distance : from - distance, 0, alignment.length);
+    const samples = this.withCant(
+      alignmentSamplesInRange(alignment, Math.min(from, to), Math.max(from, to), TURNOUT_STEP),
+      segment,
+    );
+    return atStart ? samples : reverseSamples(samples);
+  }
+
   /** 描画に使った高さ (踏切の補正込み) で線形をたどる経路。標示用。 */
   private surfacePath(segment: SegmentId): SurfacePath {
     const alignment = this.network.alignmentOf(segment);
@@ -1674,6 +1695,9 @@ export class WorldBuilder {
     for (const message of junction.warnings) {
       warnings.push({ message, position: node.pos.clone(), severity: 'warning' });
     }
+    for (const message of junction.errors) {
+      warnings.push({ message, position: node.pos.clone(), severity: 'error' });
+    }
 
     if (junction.kind === 'intersection') stats.intersections++;
     if (junction.kind === 'railSwitch' && junction.approaches.length >= 3) stats.turnouts++;
@@ -1681,14 +1705,16 @@ export class WorldBuilder {
     const cls = junction.approaches[0]?.branch.cls;
     if (!cls) return;
 
-    buildJunctionSurface(
-      surface,
-      junction.rings,
-      cls,
-      junction.openEdge,
-      (x, z) => this.field.heightAt(x, z),
-      tint,
-    );
+    if (cls.kind !== 'rail') {
+      buildJunctionSurface(
+        surface,
+        junction.rings,
+        cls,
+        junction.openEdge,
+        (x, z) => this.field.heightAt(x, z),
+        tint,
+      );
+    }
 
     // 高い所にある交差点には床版と橋脚を付ける。付けないと路面だけが宙に浮く。
     const terrain = this.field.baseHeightAt(node.pos.x, node.pos.z);
@@ -1717,17 +1743,13 @@ export class WorldBuilder {
     }
 
     if (cls.kind === 'rail') {
-      // 交差点面 (道床天端) は、いちばん内側のリングを塗ったもの。
-      const ballast = junction.rings[junction.rings.length - 1];
-      const ballastY =
-        ballast && ballast.length >= 3
-          ? (x: number, z: number): number | null => surfaceHeightAt(ballast, x, z)
-          : undefined;
-      for (const connection of junction.connections) {
-        const from = junction.approaches.find((a) => a.branch.segment === connection.from);
-        const to = junction.approaches.find((a) => a.branch.segment === connection.to);
-        if (from && to) buildTrackConnection(structure, from, to, connection.through, { ballastY });
-      }
+      // 線路の交差点には面も中身も無く、枝の帯がノードまで通っている。
+      // その帯の上に、分岐器の金物だけを載せる。
+      buildTurnouts(structure, junction, {
+        branchPath: (approach, distance) => this.railPathOutward(approach, distance),
+        canPlace: (x, z, y) =>
+          this.canPlaceProp(x, z, y, junction.approaches.map((a) => a.branch.segment)),
+      });
       return;
     }
 

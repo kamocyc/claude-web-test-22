@@ -7,5 +7,9 @@ export default defineConfig({
   test: {
     environment: 'node',
     include: ['test/**/*.test.ts'],
+    // 既定は「コア数 - 1」だが、テストはどれも CPU を使い切る計算なので、
+    // 空けておいた 1 コアはただ遊んでいる。コア数ぶん動かすと全体で 1 割
+    // 短くなる (それ以上に増やしても縮まない)。
+    maxWorkers: '100%',
   },
 });

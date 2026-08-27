@@ -313,7 +313,8 @@ function solve(
   let kappa = Math.abs(k1) < 1e-9 ? 1e-9 * Math.sign(Y || 1) : k1;
   let Ls = lsFor(kappa);
   // 真後ろを指すと掃引角が 2π 近くになるので、円曲線の長さに頭を打たせる
-  // (規則の「指した所まで届きません」が受け止める)。
+  // (指した所まで届かない解になるが、敷設は届いた所で切る。
+  //  `reachedAnchor` を参照)。
   const lcMax = Math.max(2 * chordLen, 50);
   let Lc = clamp((sweep - ((k0 + kappa) / 2) * Ls) / kappa, 0, lcMax);
 

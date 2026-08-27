@@ -6,6 +6,7 @@ import { Ui } from './app/ui';
 import { Viewport } from './app/viewport';
 import { Network } from './network/network';
 import { createTerrainMaterial } from './render/materials';
+import { SnapView } from './render/snapView';
 import { WorldBuilder } from './render/worldBuilder';
 import { DEFAULT_TERRAIN, generateTerrain } from './terrain/generator';
 import { Heightfield } from './terrain/heightfield';
@@ -111,7 +112,33 @@ const ui = new Ui(uiRoot, {
     tool.cancel();
     dirty = true;
   },
+  onFocus: (position) => focusOn(position),
 });
+
+// ---------------------------------------------------------------- 警告から飛ぶ
+
+/** 警告から飛んだ先を光らせる目印。敷設の目印と同じ描き方を使う。 */
+const focusView = new SnapView('warning-focus');
+viewport.scene.add(focusView.group);
+/** 目印を消す時刻 (`performance.now()` の値)。 */
+let focusUntil = 0;
+/** 目印を出しておく時間 [s]。視点が着いてから見つけられるだけ残す。 */
+const FOCUS_SECONDS = 6;
+
+/**
+ * その場所へ視点を移し、輪で囲って示す。
+ *
+ * 警告の文言だけでは「どこの話なのか」が分からない。一覧の行から呼ばれる。
+ */
+function focusOn(position: Vector3): void {
+  viewport.panTo(position);
+  focusUntil = performance.now() + FOCUS_SECONDS * 1000;
+  // 引いた視点からでも見つけられる大きさにする (画面に対して同じ大きさ)。
+  const radius = Math.max(8, viewport.viewDistance * 0.06);
+  focusView.update([
+    { kind: 'focus', pos: position.clone(), radius, width: Math.max(1.5, radius * 0.14) },
+  ]);
+}
 
 function setMode(mode: ToolMode): void {
   // ツールを使うなら乗車モードから降りる (敷設中は俯瞰でないと使えない)。
@@ -232,6 +259,54 @@ let cursor: Vector3 | null = null;
  */
 const pick = (): Vector3 | null => viewport.pick([...terrainMesh.meshes, world.surfaceMesh]);
 const modifiers = { straight: false, noSnap: false };
+
+/**
+ * WASD で押されている向き (画面の奥 / 右)。
+ *
+ * W = 画面の奥、S = 手前、A = 左、D = 右。押している間ずっと動かすので、
+ * キーの上げ下げだけを覚えておき、実際の移動はフレームごとに行う。
+ */
+const PAN_KEYS: Record<string, { forward: number; right: number }> = {
+  w: { forward: 1, right: 0 },
+  s: { forward: -1, right: 0 },
+  a: { forward: 0, right: -1 },
+  d: { forward: 0, right: 1 },
+};
+const heldPanKeys = new Set<string>();
+/**
+ * 1 秒あたりに動く距離 (視点までの距離に対する比)。
+ *
+ * 距離に比例させると、引いて地図を眺めているときは大きく、寄って
+ * 敷いているときは細かく動く。画面に映る範囲に対しては同じ速さになる。
+ */
+const PAN_SPEED = 0.8;
+/**
+ * 1 フレームで進める時間の上限 [s]。
+ *
+ * 描画が詰まった直後の 1 フレームは dt が大きく、そのぶんを一度に動かすと
+ * 視点が飛んでしまう。押している間の速さは変わらないので、詰まった時間の
+ * ぶんだけ進みが遅れるだけで済む。
+ */
+const PAN_MAX_STEP = 0.1;
+
+/** 押されている WASD のぶんだけ視点を平行移動する。 */
+function updateKeyboardPan(dt: number): void {
+  if (heldPanKeys.size === 0 || ride.active || ride.aiming) return;
+  // 自分で動かし始めたら、警告から飛んでいる途中でもそこで止める。
+  viewport.cancelPan();
+  let forward = 0;
+  let right = 0;
+  for (const key of heldPanKeys) {
+    const dir = PAN_KEYS[key];
+    forward += dir.forward;
+    right += dir.right;
+  }
+  // 斜めが速くならないように正規化する。
+  const length = Math.hypot(forward, right);
+  if (length < 1e-6) return;
+  const step = (viewport.viewDistance * PAN_SPEED * Math.min(dt, PAN_MAX_STEP)) / length;
+  viewport.panScreen(forward * step, right * step);
+}
 let pointerDownAt: { x: number; y: number; time: number } | null = null;
 /** 乗車中に見回すときの感度 [rad/px]。 */
 const LOOK_SENSITIVITY = 0.004;
@@ -261,6 +336,8 @@ canvas.addEventListener('pointerdown', (event) => {
     canvas.setPointerCapture(event.pointerId);
     return;
   }
+  // 視点を触ったら、警告から飛んでいる途中でもそこで止める。
+  viewport.cancelPan();
   if (event.button === 0) {
     pointerDownAt = { x: event.clientX, y: event.clientY, time: performance.now() };
   }
@@ -292,6 +369,12 @@ canvas.addEventListener('contextmenu', (event) => event.preventDefault());
 
 window.addEventListener('keydown', (event) => {
   if (isTextControl(event.target)) return;
+  const panKey = event.key.toLowerCase();
+  if (panKey in PAN_KEYS && !event.ctrlKey && !event.metaKey && !event.altKey) {
+    heldPanKeys.add(panKey);
+    event.preventDefault();
+    return;
+  }
   switch (event.key) {
     case 'Escape':
       if (ride.active || ride.aiming) stopRide();
@@ -323,8 +406,8 @@ window.addEventListener('keydown', (event) => {
     case 'B':
       setMode('build');
       break;
-    case 's':
-    case 'S':
+    case 't':
+    case 'T':
       setMode('station');
       break;
     case 'z':
@@ -356,10 +439,15 @@ window.addEventListener('keydown', (event) => {
 });
 
 window.addEventListener('keyup', (event) => {
+  heldPanKeys.delete(event.key.toLowerCase());
   if (isTextControl(event.target)) return;
   if (event.key === 'Shift') modifiers.straight = false;
   if (event.key === 'Control' || event.key === 'Meta') modifiers.noSnap = false;
 });
+
+// 画面から離れている間のキーの上げ下げは届かない。押しっぱなしのまま
+// 動き続けないよう、戻ってきたら忘れる。
+window.addEventListener('blur', () => heldPanKeys.clear());
 
 function isTextControl(target: EventTarget | null): boolean {
   return (
@@ -391,6 +479,12 @@ function frame(): void {
       ride.hover(world.traffic.vehicles, viewport.ray(), cursor)?.id ?? null;
   }
 
+  updateKeyboardPan(dt);
+  // 警告の目印は、しばらくしたら自分で消える。
+  if (focusUntil > 0 && now >= focusUntil) {
+    focusUntil = 0;
+    focusView.update([]);
+  }
   world.animate(time, dt);
   // 乗車モードのカメラは、車両を進めたあとに置く (1 フレーム遅れないように)。
   const riding = ride.update(world.traffic.vehicles, dt);

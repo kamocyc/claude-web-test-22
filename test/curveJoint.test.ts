@@ -117,7 +117,7 @@ describe('継ぎ目の平面線形', () => {
     const network = chain('rail_single', [new Vector3(0, 0, 0), new Vector3(200, 0, 0)]);
     const end = network.findNodeNear(new Vector3(200, 0, 0), 1)!;
     const anchor = anchorFromNode(network, end, cls);
-    // 半径 75 m ぶんの曲がり (最小半径 70 m より緩く、標準半径より急)。
+    // 半径 75 m ぶんの曲がり (最小半径 50 m より緩く、標準半径より急)。
     const target = new Vector3(260, 0, -30);
     const preview = computePlacement(anchor, target, { straight: false, cls });
     expect(preview.radius).toBeLessThan(cls.smoothRadius);

@@ -1,12 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { Mesh, MeshBasicMaterial, Vector2, Vector3 } from 'three';
-import { surfaceHeightAt } from '../src/build/surface';
-import { trackConnectionAlignment } from '../src/build/rail';
+import { Mesh, MeshBasicMaterial, Vector3 } from 'three';
+import { SLEEPER_COLOR, SLEEPER_PITCH } from '../src/build/rail';
 import { SURFACE_LIFT } from '../src/core/units';
 import { getClass } from '../src/network/classes';
 import { anchorFromNode, computePlacement, placeSegment, type Anchor } from '../src/network/editing';
 import { Network } from '../src/network/network';
-import { solveJunctions, type Junction } from '../src/network/junction';
+import type { Junction } from '../src/network/junction';
 import { WorldBuilder } from '../src/render/worldBuilder';
 import { DEFAULT_TERRAIN, generateTerrain } from '../src/terrain/generator';
 import { Heightfield } from '../src/terrain/heightfield';
@@ -14,14 +13,20 @@ import { TerrainMesh } from '../src/terrain/terrainMesh';
 import { testField } from './support/field';
 
 /** 建設ツールと同じ手順で線形を引く (経由点は絶対座標)。 */
-function draw(network: Network, classId: string, points: Vector3[]): void {
+function draw(
+  network: Network,
+  classId: string,
+  points: Vector3[],
+  options: { straight?: boolean } = {},
+): void {
   const cls = getClass(classId);
+  const straight = options.straight ?? true;
   const existing = network.findNodeNear(points[0], 3);
   let anchor: Anchor = existing
     ? anchorFromNode(network, existing, cls)
     : { pos: points[0].clone() };
   for (let i = 1; i < points.length; i++) {
-    const preview = computePlacement(anchor, points[i], { straight: true, cls });
+    const preview = computePlacement(anchor, points[i], { straight, cls });
     const result = placeSegment(network, classId, anchor, { pos: points[i].clone() }, preview);
     const endNode = network.nodes.get(result.endNode);
     if (!endNode) break;
@@ -32,23 +37,6 @@ function draw(network: Network, classId: string, points: Vector3[]): void {
       grade: preview.endGrade,
     };
   }
-}
-
-/** 直線のセグメントを 1 本足す (端点は近ければ既存ノードに繋ぐ)。 */
-function addStraight(network: Network, classId: string, a: Vector3, b: Vector3): void {
-  const na = network.findNodeNear(a, 0.5) ?? network.addNode(a);
-  const nb = network.findNodeNear(b, 0.5) ?? network.addNode(b);
-  const p0 = new Vector2(a.x, a.z);
-  const p1 = new Vector2(b.x, b.z);
-  network.addSegment({
-    classId,
-    a: na.id,
-    b: nb.id,
-    ctrlA: p0.clone().lerp(p1, 1 / 3),
-    ctrlB: p0.clone().lerp(p1, 2 / 3),
-    gradeA: 0,
-    gradeB: 0,
-  });
 }
 
 function makeWorld(build: (network: Network, field: Heightfield) => void) {
@@ -211,20 +199,24 @@ describe('踏切', () => {
 });
 
 describe('線路の分岐', () => {
-  /** 本線を引き、その中ほどのノードから浅い角度で分岐させる。 */
-  function switchScene(mainGrade: number, branchGrade: number) {
+  /**
+   * 本線を引き、その中ほどのノードから分岐させる。
+   *
+   * 線路の分岐は接線に沿ってしか作れない (`checkPlacement`) ので、
+   * 分岐側は接線を引き継いで引く。
+   */
+  function switchScene() {
     return makeWorld((network) => {
       draw(network, 'rail_single', [
         new Vector3(-260, 40, 0),
-        new Vector3(0, 40 + mainGrade * 260, 0),
-        new Vector3(260, 40 + mainGrade * 520, 0),
+        new Vector3(0, 40, 0),
+        new Vector3(260, 40, 0),
       ]);
-      const node = network.findNodeNear(new Vector3(0, 40 + mainGrade * 260, 0), 5);
+      const node = network.findNodeNear(new Vector3(0, 40, 0), 5);
       if (!node) throw new Error('分岐元のノードが見つかりません');
-      draw(network, 'rail_yard', [
-        node.pos.clone(),
-        new Vector3(240, node.pos.y + branchGrade * 250, 70),
-      ]);
+      draw(network, 'rail_yard', [node.pos.clone(), new Vector3(240, node.pos.y, 70)], {
+        straight: false,
+      });
     });
   }
 
@@ -234,233 +226,55 @@ describe('線路の分岐', () => {
     );
   }
 
-  it('分岐器の中の軌道が、枝の勾配をそのまま引き継ぐ', () => {
-    const scene = switchScene(0.02, -0.015);
-    const junctions = switchJunctions(scene);
-    expect(junctions.length).toBe(1);
-
-    let checked = 0;
-    for (const junction of junctions) {
-      for (const conn of junction.connections) {
-        const from = junction.approaches.find((a) => a.branch.segment === conn.from)!;
-        const to = junction.approaches.find((a) => a.branch.segment === conn.to)!;
-        const alignment = trackConnectionAlignment(from, to);
-        expect(alignment).not.toBeNull();
-        checked++;
-        // 接続曲線は from の外向きと逆に進むので、始点の勾配は符号が反転する。
-        expect(alignment!.vertical.gradeAt(0)).toBeCloseTo(-from.outwardGrade, 6);
-        expect(alignment!.vertical.gradeAt(alignment!.length)).toBeCloseTo(to.outwardGrade, 6);
-        // 枝の勾配は、実際の線形から測ったものと一致していること。
-        const branchAlignment = scene.network.alignmentOf(from.branch.segment);
-        const s = from.branch.atStart
-          ? from.trim
-          : branchAlignment.length - from.trim;
-        const grade = branchAlignment.sampleAt(s).grade;
-        expect(from.outwardGrade).toBeCloseTo(from.branch.atStart ? grade : -grade, 6);
-      }
-    }
-    expect(checked).toBeGreaterThanOrEqual(2);
-  });
-
-  it('分岐器の中の曲線が、規格の最小半径を大きく下回らない', () => {
-    const scene = switchScene(0.01, -0.01);
-    const junctions = switchJunctions(scene);
-    expect(junctions.length).toBe(1);
-
-    for (const junction of junctions) {
-      for (const conn of junction.connections) {
-        const from = junction.approaches.find((a) => a.branch.segment === conn.from)!;
-        const to = junction.approaches.find((a) => a.branch.segment === conn.to)!;
-        const alignment = trackConnectionAlignment(from, to)!;
-        const { minRadius } = alignment.horizontal.extremeCurvature(48);
-        const required = Math.min(from.branch.cls.minRadius, to.branch.cls.minRadius);
-        expect(minRadius).toBeGreaterThan(required * 0.8);
-      }
-    }
-  });
-
-  it('高低差のある分岐でも、レールが交差点の道床に埋まらない', () => {
-    for (const [mainGrade, branchGrade] of [
-      [0.02, -0.015],
-      [-0.025, 0.015],
-      [0.03, 0.02],
-    ]) {
-      const scene = switchScene(mainGrade, branchGrade);
-      const junctions = switchJunctions(scene);
-      expect(junctions.length).toBe(1);
-      const structures = scene.meshes.get('structures')!;
-
-      for (const junction of junctions) {
-        const ballast = junction.rings[junction.rings.length - 1];
-        expect(ballast.length).toBeGreaterThan(3);
-        let checked = 0;
-        const problems: string[] = [];
-        for (const conn of junction.connections) {
-          const from = junction.approaches.find((a) => a.branch.segment === conn.from)!;
-          const to = junction.approaches.find((a) => a.branch.segment === conn.to)!;
-          const alignment = trackConnectionAlignment(from, to)!;
-          for (let i = 1; i < 20; i++) {
-            const sample = alignment.sampleAt((alignment.length * i) / 20);
-            const surface = surfaceHeightAt(ballast, sample.pos.x, sample.pos.z);
-            if (surface === null) continue;
-            const rail = highestVertexNear(
-              structures,
-              sample.pos.x,
-              sample.pos.z,
-              1.1,
-              sample.pos.y + 1,
-            );
-            if (rail.count === 0) continue;
-            checked++;
-            // レールは道床の上に出ていること (レール高 0.15 m の半分以上)。
-            if (rail.y < surface + 0.1) {
-              problems.push(
-                `${mainGrade}/${branchGrade}: レール頭頂面が道床の ${(
-                  surface - rail.y
-                ).toFixed(3)} m 下`,
-              );
-            }
-          }
-        }
-        expect(checked).toBeGreaterThan(20);
-        expect(problems).toEqual([]);
-      }
-    }
-  });
-
   /**
-   * 分岐器の道床は、通り抜ける軌道と同じように曲がっていなければならない。
-   *
-   * 両端の断面を弦で結んだだけの形にすると、曲線のふくらみの分だけ道床が
-   * 外へ張り出し、線路が道床の真ん中から外れて見える。
+   * 線路の交差点には中身が無い。トリムして空いた所を別の面で塗ると、地形に
+   * 沿う道床の帯とは別の平らな板が現れ、そこを通る軌道の枕木も帯と揃わない。
    */
-  it('分岐器の道床が軌道に沿って曲がる (弦で結んだ形にならない)', () => {
-    const scene = switchScene(0, 0);
+  it('交差点の面を作らず、帯をノードまで通す', () => {
+    const scene = switchScene();
     const junctions = switchJunctions(scene);
-    expect(junctions.length).toBe(1);
+    expect(junctions).toHaveLength(1);
     const junction = junctions[0];
-
-    // 交差点の中を通る全ての軌道と、取り付く枝の中心線。
-    const paths: { points: Vector3[]; halfWidth: number }[] = [];
-    for (const conn of junction.connections) {
-      const from = junction.approaches.find((a) => a.branch.segment === conn.from)!;
-      const to = junction.approaches.find((a) => a.branch.segment === conn.to)!;
-      const alignment = trackConnectionAlignment(from, to)!;
-      const points: Vector3[] = [];
-      for (let i = 0; i <= 60; i++) points.push(alignment.sampleAt((alignment.length * i) / 60).pos);
-      paths.push({
-        points,
-        halfWidth: Math.max(from.branch.cls.halfWidth, to.branch.cls.halfWidth),
-      });
+    expect(junction.rings).toEqual([]);
+    expect(junction.ring).toEqual([]);
+    for (const ap of junction.approaches) {
+      expect(ap.trim).toBe(0);
+      const range = scene.result.ranges.get(ap.branch.segment)!;
+      const length = scene.network.alignmentOf(ap.branch.segment).length;
+      // 引っ込めていないので、帯はノードのある端まで届いている。
+      if (ap.branch.atStart) expect(range.s0).toBeCloseTo(0, 6);
+      else expect(range.s1).toBeCloseTo(length, 6);
     }
-    expect(paths.length).toBeGreaterThanOrEqual(2);
-
-    /** その点から、いちばん近い軌道の路端までの距離 (中に入っていれば負)。 */
-    const beyondTrack = (x: number, z: number): number => {
-      let best = Infinity;
-      for (const path of paths) {
-        for (const p of path.points) {
-          best = Math.min(best, Math.hypot(p.x - x, p.z - z) - path.halfWidth);
-        }
-      }
-      return best;
-    };
-
-    const ballast = junction.rings[junction.rings.length - 1];
-    let inside = 0;
-    let worst = 0;
-    let worstAt = '';
-    const bounds = ballast.reduce(
-      (b, p) => ({
-        minX: Math.min(b.minX, p.x),
-        maxX: Math.max(b.maxX, p.x),
-        minZ: Math.min(b.minZ, p.z),
-        maxZ: Math.max(b.maxZ, p.z),
-      }),
-      { minX: Infinity, maxX: -Infinity, minZ: Infinity, maxZ: -Infinity },
-    );
-    for (let x = bounds.minX; x <= bounds.maxX; x += 0.35) {
-      for (let z = bounds.minZ; z <= bounds.maxZ; z += 0.35) {
-        if (surfaceHeightAt(ballast, x, z) === null) continue;
-        inside++;
-        const beyond = beyondTrack(x, z);
-        if (beyond > worst) {
-          worst = beyond;
-          worstAt = `(${x.toFixed(1)}, ${z.toFixed(1)})`;
-        }
-      }
-    }
-    expect(inside).toBeGreaterThan(500);
-    // 軌道の路端から 1.5 m 以上外まで道床が張り出していたら、それは
-    // 曲線を無視して弦で結んでいる (直前の実装では 4 m 近く出ていた)。
-    expect(`${worst.toFixed(2)} m @ ${worstAt}`).toBe(`${Math.min(worst, 1.5).toFixed(2)} m @ ${worstAt}`);
   });
 
   /**
-   * どんな分岐でも、交差点を通る進路は必ず道床の上を通っていなければ
-   * ならない。弦で結んだ道床では、分岐角が 30° を超えると曲線が道床から
-   * はみ出して、線路が宙に浮いていた。
+   * 枕木は帯の刻み (`SLEEPER_PITCH`) だけが並べる。交差点の中に別の軌道を
+   * 引くと、そこだけ刻みの粗い枕木が二重に置かれる。
    */
-  it('どの分岐角・規格でも、進路が道床から外れない', () => {
-    const problems: string[] = [];
-    let checked = 0;
-    for (const [main, branch] of [
-      ['rail_single', 'rail_yard'],
-      ['rail_single', 'rail_yard'],
-      ['rail_single', 'rail_single'],
-    ]) {
-      for (const deg of [8, 15, 20, 25, 30, 40, 55, 70, 90]) {
-        for (const [la, lb, lc] of [
-          [200, 200, 200],
-          [60, 60, 60],
-          [200, 40, 40],
-        ]) {
-          const network = new Network();
-          const rad = (deg * Math.PI) / 180;
-          addStraight(network, main, new Vector3(-la, 40, 0), new Vector3(0, 40, 0));
-          addStraight(network, main, new Vector3(0, 40, 0), new Vector3(lb, 40, 0));
-          addStraight(
-            network,
-            branch,
-            new Vector3(0, 40, 0),
-            new Vector3(Math.cos(rad) * lc, 40, Math.sin(rad) * lc),
-          );
-
-          for (const junction of solveJunctions(network).junctions.values()) {
-            if (junction.approaches.length < 3) continue;
-            const ballast = junction.rings[junction.rings.length - 1];
-            // 帯を組むには、どのリングも同じ点数でなければならない。
-            expect(new Set(junction.rings.map((r) => r.length)).size).toBe(1);
-            for (const conn of junction.connections) {
-              const from = junction.approaches.find((a) => a.branch.segment === conn.from)!;
-              const to = junction.approaches.find((a) => a.branch.segment === conn.to)!;
-              const alignment = trackConnectionAlignment(from, to);
-              if (!alignment) continue;
-              for (let i = 0; i <= 24; i++) {
-                const p = alignment.sampleAt((alignment.length * i) / 24).pos;
-                checked++;
-                if (ballast.length < 3 || surfaceHeightAt(ballast, p.x, p.z) === null) {
-                  problems.push(
-                    `${main}/${branch} ${deg}° L=${la},${lb},${lc}: (${p.x.toFixed(1)}, ${p.z.toFixed(1)}) に道床がない`,
-                  );
-                }
-              }
-            }
-          }
-        }
-      }
+  it('分岐の所にも、余分な枕木が置かれない', () => {
+    const scene = switchScene();
+    const structures = scene.meshes.get('structures')!;
+    const color = structures.geometry.attributes.color;
+    let sleeperVertices = 0;
+    for (let i = 0; i < color.count; i++) {
+      const rgb = [color.getX(i), color.getY(i), color.getZ(i)];
+      if (rgb.every((v, k) => Math.abs(v - SLEEPER_COLOR[k]) < 1e-6)) sleeperVertices++;
     }
-    expect(checked).toBeGreaterThan(3000);
-    expect(problems.slice(0, 5)).toEqual([]);
-  }, 30000);
+    // 箱 1 つ = 6 面 × 4 頂点。
+    const sleepers = sleeperVertices / 24;
+    const expected = [...scene.network.segments.values()].reduce((sum, seg) => {
+      const range = scene.result.ranges.get(seg.id)!;
+      return sum + Math.floor((range.s1 - range.s0) / SLEEPER_PITCH) + 1;
+    }, 0);
+    expect(sleepers).toBe(expected);
+  });
 
   /**
-   * 交差点の道床は、セグメントの道床と同じ色でなければならない。
-   * 種別の代表色をそのまま使うと、断面の道床色とわずかに食い違って
-   * 分岐器の所だけ色が変わって見える。
+   * 分岐の所の道床は、帯の道床がそのまま重なったもの。別の面を塗ると、
+   * 断面の道床色とわずかに食い違って、そこだけ色が変わって見える。
    */
-  it('分岐器の道床の色が、線路の道床の色と同じ', () => {
-    const scene = switchScene(0, 0);
+  it('分岐の所の道床の色が、線路の道床の色と同じ', () => {
+    const scene = switchScene();
     const junction = switchJunctions(scene)[0];
     const node = scene.network.getNode(junction.node).pos;
     const surfaces = scene.meshes.get('surfaces')!;

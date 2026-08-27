@@ -47,6 +47,8 @@ export interface Anchor {
 /** 建設プレビューの計算結果。 */
 export interface PlacementPreview {
   horizontal: HorizontalCurve;
+  /** 実際の始点 (円弧の掃引角制限で、指定点と異なることがある)。 */
+  start: Vector3;
   /** 実際の終点 (円弧の掃引角制限で、指定点と異なることがある)。 */
   end: Vector3;
   startGrade: number;
@@ -64,6 +66,30 @@ export interface PlacementPreview {
  * 始点も終点もクリックした点そのもの (そこにノードを作る) なので、実質 0。
  */
 const REACH = 0.05;
+
+/**
+ * 線形の端が、指した点から離れていても**そこへ繋ぐ**距離 [m]。
+ *
+ * 円弧は掃引角で頭打ちになるので、真後ろに近い所を指すと線形は指した所まで
+ * 届かない。以前はそれを「指した所まで届きません」として置かせなかったが、
+ * 届く所までは敷けた方が素直なので、離れていたら**届いた所で切る**。
+ * これを超えて離れた端は接続 (ノード・取り付き・接線) を諦め、届いた所に
+ * 自由な端点を作る。平行スナップは既存ノードに 2 m まで寄せて繋ぐので、
+ * そこは離れていても繋いだままにする。
+ */
+export const REACH_GAP = 5;
+
+/**
+ * 線形が実際に届いた点を端にしたアンカー。
+ *
+ * ノードの位置と制御点から線形を組み直すので (`Network.alignmentOf`)、
+ * ノードは必ず線形の端に置く。届かなかった端は接続を諦めるので、
+ * 敷いた線形はプレビューと同じ形になる。
+ */
+export function reachedAnchor(anchor: Anchor, at: Vector3): Anchor {
+  const gap = Math.hypot(at.x - anchor.pos.x, at.z - anchor.pos.z);
+  return gap <= REACH_GAP ? { ...anchor, pos: at.clone() } : { pos: at.clone() };
+}
 
 /**
  * 始点の接線を保ったまま、カーソル位置まで伸びる線形を求める。
@@ -180,6 +206,8 @@ export function computePlacement(
   }
 
   const length = Math.max(horizontal.length, 1e-3);
+  const startXZ = horizontal.p0;
+  const start = new Vector3(startXZ.x, anchor.pos.y, startXZ.y);
   const endXZ = horizontal.p1;
   const end = new Vector3(endXZ.x, destination.pos.y, endXZ.y);
 
@@ -212,6 +240,7 @@ export function computePlacement(
 
   return {
     horizontal,
+    start,
     end,
     startGrade,
     endGrade,
@@ -542,9 +571,9 @@ export function placeSegment(
   end: Anchor,
   preview: PlacementPreview,
 ): PlaceResult {
-  const startNode = resolveAnchor(network, start);
-  const endAnchor: Anchor = { ...end, pos: preview.end };
-  const endNode = resolveAnchor(network, endAnchor);
+  // 線形が指した所まで届かなかった端は、届いた所を端点にする (`reachedAnchor`)。
+  const startNode = resolveAnchor(network, reachedAnchor(start, preview.start));
+  const endNode = resolveAnchor(network, reachedAnchor(end, preview.end));
 
   const segment = network.addSegment({
     classId,
