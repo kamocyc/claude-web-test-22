@@ -3,6 +3,7 @@ import { Vector2, Vector3 } from 'three';
 import { Alignment } from '../src/core/alignment';
 import { arcFromTangent, curveFromTangents } from '../src/core/curve';
 import { VerticalProfile } from '../src/core/profile';
+import { DEG } from '../src/core/units';
 import { getClass } from '../src/network/classes';
 import {
   anchorFromNode,
@@ -103,7 +104,7 @@ describe('規格最小曲線半径', () => {
     ['road_large', 26],
     ['road_highway', 70],
     ['road_ramp', 26],
-    ['rail_single', 70],
+    ['rail_single', 50],
     ['rail_yard', 30],
   ];
 
@@ -146,7 +147,7 @@ describe('規格最小曲線半径', () => {
     const cls = getClass('rail_single');
     const from = { pos: new Vector3(0, 20, 0), tangent: new Vector2(1, 0) };
 
-    // 半径 75 m ぶんの曲がり (標準半径 119 m より急、最小半径 70 m より緩い)。
+    // 半径 75 m ぶんの曲がり (標準半径 120 m より急、最小半径 50 m より緩い)。
     const tight = computePlacement(from, new Vector3(60, 20, 30), { straight: false, cls });
     expect(tight.radius).toBeGreaterThan(cls.minRadius);
     expect(tight.radius).toBeLessThan(cls.smoothRadius);
@@ -307,6 +308,32 @@ describe('敷設できるかどうかの判定', () => {
     expect(check.blockers.join(' ')).toContain('交差点');
   });
 
+  /**
+   * 止めた理由の**場所**。
+   *
+   * 「交差点が近すぎます」「交差点の中に端点があります」と言われても、
+   * どの交差点の話なのかは文言から分からない。敷設ツールはここを目印で
+   * 囲って示すので、原因のノードの位置が返ることを確かめる。
+   */
+  it('交差点の中で終わらせたときは、その交差点の位置が返る', () => {
+    const network = new Network();
+    addStraight(network, 'road_large', new Vector3(-120, 0, 0), new Vector3(0, 0, 0));
+    addStraight(network, 'road_large', new Vector3(0, 0, 0), new Vector3(120, 0, 0));
+    addStraight(network, 'road_large', new Vector3(0, 0, 0), new Vector3(0, 0, 120));
+    const start = new Vector3(4, 0, -100);
+    const end = new Vector3(4, 0, -4);
+    const check = checkPlacement({
+      network,
+      cls: getClass('road_small'),
+      alignment: straight(start, end),
+      start: { pos: start },
+      end: { pos: end },
+    });
+    expect(check.blockers.join(' ')).toContain('交差点');
+    expect(check.places).toHaveLength(1);
+    expect(check.places[0].distanceTo(new Vector3(0, 0, 0))).toBeLessThan(0.01);
+  });
+
   it('隣の交差点まで届かない所に枝を足すことはできない', () => {
     // 交差点どうしが 10 m しか離れていない配置。ここに 3 本目を繋ぐと、
     // 間のセグメントが両側からトリムされて形が保てない。
@@ -327,6 +354,48 @@ describe('敷設できるかどうかの判定', () => {
       end: { pos: end },
     });
     expect(check.blockers.join(' ')).toContain('交差点が近すぎます');
+    // 詰まっている相手 = 10 m 先の交差点。
+    expect(check.places.some((p) => p.distanceTo(new Vector3(0, 0, 0)) < 0.01)).toBe(true);
+  });
+});
+
+/**
+ * 線路どうしの交差 (ダイヤモンドクロッシング)。
+ *
+ * 線路の交差点は面を持たない (`junction.ts` の冒頭の説明) ので、道路の
+ * 交差点のように取り付き長を空ける必要がない。渡り線・シーサスは既存の
+ * ノードのすぐ近くで交わることが多いので、ここで止めては作れなくなる。
+ */
+describe('線路どうしの交差に要る余裕', () => {
+  /** 原点で交わる 2 本の線路。既存側は `end` で切れている。 */
+  function crossing(end: number, angle: number): { network: Network; alignment: Alignment } {
+    const network = new Network();
+    addStraight(network, 'rail_single', new Vector3(-200, 0, 0), new Vector3(end, 0, 0));
+    const dx = Math.cos(angle) * 200;
+    const dz = Math.sin(angle) * 200;
+    const start = new Vector3(-dx, 0, -dz);
+    const stop = new Vector3(dx, 0, dz);
+    return { network, alignment: straight(start, stop) };
+  }
+
+  function check(end: number, angle: number): string[] {
+    const { network, alignment } = crossing(end, angle);
+    return checkPlacement({
+      network,
+      cls: getClass('rail_single'),
+      alignment,
+      start: { pos: alignment.sampleAt(0).pos.clone() },
+      end: { pos: alignment.sampleAt(alignment.length).pos.clone() },
+    }).blockers;
+  }
+
+  it('浅い角度でも、交点の 10 m 先で相手が終わっていれば置ける', () => {
+    // 交差角 10°。従来は取り付き長 26 m を求めて止めていた。
+    expect(check(10, 10 * DEG)).toEqual([]);
+  });
+
+  it('交点が相手の端点に重なるほど近ければ止まる', () => {
+    expect(check(1, 10 * DEG).join(' ')).toContain('交差点が近すぎます');
   });
 });
 

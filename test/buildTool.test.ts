@@ -851,6 +851,60 @@ describe('踏切', () => {
  * 線路の交差点には中身が無いので、折れたまま枝が集まると角がそのまま残る。
  * 交差点の中で振り分ける余地が無く、置いてから直せないので、置く前に止める。
  */
+/**
+ * 交差点への吸い付き。
+ *
+ * 交差点は「そこに繋いでください」と案内される相手なので、面の広さに
+ * 関わらず掴めるようにする。線路の分岐は面を持たないので、これが無いと
+ * ノードのすぐ上を指すしかない。
+ */
+describe('交差点のスナップ', () => {
+  /** 原点で分かれる 3 枝の線路 (原点が分岐器)。 */
+  function turnout(): { tool: BuildTool; network: Network } {
+    const network = new Network();
+    const tool = new BuildTool(network, flatField(), () => {});
+    tool.setClass('rail_single');
+    for (const x of [-200, 200]) {
+      tool.update(new Vector3(x, 0, 0), MODS);
+      tool.click();
+    }
+    tool.cancel();
+    const soft = { straight: false, noSnap: false };
+    tool.update(new Vector3(0, 0, 0), soft);
+    tool.click();
+    tool.update(new Vector3(150, 0, -80), soft);
+    tool.click();
+    tool.cancel();
+    return { tool, network };
+  }
+
+  it('線形から外れた 12 m 先を指しても、交差点に吸い付く', () => {
+    const { tool, network } = turnout();
+    expect(network.branchesAt(junctionNode(network).id).length).toBe(3);
+    // 本線からも側線からも外れた所 (北 12 m)。
+    tool.update(new Vector3(0, 0, 12), MODS);
+    const status = tool.status();
+    expect(status.snap).toBe('node');
+    expect(status.markers[0].pos.length()).toBeLessThan(0.01);
+  });
+
+  it('離れすぎた所 (20 m) では吸い付かない', () => {
+    const { tool } = turnout();
+    tool.update(new Vector3(0, 0, 20), MODS);
+    expect(tool.status().snap).toBe('none');
+  });
+
+  /**
+   * 線形の上を指しているときは今までどおり分割する。ここまで交差点に
+   * 吸わせると、分岐器のすぐ先に渡り線を作れなくなる。
+   */
+  it('線形の上を指したときは、交差点の近くでも分割する', () => {
+    const { tool } = turnout();
+    tool.update(new Vector3(12, 0, 0), MODS);
+    expect(tool.status().snap).toBe('segment');
+  });
+});
+
 describe('線路の分岐', () => {
   function railLine(): { tool: BuildTool; network: Network } {
     const network = new Network();

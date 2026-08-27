@@ -155,6 +155,15 @@ const CROSS_REACH = 20;
  */
 const CROSSING_SNAP_HEIGHT = 2.5;
 
+/**
+ * 交差点に吸い付く範囲の下限 [m]。
+ *
+ * 面の広さ (`junctionReach`) に任せると、面を持たない線路の分岐では
+ * ノードのすぐ上を指さないと掴めない。交差点は「繋いでください」と
+ * 案内される相手なので、外した所からでも掴めるだけ広く取る。
+ */
+const JUNCTION_SNAP = 15;
+
 /** カーソルが構造物 (橋の路面) に当たっているとみなす、地形との差 [m]。 */
 const ON_STRUCTURE = 2;
 const ANGLE_SNAP = 15 * DEG;
@@ -192,9 +201,13 @@ export class BuildTool {
   /** 引き始めた点の目印 (確定済み)。 */
   private anchorMarker: SnapMarker | null = null;
   private markers: SnapMarker[] = [];
+  /** スナップの目印 (原因の交差点を除いたもの)。 */
+  private snapMarkers: SnapMarker[] = [];
   private hoverSegment: SegmentId | null = null;
   private lastDiagnostics: SegmentDiagnostics | null = null;
   private blockers: string[] = [];
+  /** 敷設を止めている原因の場所 (既存の交差点)。目印で囲って示す。 */
+  private blockedPlaces: Vector3[] = [];
   /** いま平行に敷こうとしている基準の線形。 */
   private parallel: ParallelReference | null = null;
   /**
@@ -571,12 +584,12 @@ export class BuildTool {
 
   // ---------------------------------------------------------- 目印
 
-  /** 交差点・端点に繋ぐ目印。輪の大きさは交差点の面の広がりに合わせる。 */
+  /** 交差点・端点に繋ぐ目印。輪の大きさは吸い付く範囲に合わせる。 */
   private nodeMarker(node: NetNode): SnapMarker {
     return {
       kind: 'node',
       pos: node.pos.clone(),
-      radius: Math.max(junctionReach(this.network, node.id), this.cls.halfWidth * 0.8),
+      radius: Math.max(this.junctionSnapRange(node), this.cls.halfWidth * 0.8),
     };
   }
 
@@ -688,8 +701,31 @@ export class BuildTool {
 
   /** 目印を描き直す。引き始めた点は常に出す。 */
   private showMarkers(markers: readonly (SnapMarker | null)[]): void {
-    this.markers = markers.filter((m): m is SnapMarker => m !== null);
+    this.snapMarkers = markers.filter((m): m is SnapMarker => m !== null);
+    this.syncMarkers();
+  }
+
+  /**
+   * 目印を描き直す。
+   *
+   * スナップの目印は `refreshPreview` が、止めている原因の交差点はその後の
+   * `updatePreviewMesh` (判定を通す所) が決めるので、両方をここで合わせる。
+   */
+  private syncMarkers(): void {
+    this.markers = [
+      ...this.snapMarkers,
+      ...this.blockedPlaces.map((pos) => this.blockedMarker(pos)),
+    ];
     this.snapView.update(this.markers);
+  }
+
+  /** 敷設を止めている交差点の目印。 */
+  private blockedMarker(pos: Vector3): SnapMarker {
+    const node = this.network.findNodeNear(pos, 1);
+    const radius = node
+      ? Math.max(junctionReach(this.network, node.id), this.cls.halfWidth)
+      : this.cls.halfWidth;
+    return { kind: 'blocked', pos: pos.clone(), radius, width: 1.1 };
   }
 
   /** その種別を繋いでよいノードか (線路のノードに道路は繋がない)。 */
@@ -699,10 +735,26 @@ export class BuildTool {
   }
 
   /**
+   * その交差点に吸い付く範囲 [m]。
+   *
+   * 下限は「そこに端点を置くと止められる範囲」(`checkJunctionSpacing` と
+   * 同じ式)。指せる所と置ける所が食い違わないようにする。そのうえで
+   * 3 枝以上の交差点は、面が無くても掴めるよう `JUNCTION_SNAP` まで広げる。
+   */
+  private junctionSnapRange(node: NetNode): number {
+    const blocked = junctionReach(this.network, node.id) + this.cls.halfWidth * 0.5;
+    return this.network.branchesAt(node.id).length >= 3
+      ? Math.max(JUNCTION_SNAP, blocked)
+      : blocked;
+  }
+
+  /**
    * 既存の線形の `s` 地点が交差点の面の中なら、その交差点のノード。
    *
-   * 面の広がりは敷設の判定と同じ `junctionReach` で測る。指せる所と
-   * 置ける所が同じ範囲になるので、「指せるのに置けない」所ができない。
+   * ここは `junctionSnapRange` ではなく**面の広さそのもの**で測る。広げると
+   * 交差点の近くで線形を分割できなくなり、分岐器のすぐ先に渡り線を作る、
+   * といった引き方ができなくなる。線形から外れた所を指したときの吸い付き
+   * (`junctionUnder`) だけを広げる。
    */
   private junctionAt(segment: SegmentId, s: number): NetNode | null {
     const seg = this.network.getSegment(segment);
@@ -719,7 +771,12 @@ export class BuildTool {
     return null;
   }
 
-  /** カーソルが交差点の面の中にあれば、その交差点のノード。 */
+  /**
+   * カーソルが交差点の吸い付く範囲にあれば、その交差点のノード。
+   *
+   * 候補はいちばん近いものが勝つので、範囲を広げても線形の上 (距離 ≒ 0) の
+   * 分割や平行スナップを奪わない。効くのは「線形から外れた所を指したとき」。
+   */
   private junctionUnder(cursor: Vector3, y: number): { node: NetNode; distance: number } | null {
     let best: { node: NetNode; distance: number } | null = null;
     for (const node of this.network.nodes.values()) {
@@ -727,7 +784,7 @@ export class BuildTool {
       const distance = Math.hypot(node.pos.x - cursor.x, node.pos.z - cursor.z);
       if (distance > 60 || (best && distance >= best.distance)) continue;
       if (!this.canJoin(node)) continue;
-      if (distance > junctionReach(this.network, node.id)) continue;
+      if (distance > this.junctionSnapRange(node)) continue;
       best = { node, distance };
     }
     return best;
@@ -900,6 +957,7 @@ export class BuildTool {
   private updatePreviewMesh(): void {
     const mb = new MeshBuilder();
     const preview = this.preview;
+    this.blockedPlaces = [];
     if (this.mode === 'zone') {
       if (this.cursor) buildZoneBrush(mb, this.cursor, this.field, this.zoneType);
       this.lastDiagnostics = null;
@@ -924,10 +982,16 @@ export class BuildTool {
             ? this.endAnchor ?? { pos: at.end }
             : { pos: at.end };
         diagnostics.push(evaluateAlignment(alignment, cls));
-        blockers.push(
-          ...checkPlacement({ network: this.network, cls, alignment, start, end, field: this.field })
-            .blockers,
-        );
+        const check = checkPlacement({
+          network: this.network,
+          cls,
+          alignment,
+          start,
+          end,
+          field: this.field,
+        });
+        blockers.push(...check.blockers);
+        this.blockedPlaces.push(...check.places);
         buildRibbon(mb, alignment.sample(2), profileFor(cls), { skirt: false, cls });
         start = { pos: at.end.clone() };
       }
@@ -938,7 +1002,7 @@ export class BuildTool {
       const alignment = this.previewAlignment(preview);
       this.lastDiagnostics = evaluateAlignment(alignment, cls);
       // 置けるかどうかはクリック前に分かるようにする。
-      this.blockers = checkPlacement({
+      const check = checkPlacement({
         network: this.network,
         cls,
         alignment,
@@ -947,12 +1011,16 @@ export class BuildTool {
         start: reachedAnchor(this.anchor, preview.start),
         end: this.endAnchor ?? { pos: preview.end },
         field: this.field,
-      }).blockers;
+      });
+      this.blockers = check.blockers;
+      this.blockedPlaces = check.places;
       buildRibbon(mb, alignment.sample(2), profileFor(cls), { skirt: false, cls });
     } else if (this.mode !== 'station') {
       this.lastDiagnostics = null;
       this.blockers = [];
     }
+    // 原因の交差点は目印で示す (文言だけでは、どの交差点の話か分からない)。
+    this.syncMarkers();
     // 置けないときはプレビューを赤くする。
     setPreviewBlocked(
       { preview: this.previewMaterial, xray: this.previewXrayMaterial },

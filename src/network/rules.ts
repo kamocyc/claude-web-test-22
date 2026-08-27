@@ -65,6 +65,25 @@ const OVERLAP_TOLERANCE = 0.15;
 export interface PlacementCheck {
   /** 空なら敷設できる。 */
   blockers: string[];
+  /**
+   * 止めた理由の**場所** (原因になっている既存の交差点・端点)。
+   *
+   * 「交差点が近すぎます」と言われても、どの交差点の話なのかは文言から
+   * 分からない。敷設ツールはここを目印で囲って示す。
+   */
+  places: Vector3[];
+}
+
+/** 止めた理由 1 つぶん。場所の分かるものは、その位置も持つ。 */
+interface Blocker {
+  message: string;
+  /** 原因になっている既存の交差点・端点の位置。 */
+  at?: Vector3;
+}
+
+/** 場所の分からない理由。 */
+function plain(messages: string[]): Blocker[] {
+  return messages.map((message) => ({ message }));
 }
 
 export interface PlacementContext {
@@ -133,14 +152,38 @@ export function checkPlacement(ctx: PlacementContext): PlacementCheck {
   const connected = new Set<SegmentId>([...sides[0], ...sides[1]]);
   if (ctx.ignore !== undefined) connected.add(ctx.ignore);
 
-  blockers.push(...checkRailBranches(ctx));
-  blockers.push(...checkOverlaps(ctx, connected));
-  blockers.push(...checkRunningAlong(ctx, sides[0], sides[1]));
-  blockers.push(...checkJunctionSpacing(ctx));
-  blockers.push(...checkTunnelJunctions(ctx, connected));
-  blockers.push(...checkAlignmentAgainstStations(network, ctx.alignment, ctx.cls.halfWidth + 1, ctx.ignore));
+  const found: Blocker[] = [
+    ...plain(blockers),
+    ...plain(checkRailBranches(ctx)),
+    ...checkOverlaps(ctx, connected),
+    ...plain(checkRunningAlong(ctx, sides[0], sides[1])),
+    ...checkJunctionSpacing(ctx),
+    ...plain(checkTunnelJunctions(ctx, connected)),
+    ...plain(
+      checkAlignmentAgainstStations(network, ctx.alignment, ctx.cls.halfWidth + 1, ctx.ignore),
+    ),
+  ];
 
-  return { blockers: dedupe(blockers) };
+  return { blockers: dedupe(found.map((b) => b.message)), places: placesOf(found) };
+}
+
+/**
+ * 止めた理由の場所を集める。
+ *
+ * 文言は同じでも、原因の交差点が別なら両方見せたい (「交差点が近すぎます」は
+ * 両端で別々に出る)。文言ではなく**位置**で重複を落とす。
+ */
+function placesOf(found: Blocker[]): Vector3[] {
+  const out: Vector3[] = [];
+  const seen = new Set<string>();
+  for (const blocker of found) {
+    if (!blocker.at) continue;
+    const key = `${blocker.at.x.toFixed(1)},${blocker.at.z.toFixed(1)}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(blocker.at);
+  }
+  return out;
 }
 
 function evaluate(ctx: PlacementContext): string[] {
@@ -282,11 +325,11 @@ function checkRailBranches(ctx: PlacementContext): string[] {
  * - 同じ高さで交差する道路どうし・線路どうし → 交差点にできないので置けない
  * - 立体交差だが桁下が足りない → 置けない
  */
-function checkOverlaps(ctx: PlacementContext, connected: Set<SegmentId>): string[] {
+function checkOverlaps(ctx: PlacementContext, connected: Set<SegmentId>): Blocker[] {
   const { network, cls } = ctx;
   const mine = polyline(ctx.alignment);
   const bounds = boundsOf(mine);
-  const out: string[] = [];
+  const out: Blocker[] = [];
 
   // まず近くの線形と交点を集める。同一平面で交わる所 (交差点・踏切になる
   // 所) では路面が重なって当たり前なので、あとの重なり判定から外す「窓」を
@@ -373,6 +416,8 @@ function checkOverlaps(ctx: PlacementContext, connected: Set<SegmentId>): string
 
     let shallowLimit = 0;
     let tooClose = 0;
+    /** その交差点が詰まっている原因の位置 (近い方の既存の端点)。 */
+    let tooCloseAt: Vector3 | null = null;
     let worstClearance = Infinity;
     let worstCrossing = 0;
     let lowerKindOfWorst: 'road' | 'rail' = other.kind;
@@ -403,19 +448,37 @@ function checkOverlaps(ctx: PlacementContext, connected: Set<SegmentId>): string
           if (need > MAX_CROSSING_LIFT) worstCrossing = Math.max(worstCrossing, need);
         }
         if (cls.kind === other.kind) {
-          // 交差点は取り付き部の分だけ両側の線形を食べる。取り付きが端から
-          // はみ出すようなら、交差点の形が崩れるので置かせない。
+          // 道路の交差点は取り付き部の分だけ両側の線形を食べる。取り付きが
+          // 端からはみ出すようなら、交差点の形が崩れるので置かせない。
           // (「余裕をもって離す」ではなく、**実際に要る長さ**で判定する。)
+          // 交差点はここで両方を分割するので、飲み込めるかは分割してできる
+          // **短い方**の長さで決まる。
+          //
+          // 線路の交差点は面を持たず、区間を食べない (`crossingRoom`)。
+          // トリムの上限 (`roomFor`) も掛からないので、端までの距離を
+          // そのまま使う。
           const cos = Math.abs(hit.dirA.x * hit.dirB.x + hit.dirA.y * hit.dirB.y);
-          const mine = crossingTrim(cls, other, sin, cos);
-          const theirs = crossingTrim(other, cls, sin, cos);
-          // 交差点はここで両方を分割する。トリムを飲み込めるかは、
-          // 分割してできる**短い方**の長さで決まる。
-          tooClose = Math.max(
-            tooClose,
-            mine - roomFor(Math.min(hit.sA, ctx.alignment.length - hit.sA), 0),
-            theirs - roomFor(Math.min(hit.sB, otherLength - hit.sB), 0),
-          );
+          const railPair = cls.kind === 'rail' && other.kind === 'rail';
+          const available = (toEnd: number): number => (railPair ? toEnd : roomFor(toEnd, 0));
+          const shortfalls: [number, Vector3][] = [
+            [
+              crossingRoom(cls, other, sin, cos) -
+                available(Math.min(hit.sA, ctx.alignment.length - hit.sA)),
+              // 自分の側が足りないときは、詰まっている自分の端。
+              endNear(ctx.alignment, hit.sA),
+            ],
+            [
+              crossingRoom(other, cls, sin, cos) -
+                available(Math.min(hit.sB, otherLength - hit.sB)),
+              // 相手の側が足りないときは、相手の近い方の端 (= 既存の交差点)。
+              endNear(otherAlignment, hit.sB),
+            ],
+          ];
+          for (const [shortfall, at] of shortfalls) {
+            if (shortfall <= tooClose) continue;
+            tooClose = shortfall;
+            tooCloseAt = at;
+          }
         }
         continue;
       }
@@ -463,33 +526,33 @@ function checkOverlaps(ctx: PlacementContext, connected: Set<SegmentId>): string
     }
 
     if (tooClose > 0.05) {
-      out.push(
-        `交差点が近すぎます (あと ${Math.max(1, tooClose).toFixed(0)} m 離すか、既存のノードに繋いでください)。`,
-      );
+      out.push({ message: tooCloseMessage(tooClose), at: tooCloseAt ?? undefined });
     }
     if (shallowLimit > 0) {
-      out.push(`交差角が浅すぎます (${(shallowLimit / DEG).toFixed(0)}° 以上必要)。`);
+      out.push({ message: `交差角が浅すぎます (${(shallowLimit / DEG).toFixed(0)}° 以上必要)。` });
     }
     if (worstCrossing > 0) {
-      out.push(
-        `踏切にできません。路面を線路に合わせるのに ±${worstCrossing.toFixed(1)} m の` +
+      out.push({
+        message:
+          `踏切にできません。路面を線路に合わせるのに ±${worstCrossing.toFixed(1)} m の` +
           `すり付けが要ります (交差角を大きくするか、道路の勾配を緩めてください)。`,
-      );
+      });
     }
     if (shallowLimit === 0 && overlapDepth > 0) {
-      out.push(
-        overlapLength > reach * 2.5
-          ? '既存の線形と重なって並走しています。'
-          : `既存の線形と路面が重なります (あと ${Math.max(0.5, overlapDepth).toFixed(1)} m 離すか、` +
-            '中心線どうしを交わらせて交差点にしてください)。',
-      );
+      out.push({
+        message:
+          overlapLength > reach * 2.5
+            ? '既存の線形と重なって並走しています。'
+            : `既存の線形と路面が重なります (あと ${Math.max(0.5, overlapDepth).toFixed(1)} m 離すか、` +
+              '中心線どうしを交わらせて交差点にしてください)。',
+      });
     }
     if (Number.isFinite(worstClearance)) {
       const required =
         lowerKindOfWorst === 'rail' ? CLEARANCE_OVER_RAIL : CLEARANCE_OVER_ROAD;
-      out.push(
-        `桁下 ${worstClearance.toFixed(1)} m は建築限界 ${required.toFixed(1)} m に足りません。高さを変えてください。`,
-      );
+      out.push({
+        message: `桁下 ${worstClearance.toFixed(1)} m は建築限界 ${required.toFixed(1)} m に足りません。高さを変えてください。`,
+      });
     }
   }
   return out;
@@ -773,9 +836,9 @@ function endDirection(line: Sample[], atStart: boolean): { dx: number; dz: numbe
  *  - 既存セグメントの途中に繋ぐ … 分割してできる 2 本が飲み込めるか
  *  - 新しいノードを作る … その点が既存の交差点の中に入っていないか
  */
-function checkJunctionSpacing(ctx: PlacementContext): string[] {
+function checkJunctionSpacing(ctx: PlacementContext): Blocker[] {
   const { network, cls, alignment } = ctx;
-  const out: string[] = [];
+  const out: Blocker[] = [];
   const length = alignment.length;
   const mineAt: number[] = [0, 0];
 
@@ -798,7 +861,10 @@ function checkJunctionSpacing(ctx: PlacementContext): string[] {
       branches.forEach((branch, k) => {
         if (trims[k] < 1e-3) return; // 一直線に繋がる枝はトリムしない
         const shortfall = trims[k] + CORNER_MARGIN - branchRoom(network, branch);
-        if (shortfall > 0.05) out.push(tooClose(shortfall));
+        // 詰まっているのは、その枝の**向こう端**にある交差点。
+        if (shortfall > 0.05) {
+          out.push({ message: tooCloseMessage(shortfall), at: farEnd(network, branch) });
+        }
       });
       return;
     }
@@ -826,7 +892,12 @@ function checkJunctionSpacing(ctx: PlacementContext): string[] {
         const far = trimAt(network, half.far, anchor.split!.segment);
         const shortfall =
           trims[k] + CORNER_MARGIN - roomFor(half.length, far + CORNER_MARGIN);
-        if (shortfall > 0.05) out.push(tooClose(shortfall));
+        if (shortfall > 0.05) {
+          out.push({
+            message: tooCloseMessage(shortfall),
+            at: network.nodes.get(half.far)?.pos.clone(),
+          });
+        }
       });
       return;
     }
@@ -839,10 +910,12 @@ function checkJunctionSpacing(ctx: PlacementContext): string[] {
       if (distance > 60) continue;
       const reach = junctionReach(network, node.id) + cls.halfWidth * 0.5;
       if (distance < reach) {
-        out.push(
-          `交差点の中に端点があります (あと ${Math.max(1, reach - distance).toFixed(0)} m 離すか、` +
+        out.push({
+          message:
+            `交差点の中に端点があります (あと ${Math.max(1, reach - distance).toFixed(0)} m 離すか、` +
             `交差点のノードに繋いでください)。`,
-        );
+          at: node.pos.clone(),
+        });
       }
     }
   });
@@ -855,17 +928,23 @@ function checkJunctionSpacing(ctx: PlacementContext): string[] {
     const shortfall =
       trim + CORNER_MARGIN - roomFor(length, mineAt[1 - index] + CORNER_MARGIN);
     if (shortfall > 0.05) {
-      out.push(
-        `交差点の取り付きに ${(trim + CORNER_MARGIN).toFixed(0)} m 必要ですが、` +
+      out.push({
+        message:
+          `交差点の取り付きに ${(trim + CORNER_MARGIN).toFixed(0)} m 必要ですが、` +
           `区間長が ${length.toFixed(0)} m しかありません。`,
-      );
+      });
     }
   });
   return out;
 }
 
-function tooClose(shortfall: number): string {
+function tooCloseMessage(shortfall: number): string {
   return `交差点が近すぎます (あと ${Math.max(1, shortfall).toFixed(0)} m 離すか、既存のノードに繋いでください)。`;
+}
+
+/** 線形の、弧長 `s` に近い方の端の位置。 */
+function endNear(alignment: Alignment, s: number): Vector3 {
+  return alignment.sampleAt(s * 2 <= alignment.length ? 0 : alignment.length).pos.clone();
 }
 
 /**
@@ -889,6 +968,13 @@ function branchRoom(network: Network, branch: Branch): number {
   return roomFor(length, far + CORNER_MARGIN);
 }
 
+/** その枝の、ノードと反対側の端の位置。 */
+function farEnd(network: Network, branch: Branch): Vector3 | undefined {
+  const seg = network.segments.get(branch.segment);
+  if (!seg) return undefined;
+  return network.nodes.get(branch.atStart ? seg.b : seg.a)?.pos.clone();
+}
+
 /** そのノードで、指定したセグメントの枝に必要なトリム量 [m]。 */
 function trimAt(network: Network, node: NodeId, segment: SegmentId): number {
   const branches = network.branchesAt(node);
@@ -910,6 +996,25 @@ export function junctionReach(network: Network, node: NodeId): number {
   const trim = Math.max(...trims);
   if (trim < 1e-3) return 0;
   return Math.min(trim + CORNER_MARGIN, MAX_TRIM);
+}
+
+/**
+ * 同一平面で交差してできる交差点のために、片方が空けておく長さ [m]。
+ *
+ * 道路は交差点の面を作るので、路端線の交点までのトリムがそのまま要る
+ * (`crossingTrim`)。**線路の交差点は面を持たない** (`junction.ts` の冒頭の
+ * 説明) のでトリムは 0。ノードどうしが重ならないだけの最小限を見る。
+ */
+function crossingRoom(
+  own: NetworkClass,
+  other: NetworkClass,
+  sin: number,
+  cos: number,
+): number {
+  if (own.kind === 'rail' && other.kind === 'rail') {
+    return own.halfWidth + other.halfWidth + CORNER_MARGIN;
+  }
+  return crossingTrim(own, other, sin, cos);
 }
 
 /**
@@ -1042,7 +1147,7 @@ function dedupe(list: string[]): string[] {
 
 /** 撤去してよいか (今は常に許す)。将来の拡張のために口を開けておく。 */
 export function checkRemoval(_network: Network, _segment: SegmentId): PlacementCheck {
-  return { blockers: [] };
+  return { blockers: [], places: [] };
 }
 
 /** デバッグ用: 判定に使った点を可視化したいとき向け。 */

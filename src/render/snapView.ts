@@ -22,7 +22,7 @@ import { MeshBuilder, UP } from '../core/meshbuilder';
 export type SnapKind = 'none' | 'node' | 'segment' | 'parallel' | 'crossing';
 
 export interface SnapMarker {
-  kind: 'node' | 'segment' | 'parallel' | 'inspect' | 'crossing' | 'focus';
+  kind: 'node' | 'segment' | 'parallel' | 'inspect' | 'crossing' | 'focus' | 'blocked';
   /** 吸い付いた点。 */
   pos: Vector3;
   /** 目印の半径 [m] (交差点なら面の広がり)。 */
@@ -51,6 +51,8 @@ const COLORS: Record<SnapMarker['kind'], readonly [number, number, number]> = {
   crossing: [1.0, 0.45, 0.38],
   // 警告から飛んできた所。敷設の目印のどれとも混ざらない色にする。
   focus: [1.0, 0.35, 0.95],
+  // 敷設を止めている交差点。繋ぐ相手 (水色・黄) ではないことを赤で示す。
+  blocked: [1.0, 0.2, 0.2],
 };
 
 /** 目印を浮かせる高さ [m]。 */

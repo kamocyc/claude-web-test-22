@@ -372,7 +372,13 @@ export const NETWORK_CLASSES: NetworkClass[] = [
     id: 'rail_single',
     label: '線路',
     shoulder: 2.2,
-    minRadius: 70,
+    minRadius: 50,
+    // 標準半径は既定 (最小半径の 1.7 倍 = 85 m) を使わず、最小半径を下げる
+    // 前と同じ所に置く。ここはカントが最大になる半径なので、下げると**既に
+    // ある緩い曲線のカントまで一律に減る** (R=200 で 0.060 → 0.043)。
+    // 急曲線を敷けるようにしたいだけなので、徐行区間 (緩和曲線もカントも
+    // 入れない素の円弧) の範囲が 50〜120 m に広がるだけにする。
+    smoothRadius: 120,
     maxGrade: 0.05,
     designSpeed: 100,
     costPerMeter: 150,
