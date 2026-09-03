@@ -1,5 +1,5 @@
 import { Vector2, Vector3 } from 'three';
-import { Alignment } from '../core/alignment';
+import { Alignment, stationOf } from '../core/alignment';
 import {
   bezierDerivative,
   bezierSecondDerivative,
@@ -15,6 +15,14 @@ import type { PlacementPreview } from './editing';
 import type { Network, NodeId, SegmentId } from './network';
 import { junctionReach } from './rules';
 import { CROSSING_END_MARGIN } from './editing';
+
+/**
+ * `stationOf` はもともとここにあったが、駅 (`network/station.ts`) からも使うように
+ * なり、`station.ts → parallel.ts → network.ts → station.ts` の循環になってしまう。
+ * 線形しか見ない純粋な計算なので `core/alignment.ts` へ移し、ここからは今までどおり
+ * 呼べるように再輸出しておく。
+ */
+export { stationOf };
 
 /**
  * 平行スナップ。
@@ -217,35 +225,6 @@ function farFrom(alignment: Alignment, x: number, z: number, radius: number): bo
   const dx = Math.max(Math.min(...xs) - x, 0, x - Math.max(...xs));
   const dz = Math.max(Math.min(...zs) - z, 0, z - Math.max(...zs));
   return dx * dx + dz * dz > radius * radius;
-}
-
-/** 線形上で、その点にいちばん近い弧長。 */
-export function stationOf(alignment: Alignment, x: number, z: number): number {
-  const length = alignment.length;
-  const steps = Math.max(8, Math.ceil(length / 2));
-  let best = 0;
-  let bestDistance = Infinity;
-  for (let i = 0; i <= steps; i++) {
-    const s = (length * i) / steps;
-    const p = alignment.horizontal.pointAt(s);
-    const d = (p.x - x) ** 2 + (p.y - z) ** 2;
-    if (d < bestDistance) {
-      bestDistance = d;
-      best = s;
-    }
-  }
-  // 粗い刻みのまわりを 1 段だけ詰める。
-  const span = length / steps;
-  for (let i = -4; i <= 4; i++) {
-    const s = clamp(best + (span * i) / 4, 0, length);
-    const p = alignment.horizontal.pointAt(s);
-    const d = (p.x - x) ** 2 + (p.y - z) ** 2;
-    if (d < bestDistance) {
-      bestDistance = d;
-      best = s;
-    }
-  }
-  return best;
 }
 
 /**

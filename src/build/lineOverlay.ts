@@ -1,6 +1,6 @@
 import { Vector3 } from 'three';
 import { MeshBuilder, UP } from '../core/meshbuilder';
-import type { Station, StationId } from '../network/station';
+import { stationPointOn, type Station, type StationId } from '../network/station';
 import type { LaneGraph } from '../sim/lanegraph';
 import type { LinePlan } from '../sim/lineRoute';
 
@@ -29,6 +29,9 @@ const STEP = 4;
 const RING_WIDTH = 1.6;
 /** 停車駅の輪を、駅の中心から広げる余裕 [m]。 */
 const RING_MARGIN = 3;
+
+/** 駅を囲む輪を刻む間隔 [m]。曲線の駅でも縁が折れて見えない程度に。 */
+const RING_STEP = 12;
 
 export function buildLineOverlay(
   mb: MeshBuilder,
@@ -85,33 +88,34 @@ function band(
   mb.strip(left, right);
 }
 
-/** 停車駅を囲む輪。 */
+/**
+ * 停車駅を囲む輪。
+ *
+ * 中心線に沿わせるので、曲線の途中の駅でも敷地の形どおりに囲む。
+ */
 function ring(mb: MeshBuilder, station: Station, color: readonly [number, number, number]): void {
-  const cos = Math.cos(station.heading);
-  const sin = Math.sin(station.heading);
   const along = station.length / 2 + RING_MARGIN;
   const half = Math.max(Math.abs(station.minOffset), Math.abs(station.maxOffset)) + RING_MARGIN;
-  const y = station.center.y + BAND_LIFT + 1.2;
-  const at = (u: number, v: number): number => {
-    const x = station.center.x + cos * u - sin * v;
-    const z = station.center.z + sin * u + cos * v;
-    return mb.vertex(new Vector3(x, y, z), UP, 0, 0, color);
-  };
-  const outer: [number, number][] = [
-    [along, half],
-    [along, -half],
-    [-along, -half],
-    [-along, half],
-  ];
+  const lift = BAND_LIFT + 1.2;
+  const outer = ringLoop(station, along, half, lift);
+  const inner = ringLoop(station, along - RING_WIDTH, half - RING_WIDTH, lift);
+  const at = (p: Vector3): number => mb.vertex(p, UP, 0, 0, color);
   for (let i = 0; i < outer.length; i++) {
-    const [au, av] = outer[i];
-    const [bu, bv] = outer[(i + 1) % outer.length];
-    // 内側は中心へ寄せた分だけ細くする。
-    const inset = (u: number, v: number): [number, number] => [
-      u - Math.sign(u) * RING_WIDTH,
-      v - Math.sign(v) * RING_WIDTH,
-    ];
-    const [ia, ib] = [inset(au, av), inset(bu, bv)];
-    mb.quad(at(au, av), at(bu, bv), at(ib[0], ib[1]), at(ia[0], ia[1]));
+    const j = (i + 1) % outer.length;
+    mb.quad(at(outer[i]), at(outer[j]), at(inner[j]), at(inner[i]));
   }
+}
+
+/** 駅を囲む閉じた輪郭。中心線の片側を往き、反対側を返る。 */
+function ringLoop(station: Station, along: number, half: number, lift: number): Vector3[] {
+  const steps = Math.max(2, Math.ceil(station.path.length / RING_STEP));
+  const side = (across: number, forward: boolean): Vector3[] => {
+    const out: Vector3[] = [];
+    for (let i = 0; i <= steps; i++) {
+      const t = forward ? i / steps : 1 - i / steps;
+      out.push(stationPointOn(station, -along + t * along * 2, across, lift));
+    }
+    return out;
+  };
+  return [...side(half, true), ...side(-half, false)];
 }

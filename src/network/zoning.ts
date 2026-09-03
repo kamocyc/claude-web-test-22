@@ -3,6 +3,7 @@ import type { AlignmentSample } from '../core/alignment';
 import type { NetworkClass } from './classes';
 import type { Network, SegmentId } from './network';
 import type { Occupancy } from './occupancy';
+import { stationLocal } from './station';
 import type { StructureRun } from './structure';
 import type { Heightfield } from '../terrain/heightfield';
 
@@ -474,12 +475,8 @@ function frontPoint(cell: ZoneCell): Vector3 {
 /** 駅の敷地に掛かっているか。線路の索引だけではホーム・駅舎を覆えない。 */
 function coversStation(network: Network, point: Vector3): boolean {
   for (const station of network.stations.values()) {
-    const dx = point.x - station.center.x;
-    const dz = point.z - station.center.z;
-    const cos = Math.cos(station.heading);
-    const sin = Math.sin(station.heading);
-    const along = dx * cos + dz * sin;
-    const across = -dx * sin + dz * cos;
+    // 曲線に沿った駅でも同じ式で見られるよう、中心線を基準にした局所座標で測る。
+    const { along, across } = stationLocal(station, point.x, point.z);
     const halfWidth = Math.max(Math.abs(station.minOffset), Math.abs(station.maxOffset)) + 6;
     if (Math.abs(along) <= station.length / 2 + 6 && Math.abs(across) <= halfWidth) return true;
   }

@@ -244,19 +244,23 @@ export class TerrainGrading {
    * earcut で三角形分割する。交差点面の形と整地の形が必ず一致する。
    */
   stampPolygon(ring: Vector3[], options: StampOptions = {}): void {
-    if (ring.length < 3) return;
-    const flat: number[] = [];
-    for (const p of ring) flat.push(p.x, p.z);
-    const tris = earcutXZ(flat);
-    for (let i = 0; i + 2 < tris.length; i += 3) {
-      this.stampTriangle(ring[tris[i]], ring[tris[i + 1]], ring[tris[i + 2]], options);
-    }
+    for (const [a, b, c] of triangulate(ring)) this.stampTriangle(a, b, c, options);
   }
 
   /** 4 点を 2 三角形として焼き込む。 */
   stampQuad(a: Vector3, b: Vector3, c: Vector3, d: Vector3, options: StampOptions = {}): void {
     this.stampTriangle(a, b, c, options);
     this.stampTriangle(a, c, d, options);
+  }
+
+  /** 多角形 (リング) の内側の整地を遮断する。`stampPolygon` と同じ分割。 */
+  blockPolygon(ring: Vector3[]): void {
+    for (const [a, b, c] of triangulate(ring)) this.block(a, b, c);
+  }
+
+  /** 多角形 (リング) の内側に天井を掛ける。`stampPolygon` と同じ分割。 */
+  carvePolygon(ring: Vector3[]): void {
+    for (const [a, b, c] of triangulate(ring)) this.carveTriangle(a, b, c);
   }
 
   /** 整地の伝播を遮断する領域 (橋・トンネルの下) を指定する。 */
@@ -551,4 +555,17 @@ function union(a: GridRegion | null, b: GridRegion | null): GridRegion | null {
     ix1: Math.max(a.ix1, b.ix1),
     iz1: Math.max(a.iz1, b.iz1),
   };
+}
+
+/** リングを三角形に割る (XZ 平面で earcut)。焼き込み・遮断・天井で共通。 */
+function triangulate(ring: Vector3[]): [Vector3, Vector3, Vector3][] {
+  if (ring.length < 3) return [];
+  const flat: number[] = [];
+  for (const p of ring) flat.push(p.x, p.z);
+  const tris = earcutXZ(flat);
+  const out: [Vector3, Vector3, Vector3][] = [];
+  for (let i = 0; i + 2 < tris.length; i += 3) {
+    out.push([ring[tris[i]], ring[tris[i + 1]], ring[tris[i + 2]]]);
+  }
+  return out;
 }

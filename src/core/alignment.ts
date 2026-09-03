@@ -178,3 +178,37 @@ function subdivideLeft(p0: XZ, c0: XZ, c1: XZ, p1: XZ, t: number): [XZ, XZ, XZ, 
   const f = d.clone().lerp(e, t);
   return [p0.clone(), a, d, f];
 }
+
+/**
+ * 線形上で、その点にいちばん近い弧長 (測点)。
+ *
+ * 粗く走査してから、そのまわりを 1 段詰める。曲線に沿った駅の局所座標
+ * (`network/station.ts` の `stationLocal`) も、平行敷設の基準位置も、これで
+ * 「その点は線形のどこか」を求める。
+ */
+export function stationOf(alignment: Alignment, x: number, z: number): number {
+  const length = alignment.length;
+  const steps = Math.max(8, Math.ceil(length / 2));
+  let best = 0;
+  let bestDistance = Infinity;
+  for (let i = 0; i <= steps; i++) {
+    const s = (length * i) / steps;
+    const p = alignment.horizontal.pointAt(s);
+    const d = (p.x - x) ** 2 + (p.y - z) ** 2;
+    if (d < bestDistance) {
+      bestDistance = d;
+      best = s;
+    }
+  }
+  const span = length / steps;
+  for (let i = -4; i <= 4; i++) {
+    const s = clamp(best + (span * i) / 4, 0, length);
+    const p = alignment.horizontal.pointAt(s);
+    const d = (p.x - x) ** 2 + (p.y - z) ** 2;
+    if (d < bestDistance) {
+      bestDistance = d;
+      best = s;
+    }
+  }
+  return best;
+}

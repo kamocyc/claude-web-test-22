@@ -1401,15 +1401,14 @@ export class WorldBuilder {
     // Ground stations flatten their whole footprint. Elevated stations preserve the
     // terrain and only clear the volume directly below the shared deck.
     for (const station of this.network.stations.values()) {
-      const ring = stationFootprint(
-        station,
-        0,
-        station.center.y - gradingDrop(getClass('rail_single')),
-      );
+      // 敷地は中心線に沿った多角形 (曲線の駅では 4 隅では足りない)。高さも
+      // 中心線から取るので、勾配のある駅でも水平面に潰れない。
+      const ring = stationFootprint(station, 0, gradingDrop(getClass('rail_single')));
       if (station.elevated) {
-        grading.blockQuad(ring[0], ring[1], ring[2], ring[3]);
-        const carved = ring.map((point) => point.clone().setY(station.center.y - DECK_CLEARANCE));
-        grading.carveQuad(carved[0], carved[1], carved[2], carved[3]);
+        grading.blockPolygon(ring);
+        grading.carvePolygon(
+          stationFootprint(station, 0, DECK_CLEARANCE),
+        );
       } else {
         grading.stampPolygon(ring, { distance: 0 });
       }

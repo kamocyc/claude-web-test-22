@@ -5,6 +5,7 @@ import { VerticalProfile } from '../core/profile';
 import { getClass, type NetworkClass } from './classes';
 import {
   planStationLayout,
+  straightStationPath,
   validateStationSpec,
   type Station,
   type StationId,
@@ -497,6 +498,9 @@ export class Network {
       platforms: layout.platforms,
       minOffset: layout.minOffset,
       maxOffset: layout.maxOffset,
+      path: straightStationPath(spec),
+      adopted: null,
+      approaches: [],
     };
     this.stations.set(id, station);
     this.touch();

@@ -37,6 +37,7 @@ import { checkPlacement, junctionReach } from '../network/rules';
 import {
   planStationLayout,
   stationAt,
+  straightStationPath,
   stationPlatformRange,
   validateStationSpec,
   type Station,
@@ -465,6 +466,9 @@ export class BuildTool {
       platforms: layout.platforms,
       minOffset: layout.minOffset,
       maxOffset: layout.maxOffset,
+      path: straightStationPath(spec),
+      adopted: null,
+      approaches: [],
     };
     this.blockers = [
       ...(this.elevationOffset < 0 ? ['地下駅には対応していません'] : []),
