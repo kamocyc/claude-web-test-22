@@ -302,6 +302,27 @@
         text-decoration: underline;
       }
 
+      /* 自動生成した都市の一覧。押すとその都市へ視点が飛ぶ。 */
+      .cities button.line {
+        appearance: none;
+        width: 100%;
+        margin: 0;
+        padding: 3px 0;
+        font: inherit;
+        color: inherit;
+        text-align: left;
+        background: none;
+        border: none;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+        cursor: pointer;
+      }
+
+      .cities button.line:hover,
+      .cities button.line:focus-visible {
+        background: rgba(255, 255, 255, 0.08);
+        text-decoration: underline;
+      }
+
       /* 確認モードのグラフ。区間全体の曲率と勾配を 2 段の帯で見せる。 */
       .graph {
         display: block;

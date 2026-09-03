@@ -50,11 +50,22 @@ export interface UiCallbacks {
   onParallelSnap: (on: boolean) => void;
   onRegenerate: () => void;
   onDemo: () => void;
+  /** 地形から都市と、都市を結ぶ道路網を自動で作る。 */
+  onAutoWorld: () => void;
   /** インターチェンジのサンプルを置く。 */
   onInterchange: (kind: 'diamond' | 'trumpet') => void;
   onClear: () => void;
   /** 警告の行から、その場所へ視点を飛ばす。 */
   onFocus: (position: Vector3) => void;
+}
+
+/** 一覧に出す都市 1 つぶん。 */
+export interface CityEntry {
+  name: string;
+  /** 規模・人口など、名前の後ろに薄く出す説明。 */
+  detail: string;
+  /** 行を押したときに飛ぶ先。 */
+  position: Vector3;
 }
 
 interface ToggleSpec {
@@ -94,6 +105,8 @@ export class Ui {
   private readonly graphBody: HTMLElement;
   private readonly warningBody: HTMLElement;
   private readonly statsBody: HTMLElement;
+  private readonly cityTitle: HTMLElement;
+  private readonly cityBody: HTMLElement;
   /** 直前に描いた状態の HTML。毎フレーム組み直さないための控え。 */
   private statusHtml = '';
   /** グラフを描いた線形。同じ線形の間は SVG を作り直さない。 */
@@ -309,6 +322,7 @@ export class Ui {
     const mapRow = el('div', 'row');
     mapRow.append(
       button('地形を再生成', callbacks.onRegenerate),
+      button('都市と道路を生成', callbacks.onAutoWorld),
       button('サンプル', callbacks.onDemo),
       button('ダイヤ型 IC', () => callbacks.onInterchange('diamond')),
       button('トランペット IC', () => callbacks.onInterchange('trumpet')),
@@ -327,6 +341,10 @@ export class Ui {
     right.append(sectionTitle('集計'));
     this.statsBody = el('div', 'readout');
     right.append(this.statsBody);
+    this.cityTitle = sectionTitle('都市');
+    this.cityBody = el('div', 'readout cities');
+    right.append(this.cityTitle, this.cityBody);
+    this.setCities([]);
     right.append(sectionTitle('警告'));
     this.warningBody = el('div', 'readout warnings');
     right.append(this.warningBody);
@@ -649,6 +667,27 @@ export class Ui {
   }
 
   /** 警告の一覧を描き直す。 */
+  /**
+   * 自動生成した都市の一覧を出す。行を押すとその都市へ視点が飛ぶ。
+   *
+   * 空の配列を渡すと見出しごと消える (手で敷いているときは都市が無い)。
+   */
+  setCities(cities: readonly CityEntry[]): void {
+    this.cityTitle.hidden = cities.length === 0;
+    this.cityBody.hidden = cities.length === 0;
+    this.cityBody.replaceChildren();
+    for (const city of cities) {
+      const line = el('button', 'line');
+      line.append(document.createTextNode(city.name));
+      const detail = el('span');
+      detail.textContent = city.detail;
+      line.append(detail);
+      line.title = 'クリックでその都市へ';
+      line.addEventListener('click', () => this.callbacks.onFocus(city.position.clone()));
+      this.cityBody.append(line);
+    }
+  }
+
   private renderWarnings(warnings: readonly WorldWarning[]): void {
     const groups = groupWarnings(warnings);
     this.warningBody.replaceChildren();

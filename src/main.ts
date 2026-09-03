@@ -1,5 +1,6 @@
 import { Vector3 } from 'three';
 import { BuildTool, type ToolMode } from './app/buildTool';
+import { buildAutoWorld } from './app/autoWorld';
 import { buildDemoNetwork, buildInterchangeDemo } from './app/demo';
 import { Ride } from './app/ride';
 import { Ui } from './app/ui';
@@ -97,11 +98,29 @@ const ui = new Ui(uiRoot, {
   },
   onDemo: () => {
     buildDemoNetwork(network, field);
+    ui.setCities([]);
     tool.cancel();
     dirty = true;
   },
+  onAutoWorld: () => {
+    // 地形と同じ種で作る。地形を再生成すれば、都市も道路網も付いてくる。
+    const result = buildAutoWorld(network, field, { seed: terrainSeed, zones: world.zones });
+    world.lines.clear();
+    tool.cancel();
+    dirty = true;
+    ui.setCities(
+      result.cities.map((city) => ({
+        name: city.name,
+        detail: `${city.tier === 2 ? '大都市' : city.tier === 1 ? '市' : '町'} · ${Math.round(
+          city.population / 1000,
+        )} 千人`,
+        position: new Vector3(city.x, field.baseHeightAt(city.x, city.z), city.z),
+      })),
+    );
+  },
   onInterchange: (kind) => {
     buildInterchangeDemo(network, field, kind);
+    ui.setCities([]);
     tool.cancel();
     dirty = true;
   },
@@ -109,6 +128,7 @@ const ui = new Ui(uiRoot, {
     network.clear();
     world.zones.clear();
     world.lines.clear();
+    ui.setCities([]);
     tool.cancel();
     dirty = true;
   },

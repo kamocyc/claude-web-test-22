@@ -1,6 +1,13 @@
 import { Vector3 } from 'three';
+import { Alignment } from '../core/alignment';
+import { VerticalProfile } from '../core/profile';
 import { clamp } from '../core/units';
 import { getClass, type NetworkClass } from '../network/classes';
+import {
+  applyRoadEdit,
+  planCrossingHeights,
+  splitAtCrossing,
+} from '../network/crossingHeight';
 import {
   anchorFromNode,
   computePlacement,
@@ -9,8 +16,8 @@ import {
   type PlaceResult,
   type PlacementPreview,
 } from '../network/editing';
-import type { Network } from '../network/network';
-import { offsetCurve, parallelSpacing } from '../network/parallel';
+import type { Network, SegmentId } from '../network/network';
+import { offsetCurve, parallelSpacing, previewFromAlignment } from '../network/parallel';
 import type { Heightfield } from '../terrain/heightfield';
 
 /**
@@ -36,6 +43,15 @@ export interface DrawOptions {
   start?: Anchor;
   /** 終点の接続先。既存の線形の途中に取り付けるときに指定する。 */
   end?: Anchor;
+  /**
+   * 既存の線形と交わる所で、交点の高さに合わせて交差点にする。
+   *
+   * 手で引くときは敷設ツールが必ず通す道 (`planCrossingHeights`) だが、
+   * 経由点から引くときは既定で通さない。交点で区間が分かれるので、
+   * 「経由点ごとに 1 本」という数え方が変わるため。自動生成のように
+   * **どこで交わるか分からない線形**を敷くときに立てる。
+   */
+  matchCrossings?: boolean;
 }
 
 /** 経由点を順に繋いで線形を引く。 */
@@ -64,19 +80,106 @@ export function draw(
     });
     const last = i === points.length - 1;
     const end: Anchor = last && options.end ? { ...options.end } : { pos: target };
-    const result = placeSegment(network, classId, anchor, end, preview);
+    const result = options.matchCrossings
+      ? placeMatched(network, classId, anchor, end, preview)
+      : placeSegment(network, classId, anchor, end, preview);
     results.push(result);
     const endNode = network.nodes.get(result.endNode);
     if (!endNode) break;
-    anchor = {
-      pos: endNode.pos.clone(),
-      node: endNode.id,
-      tangent: preview.endTangent.clone(),
-      grade: preview.endGrade,
-      curvature: preview.endCurvature,
-    };
+    anchor = options.matchCrossings
+      ? // 交点で高さを合わせると、終点の勾配はプレビューと変わる。敷いた
+        // 線形から取り直さないと、次の区間の継ぎ目で勾配が飛ぶ。
+        anchorFromNode(network, endNode, cls)
+      : {
+          pos: endNode.pos.clone(),
+          node: endNode.id,
+          tangent: preview.endTangent.clone(),
+          grade: preview.endGrade,
+          curvature: preview.endCurvature,
+        };
   }
   return results;
+}
+
+/**
+ * 交点の高さに合わせて 1 本敷く。
+ *
+ * 敷設ツールが手で引くときにしているのと同じことをする。既存の線形と
+ * 交わる所で区間を分け、交点では**先に相手を分割**して、できたノードへ
+ * 向けて敷く。高さがぴたりと揃うので、そこは交差点になる。合わせずに
+ * 敷くと、数十 cm の食い違いで交差点にならず「桁下が足りない」立体交差に
+ * なってしまう (`AUTO_JUNCTION_TOLERANCE` は 0.4 m しかない)。
+ *
+ * 合わせられない (勾配が規格に収まらない) ときは、立案が元の 1 本を返すので
+ * 従来どおりの敷き方になる。
+ */
+export function placeMatched(
+  network: Network,
+  classId: string,
+  start: Anchor,
+  end: Anchor,
+  preview: PlacementPreview,
+): PlaceResult {
+  const cls = getClass(classId);
+  const alignment = new Alignment(
+    preview.horizontal,
+    new VerticalProfile(
+      preview.start.y,
+      preview.end.y,
+      preview.startGrade,
+      preview.endGrade,
+      preview.horizontal.length,
+    ),
+  );
+  const plan = planCrossingHeights(
+    network,
+    cls,
+    alignment,
+    {
+      startGrade: preview.startGrade,
+      // 到着側が既存の線形に繋がるなら、その勾配を守る。
+      endGrade: end.node !== undefined || end.split ? preview.endGrade : null,
+    },
+    { startNode: start.node, endNode: end.node },
+  );
+  if (!plan) return placeSegment(network, classId, start, end, preview);
+
+  // 引き直しで自分の区間を拾わないように覚えておく。
+  const placed = new Set<SegmentId>();
+  const laid: { segment: SegmentId; preview: PlacementPreview }[] = [];
+  let anchor = start;
+  let result: PlaceResult | null = null;
+
+  for (const [index, leg] of plan.legs.entries()) {
+    const legPreview = previewFromAlignment(leg.alignment);
+    let target: Anchor;
+    if (!leg.joint) {
+      target = index === plan.legs.length - 1 ? end : { pos: legPreview.end.clone() };
+    } else {
+      const node = splitAtCrossing(network, leg.joint, placed);
+      target = node ? { pos: node.pos.clone(), node: node.id } : { pos: legPreview.end.clone() };
+    }
+    result = placeSegment(network, classId, anchor, target, legPreview);
+    placed.add(result.segment);
+    laid.push({ segment: result.segment, preview: legPreview });
+    const node = network.nodes.get(result.endNode);
+    anchor = node ? { pos: node.pos.clone(), node: node.id } : { pos: legPreview.end.clone() };
+  }
+
+  // 区間どうしの継ぎ目では `smoothGradeJoint` が勾配を動かす。交点の高さに
+  // 合わせて解いた勾配を入れ直す (敷き終わってからでないとまた動かされる)。
+  for (const [index, entry] of laid.entries()) {
+    // あとの区間が自分と交わっていると、敷いた区間はそこで分割されている。
+    // 分割の時点で勾配は連続に配られているので、そのままでよい。
+    if (!network.segments.has(entry.segment)) continue;
+    network.updateSegment(entry.segment, {
+      ...(index > 0 ? { gradeA: entry.preview.startGrade } : {}),
+      ...(index < laid.length - 1 ? { gradeB: entry.preview.endGrade } : {}),
+    });
+  }
+  // 既設の道路を曲げるのは最後。敷く場所には影響しない。
+  for (const edit of plan.roadEdits) applyRoadEdit(network, edit, placed);
+  return result as PlaceResult;
 }
 
 /** 並べて敷く 1 本ぶん。 */
