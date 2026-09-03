@@ -102,15 +102,17 @@ const ui = new Ui(uiRoot, {
       terrainSeed = (terrainSeed * 1664525 + 1013904223) >>> 0;
       const next = generateTerrain(field, { ...DEFAULT_TERRAIN, seed: terrainSeed });
       waterView.build(next.water);
-      // 地形が変われば、見本を建てるのに向いた場所も変わる。
+      // 地形が変われば、見本を建てるのに向いた場所も変わる。視点は動かさない
+      // — 敷いたネットワークはそのまま残るので、そこから離れると困る。
       home = demoSite(field);
-      lookHome();
       dirty = true;
     });
   },
   onDemo: () => {
     buildDemoNetwork(network, field, home);
     tool.cancel();
+    // 見本は地形から選んだ場所に建つので、そこへ視点を移す。
+    lookHome();
     dirty = true;
   },
   onInterchange: (kind) => {
