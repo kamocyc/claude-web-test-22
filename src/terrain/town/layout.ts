@@ -193,7 +193,10 @@ function collectRuns(
         previous = null;
         continue;
       }
-      run.push(p);
+      // 折れ線に残すのは格子点だけ。間の点は通れるかを見るためだけに採る。
+      // こうすると縦横の街路が必ず同じ点を共有し、実際の道路として敷いた
+      // ときにそこが交差点になる。
+      if (k % 2 === 0) run.push(p);
       previous = p;
     }
     flush();

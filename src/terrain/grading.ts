@@ -84,6 +84,30 @@ interface ProtectedRect {
   halfAcross: number;
 }
 
+/** `apply` まで溜めておく焼き込みの指示。 */
+interface Command {
+  kind: 'stamp' | 'block' | 'carve';
+  a: Vector3;
+  b: Vector3;
+  c: Vector3;
+  options: StampOptions | null;
+  bounds: GridRegion;
+}
+
+/** 離れた焼き込みの塊。 */
+interface Cluster {
+  commands: Command[];
+  bounds: GridRegion;
+}
+
+/**
+ * 離れた焼き込みを別の塊とみなす距離 [セル]。
+ *
+ * 法面が届く距離より広く取る。これより近ければ互いの法面が干渉しうるので、
+ * 同じ塊として一緒に解かなければならない。
+ */
+const CLUSTER_MARGIN = 128;
+
 export class TerrainGrading {
   private readonly field: Heightfield;
   private target = new Float32Array(0);
@@ -103,8 +127,16 @@ export class TerrainGrading {
    * 格子はマップ全体ぶんあるが、実際に触るのは線形のまわりだけ。走査を
    * この矩形に絞ることで、マップを広げても再構築の重さが変わらない。
    */
-  private stamped: GridRegion | null = null;
-  private applied: GridRegion | null = null;
+  /**
+   * 焼き込みの指示。`apply` まで実行しない。
+   *
+   * すぐ格子へ書くと、作業配列は**すべての焼き込みを含む 1 つの矩形**を
+   * 覆わなければならない。20 km 離れた 2 か所に敷くとそれがマップ全面になり、
+   * 800 MB を確保して毎編集で舐めることになる。指示を溜めておいて、
+   * 離れた塊ごとに順に処理すれば、窓は塊 1 つぶんで足りる。
+   */
+  private readonly commands: Command[] = [];
+  private applied: GridRegion[] = [];
 
   /**
    * 作業配列が覆っている格子の矩形。
@@ -117,6 +149,8 @@ export class TerrainGrading {
    * 添字なので、2 つの添字空間を取り違えないこと。
    */
   private win = { ix0: 0, iz0: 0, ix1: -1, iz1: -1, stride: 0 };
+  /** 確保してある作業配列の長さ。窓より大きければ使い回す。 */
+  private capacity = 0;
 
   constructor(field: Heightfield) {
     this.field = field;
@@ -128,77 +162,41 @@ export class TerrainGrading {
   }
 
   /**
-   * 窓が `region` を覆うようにする。足りなければ広げて中身を移す。
+   * 窓をこの矩形に張り直す。中身は引き継がない (呼び側が `clearRegion` で
+   * 初期値に戻す)。
    *
-   * 広げるときは 64 マス単位に丸めて、線形を 1 本ずつ足すたびに
-   * 確保し直さないようにする。
+   * 塊をまたいで広げてはいけない。広げると、20 km 離れた 2 か所に敷いた
+   * だけで窓がマップ全面になり、せっかく塊に分けた意味が無くなる。
+   * 配列は足りていれば使い回すので、確保し直すのは大きな塊が来たときだけ。
    */
-  private ensureWindow(region: GridRegion): void {
-    const win = this.win;
-    if (
-      win.stride > 0 &&
-      region.ix0 >= win.ix0 &&
-      region.iz0 >= win.iz0 &&
-      region.ix1 <= win.ix1 &&
-      region.iz1 <= win.iz1
-    ) {
-      return;
+  private setWindow(region: GridRegion): void {
+    const stride = region.ix1 - region.ix0 + 1;
+    const rows = region.iz1 - region.iz0 + 1;
+    const n = stride * rows;
+    if (n > this.capacity) {
+      this.capacity = n;
+      this.target = new Float32Array(n);
+      this.seeded = new Uint8Array(n);
+      this.core = new Uint8Array(n);
+      this.coreDistance = new Float32Array(n);
+      this.blocked = new Uint8Array(n);
+      this.ceiling = new Float32Array(n);
+      this.upper = new Float32Array(n);
+      this.lower = new Float32Array(n);
+      this.edgeUpper = new Float32Array(n);
+      this.edgeLower = new Float32Array(n);
     }
-    const cells = this.field.cells;
-    const block = 64;
-    const ix0 = Math.max(0, Math.floor(Math.min(region.ix0, win.stride > 0 ? win.ix0 : region.ix0) / block) * block);
-    const iz0 = Math.max(0, Math.floor(Math.min(region.iz0, win.stride > 0 ? win.iz0 : region.iz0) / block) * block);
-    const ix1 = Math.min(cells, Math.ceil((Math.max(region.ix1, win.ix1) + 1) / block) * block);
-    const iz1 = Math.min(cells, Math.ceil((Math.max(region.iz1, win.iz1) + 1) / block) * block);
-    const stride = ix1 - ix0 + 1;
-    const n = stride * (iz1 - iz0 + 1);
-
-    const next = {
-      target: new Float32Array(n),
-      seeded: new Uint8Array(n),
-      core: new Uint8Array(n),
-      coreDistance: new Float32Array(n),
-      blocked: new Uint8Array(n),
-      ceiling: new Float32Array(n).fill(INF),
-      upper: new Float32Array(n).fill(INF),
-      lower: new Float32Array(n).fill(-INF),
-      edgeUpper: new Float32Array(n).fill(INF),
-      edgeLower: new Float32Array(n).fill(-INF),
-    };
-    // 既にある窓の中身を、行ごとに新しい窓へ写す。
-    if (win.stride > 0) {
-      for (let iz = win.iz0; iz <= win.iz1; iz++) {
-        const from = (iz - win.iz0) * win.stride;
-        const to = (iz - iz0) * stride + (win.ix0 - ix0);
-        const width = win.ix1 - win.ix0 + 1;
-        next.target.set(this.target.subarray(from, from + width), to);
-        next.seeded.set(this.seeded.subarray(from, from + width), to);
-        next.core.set(this.core.subarray(from, from + width), to);
-        next.coreDistance.set(this.coreDistance.subarray(from, from + width), to);
-        next.blocked.set(this.blocked.subarray(from, from + width), to);
-        next.ceiling.set(this.ceiling.subarray(from, from + width), to);
-        next.upper.set(this.upper.subarray(from, from + width), to);
-        next.lower.set(this.lower.subarray(from, from + width), to);
-        next.edgeUpper.set(this.edgeUpper.subarray(from, from + width), to);
-        next.edgeLower.set(this.edgeLower.subarray(from, from + width), to);
-      }
-    }
-    this.target = next.target;
-    this.seeded = next.seeded;
-    this.core = next.core;
-    this.coreDistance = next.coreDistance;
-    this.blocked = next.blocked;
-    this.ceiling = next.ceiling;
-    this.upper = next.upper;
-    this.lower = next.lower;
-    this.edgeUpper = next.edgeUpper;
-    this.edgeLower = next.edgeLower;
-    this.win = { ix0, iz0, ix1, iz1, stride };
+    this.win = { ix0: region.ix0, iz0: region.iz0, ix1: region.ix1, iz1: region.iz1, stride };
   }
 
   reset(): void {
-    // 触った範囲だけを戻す。全体を埋めると、格子の数だけ空回りする。
-    this.forEachIndex(this.stamped, (i) => {
+    this.commands.length = 0;
+    this.protectedRects.length = 0;
+  }
+
+  /** 窓の中のこの矩形を初期値に戻す。塊を処理する前に呼ぶ。 */
+  private clearRegion(region: GridRegion): void {
+    this.forEachIndex(region, (i) => {
       this.seeded[i] = 0;
       this.core[i] = 0;
       this.coreDistance[i] = 0;
@@ -207,8 +205,6 @@ export class TerrainGrading {
       this.edgeUpper[i] = INF;
       this.edgeLower[i] = -INF;
     });
-    this.stamped = null;
-    this.protectedRects.length = 0;
   }
 
   /** 矩形の格子点を走査する。矩形が無ければ何もしない。 */
@@ -222,19 +218,24 @@ export class TerrainGrading {
     }
   }
 
-  /** 焼き込んだ範囲を広げる。 */
-  private include(ix0: number, iz0: number, ix1: number, iz1: number): void {
-    // 焼き込みの外側 1 マスは `apply` が初期値に戻すので、窓にも含める。
-    this.ensureWindow({ ix0: Math.max(0, ix0 - 1), iz0: Math.max(0, iz0 - 1), ix1, iz1 });
-    if (!this.stamped) {
-      this.stamped = { ix0, iz0, ix1, iz1 };
-      return;
-    }
-    const r = this.stamped;
-    if (ix0 < r.ix0) r.ix0 = ix0;
-    if (iz0 < r.iz0) r.iz0 = iz0;
-    if (ix1 > r.ix1) r.ix1 = ix1;
-    if (iz1 > r.iz1) r.iz1 = iz1;
+  /** 三角形が掛かる格子の矩形。焼き込みの帯のぶんだけ広げる。 */
+  private triangleBounds(a: Vector3, b: Vector3, c: Vector3, pad: number): GridRegion | null {
+    const f = this.field;
+    const ax = f.toGridX(a.x);
+    const az = f.toGridZ(a.z);
+    const bx = f.toGridX(b.x);
+    const bz = f.toGridZ(b.z);
+    const cx = f.toGridX(c.x);
+    const cz = f.toGridZ(c.z);
+    return clampRegion(
+      {
+        ix0: Math.floor(Math.min(ax, bx, cx)) - pad,
+        iz0: Math.floor(Math.min(az, bz, cz)) - pad,
+        ix1: Math.ceil(Math.max(ax, bx, cx)) + pad,
+        iz1: Math.ceil(Math.max(az, bz, cz)) + pad,
+      },
+      f.cells,
+    );
   }
 
   /**
@@ -264,6 +265,11 @@ export class TerrainGrading {
 
   /** 三角形の範囲の格子点に目標高さを焼き込む。重なった場合は低い方を採用する。 */
   stampTriangle(a: Vector3, b: Vector3, c: Vector3, options: StampOptions = {}): void {
+    this.push('stamp', a, b, c, options.interior ? 1 : EDGE_BAND_CELLS, options);
+  }
+
+  /** 溜めた指示を 1 つ実行する (`apply` の中から)。 */
+  private runStamp(a: Vector3, b: Vector3, c: Vector3, options: StampOptions): void {
     const core = options.core ?? true;
     const distance = options.distance ?? 0;
     const respectProtected = !options.ignoreProtected && this.protectedRects.length > 0;
@@ -339,9 +345,7 @@ export class TerrainGrading {
 
   /** 整地の伝播を遮断する領域 (橋・トンネルの下) を指定する。 */
   block(a: Vector3, b: Vector3, c: Vector3): void {
-    this.rasterize(a, b, c, (i) => {
-      if (!this.seeded[i]) this.blocked[i] = 1;
-    });
+    this.push('block', a, b, c, 1, null);
   }
 
   blockQuad(a: Vector3, b: Vector3, c: Vector3, d: Vector3): void {
@@ -358,9 +362,21 @@ export class TerrainGrading {
    * 上に被さって道路が埋まってしまう。地形が桁より高い所だけを削る。
    */
   carveTriangle(a: Vector3, b: Vector3, c: Vector3): void {
-    this.rasterize(a, b, c, (i, y) => {
-      if (y < this.ceiling[i]) this.ceiling[i] = y;
-    });
+    this.push('carve', a, b, c, 1, null);
+  }
+
+  /** 指示を溜める。頂点は写しておく (呼び側があとで動かしても影響しない)。 */
+  private push(
+    kind: Command['kind'],
+    a: Vector3,
+    b: Vector3,
+    c: Vector3,
+    pad: number,
+    options: StampOptions | null,
+  ): void {
+    const bounds = this.triangleBounds(a, b, c, pad);
+    if (!bounds) return;
+    this.commands.push({ kind, a: a.clone(), b: b.clone(), c: c.clone(), options, bounds });
   }
 
   carveQuad(a: Vector3, b: Vector3, c: Vector3, d: Vector3): void {
@@ -406,7 +422,6 @@ export class TerrainGrading {
     const eps1 = (slack * Math.hypot(cx - ax, cz - az)) / Math.abs(area);
     const eps2 = (slack * Math.hypot(ax - bx, az - bz)) / Math.abs(area);
 
-    this.include(minX, minZ, maxX, maxZ);
 
     // 縁までの距離を測る作業変数。点ごとに閉包を作らないよう外に置く。
     let bestD2 = 0;
@@ -468,37 +483,99 @@ export class TerrainGrading {
    * 戻り値は**地形が変わりうる範囲** (前回の範囲との和) で、地形メッシュを
    * 更新する範囲に使う。
    */
-  apply(): GridRegion | null {
+  apply(): GridRegion[] {
+    // 離れた焼き込みは別々に解く。1 つの矩形にまとめると、20 km 離れた
+    // 2 か所に敷いただけで作業配列がマップ全面になる。
+    const clusters = this.buildClusters();
+
+    // まず前回の整地の跡を消す。
+    for (const region of this.applied) this.restore(region);
+
+    const regions: GridRegion[] = [];
+    for (const cluster of clusters) {
+      const region = this.solveCluster(cluster);
+      if (!region) continue;
+      // 自然地形へ戻してから書く (水の下や遮断した所は書かないため)。
+      this.restore(region);
+      this.writeCluster(region);
+      regions.push(region);
+    }
+    const changed = [...regions, ...this.applied];
+    this.applied = regions;
+    return changed;
+  }
+
+  /** その矩形を自然地形へ戻す。 */
+  private restore(region: GridRegion): void {
     const f = this.field;
     const stride = f.stride;
-    const cells = f.cells;
-    const base = f.base;
-    const work = f.work;
+    for (let iz = region.iz0; iz <= region.iz1; iz++) {
+      const from = iz * stride + region.ix0;
+      f.work.set(f.base.subarray(from, from + (region.ix1 - region.ix0 + 1)), from);
+    }
+  }
 
-    const region = this.workingRegion();
-    const changed = union(region, this.applied);
-    this.applied = region;
-
-    // 自然地形へ戻す。前回の整地の跡はこれで消える。マップ全体を写すと
-    // 20,480 m 四方では 1 編集ごとに 105 MB のコピーになるので、
-    // 地形が変わりうる矩形の行だけを戻す。その外は前回も触っていない。
-    if (changed) {
-      for (let iz = changed.iz0; iz <= changed.iz1; iz++) {
-        const from = iz * stride + changed.ix0;
-        work.set(base.subarray(from, from + (changed.ix1 - changed.ix0 + 1)), from);
+  /** 指示を、法面が届く距離で繋がる塊にまとめる。 */
+  private buildClusters(): Cluster[] {
+    const clusters: Cluster[] = [];
+    for (const command of this.commands) {
+      let host: Cluster | null = null;
+      for (const cluster of clusters) {
+        if (!near(cluster.bounds, command.bounds, CLUSTER_MARGIN)) continue;
+        if (host) {
+          // 2 つの塊を繋いだので 1 つにまとめる。
+          host.commands.push(...cluster.commands);
+          host.bounds = merge(host.bounds, cluster.bounds);
+          cluster.commands.length = 0;
+          cluster.bounds = { ix0: 1, iz0: 1, ix1: -1, iz1: -1 };
+          continue;
+        }
+        host = cluster;
+      }
+      if (host) {
+        host.commands.push(command);
+        host.bounds = merge(host.bounds, command.bounds);
+      } else {
+        clusters.push({ commands: [command], bounds: { ...command.bounds } });
       }
     }
-    if (!region) return changed;
+    return clusters.filter((cluster) => cluster.commands.length > 0);
+  }
 
-    // 走査する矩形の外側 1 マスも初期値に戻す。境界の格子点が、その外の
-    // 古い値を参照して伝播してしまうのを防ぐ。
-    const guard = {
-      ix0: Math.max(0, region.ix0 - 1),
-      iz0: Math.max(0, region.iz0 - 1),
-      ix1: Math.min(cells, region.ix1 + 1),
-      iz1: Math.min(cells, region.iz1 + 1),
-    };
-    this.ensureWindow(guard);
+  /**
+   * 塊 1 つを解いて、地形が変わりうる範囲を返す。
+   *
+   * 窓をこの塊に合わせ、指示を実行し、法面を伝播させる。書き込みは
+   * `writeCluster` で行う (`work` を戻したあとでなければならない)。
+   */
+  private solveCluster(cluster: Cluster): GridRegion | null {
+    const f = this.field;
+    const cells = f.cells;
+    const stamped = cluster.bounds;
+    // 法面が届きうる距離ぶん余裕を取って窓を張る。塊を分ける距離より広い
+    // 法面はありえないので、これで走査する範囲は必ず窓に収まる。
+    const windowBounds = clampRegion(expand(stamped, CLUSTER_MARGIN + 1), cells);
+    if (!windowBounds) return null;
+    this.setWindow(windowBounds);
+    this.clearRegion(windowBounds);
+
+    for (const command of cluster.commands) {
+      if (command.kind === 'stamp') this.runStamp(command.a, command.b, command.c, command.options ?? {});
+      else if (command.kind === 'block') {
+        this.rasterize(command.a, command.b, command.c, (i) => {
+          if (!this.seeded[i]) this.blocked[i] = 1;
+        });
+      } else {
+        this.rasterize(command.a, command.b, command.c, (i, y) => {
+          if (y < this.ceiling[i]) this.ceiling[i] = y;
+        });
+      }
+    }
+
+    const region = this.workingRegion(stamped);
+    if (!region) return null;
+
+    const guard = clampRegion(expand(region, 1), cells) ?? region;
 
     const upper = this.upper;
     const lower = this.lower;
@@ -508,6 +585,8 @@ export class TerrainGrading {
     const win = this.win;
     const wstride = win.stride;
 
+    // 走査する矩形の外側 1 マスも初期値に戻す。境界の格子点が、その外の
+    // 古い値を参照して伝播してしまうのを防ぐ。
     for (let iz = guard.iz0; iz <= guard.iz1; iz++) {
       const row = (iz - win.iz0) * wstride - win.ix0;
       for (let ix = guard.ix0; ix <= guard.ix1; ix++) {
@@ -565,11 +644,23 @@ export class TerrainGrading {
         }
       }
     }
+    return region;
+  }
 
+  /** 解いた結果を `work` に写す。窓はまだその塊のもの。 */
+  private writeCluster(region: GridRegion): void {
+    const f = this.field;
+    const stride = f.stride;
+    const base = f.base;
+    const work = f.work;
+    const upper = this.upper;
+    const lower = this.lower;
+    const blocked = this.blocked;
     const ceiling = this.ceiling;
     const water = f.water;
+    const wstride = this.win.stride;
     for (let iz = region.iz0; iz <= region.iz1; iz++) {
-      const row = (iz - win.iz0) * wstride - win.ix0;
+      const row = (iz - this.win.iz0) * wstride - this.win.ix0;
       const globalRow = iz * stride;
       const wz = f.worldZ(iz);
       for (let ix = region.ix0; ix <= region.ix1; ix++) {
@@ -589,8 +680,6 @@ export class TerrainGrading {
         if (work[g] > ceiling[i]) work[g] = ceiling[i];
       }
     }
-
-    return changed;
   }
 
   /**
@@ -601,9 +690,7 @@ export class TerrainGrading {
    * どちらも地形の高さの幅から決まる。ここを外れた格子点は、伝播させても
    * 自然地形のままにしかならない。
    */
-  private workingRegion(): GridRegion | null {
-    const stamped = this.stamped;
-    if (!stamped) return null;
+  private workingRegion(stamped: GridRegion): GridRegion | null {
     const f = this.field;
 
     let minTarget = INF;
@@ -629,7 +716,8 @@ export class TerrainGrading {
       const range = this.baseRangeIn(expand(stamped, margin), f);
       const cut = Math.max(0, range.max - minTarget) / CUT_SLOPE;
       const fill = Math.max(0, maxTarget - range.min) / FILL_SLOPE;
-      reach = Math.ceil(Math.max(cut, fill) / f.cell) + 2;
+      // 塊を分ける距離より広い法面はありえない (あれば塊が繋がっている)。
+      reach = Math.min(CLUSTER_MARGIN, Math.ceil(Math.max(cut, fill) / f.cell) + 2);
       if (reach <= margin) break;
       margin = reach;
     }
@@ -656,6 +744,26 @@ export class TerrainGrading {
   }
 }
 
+/** 2 つの矩形が、`margin` セル以内に近づいているか。 */
+function near(a: GridRegion, b: GridRegion, margin: number): boolean {
+  return (
+    a.ix0 - margin <= b.ix1 &&
+    b.ix0 - margin <= a.ix1 &&
+    a.iz0 - margin <= b.iz1 &&
+    b.iz0 - margin <= a.iz1
+  );
+}
+
+/** 2 つの矩形を含む最小の矩形。 */
+function merge(a: GridRegion, b: GridRegion): GridRegion {
+  return {
+    ix0: Math.min(a.ix0, b.ix0),
+    iz0: Math.min(a.iz0, b.iz0),
+    ix1: Math.max(a.ix1, b.ix1),
+    iz1: Math.max(a.iz1, b.iz1),
+  };
+}
+
 /** 矩形を四方へ広げる。 */
 function expand(region: GridRegion, by: number): GridRegion {
   return {
@@ -674,14 +782,3 @@ function clampRegion(region: GridRegion, cells: number): GridRegion | null {
   return ix0 > ix1 || iz0 > iz1 ? null : { ix0, iz0, ix1, iz1 };
 }
 
-/** 2 つの矩形を含む最小の矩形。 */
-function union(a: GridRegion | null, b: GridRegion | null): GridRegion | null {
-  if (!a) return b;
-  if (!b) return a;
-  return {
-    ix0: Math.min(a.ix0, b.ix0),
-    iz0: Math.min(a.iz0, b.iz0),
-    ix1: Math.max(a.ix1, b.ix1),
-    iz1: Math.max(a.iz1, b.iz1),
-  };
-}

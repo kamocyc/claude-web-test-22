@@ -726,6 +726,8 @@ export function placeSegment(
   start: Anchor,
   end: Anchor,
   preview: PlacementPreview,
+  /** 町の街路として敷くときの町の番号。交差点にまとめる前に付ける。 */
+  town?: number,
 ): PlaceResult {
   // 線形が指した所まで届かなかった端は、届いた所を端点にする (`reachedAnchor`)。
   const startNode = resolveAnchor(network, reachedAnchor(start, preview.start));
@@ -741,6 +743,10 @@ export function placeSegment(
     gradeA: preview.startGrade,
     gradeB: preview.endGrade,
   });
+
+  // 交差点にまとめると分割で ID が変わるので、印はその前に付ける
+  // (`splitSegment` が半分ずつに引き継ぐ)。
+  if (town !== undefined) segment.town = town;
 
   const autoJunctions = resolveAutoJunctions(network, segment.id);
   // 既存の線形の端に繋いだ所は、両方を少し振って折れを消す。

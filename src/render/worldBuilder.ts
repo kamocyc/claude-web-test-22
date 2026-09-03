@@ -1284,7 +1284,7 @@ export class WorldBuilder {
     /** 踏切のまわりで整地目標を道路側に寄せる範囲。 */
     crossingZones: Map<SegmentId, CrossingZone[]>,
     blends: Map<SegmentId, SurfaceBlend[]>,
-  ): GridRegion | null {
+  ): GridRegion[] {
     const grading = this.grading;
     grading.reset();
 

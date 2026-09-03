@@ -8,6 +8,8 @@ import { Network } from './network/network';
 import { createPropMaterial, createTerrainMaterial, createWaterMaterial } from './render/materials';
 import { WaterView } from './render/water';
 import { TownView } from './render/townView';
+import { TownPlans } from './terrain/town/plans';
+import { TownRoads } from './app/townRoads';
 import { SnapView } from './render/snapView';
 import { WorldBuilder } from './render/worldBuilder';
 import { DEFAULT_TERRAIN, generateTerrain } from './terrain/generator';
@@ -32,12 +34,18 @@ const waterView = new WaterView(createWaterMaterial());
 viewport.scene.add(waterView.group);
 waterView.build(terrain.water);
 
-// 町。カメラのまわりのぶんだけ組む。
-const townView = new TownView(field, createPropMaterial());
+// 町。街路と敷地の控えは 1 か所に持ち、描く側と実際の道路にする側が
+// 同じ折れ線を見る。
+const townPlans = new TownPlans(field);
+townPlans.setTowns(terrain.towns);
+const townView = new TownView(field, townPlans, createPropMaterial());
 viewport.scene.add(townView.group);
-townView.setTowns(terrain.towns);
 
 const network = new Network();
+// 視点の近くの町は、街路を実際の道路として敷く。
+const townRoads = new TownRoads(network, field, townPlans, (index, paved) =>
+  townView.setPaved(index, paved),
+);
 const world = new WorldBuilder(network, field, terrainMesh);
 viewport.scene.add(world.group);
 
@@ -108,7 +116,9 @@ const ui = new Ui(uiRoot, {
       terrainSeed = (terrainSeed * 1664525 + 1013904223) >>> 0;
       const next = generateTerrain(field, { ...DEFAULT_TERRAIN, seed: terrainSeed });
       waterView.build(next.water);
-      townView.setTowns(next.towns);
+      townRoads.reset();
+      townPlans.setTowns(next.towns);
+      townView.reset();
       // 地形が変われば、見本を建てるのに向いた場所も変わる。視点は動かさない
       // — 敷いたネットワークはそのまま残るので、そこから離れると困る。
       home = demoSite(field);
@@ -116,6 +126,7 @@ const ui = new Ui(uiRoot, {
     });
   },
   onDemo: () => {
+    townRoads.reset();
     buildDemoNetwork(network, field, home);
     tool.cancel();
     // 見本は地形から選んだ場所に建つので、そこへ視点を移す。
@@ -123,11 +134,13 @@ const ui = new Ui(uiRoot, {
     dirty = true;
   },
   onInterchange: (kind) => {
+    townRoads.reset();
     buildInterchangeDemo(network, field, kind);
     tool.cancel();
     dirty = true;
   },
   onClear: () => {
+    townRoads.reset();
     network.clear();
     world.zones.clear();
     world.lines.clear();
@@ -288,6 +301,7 @@ declare global {
       tool: BuildTool;
       ride: Ride;
       towns: typeof terrain.towns;
+      townRoads: TownRoads;
       /** 指定した地点を、指定した距離・方位から見る。 */
       lookAt: (x: number, z: number, distance?: number, azimuth?: number) => void;
     };
@@ -302,6 +316,7 @@ window.trackBuilder = {
   tool,
   ride,
   towns: terrain.towns,
+  townRoads,
   lookAt: (x, z, distance = 120, azimuth = Math.PI * 0.25) => {
     const y = field.heightAt(x, z);
     viewport.controls.target.set(x, y, z);
@@ -534,6 +549,12 @@ function frame(): void {
   const time = (now - clock.start) / 1000;
   const dt = (now - clock.last) / 1000;
   clock.last = now;
+
+  // 近くの町を実際の道路にする。
+  //
+  // **再生成より前に**回す。ここでセグメントが増減するので、あとに回すと
+  // 交通が 1 フレームだけ古い車線図 (消えたセグメントを指す) で走ってしまう。
+  if (townRoads.update(viewport.controls.target.x, viewport.controls.target.z)) dirty = true;
 
   if (dirty) {
     dirty = false;

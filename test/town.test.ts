@@ -3,6 +3,12 @@ import { TOWN_DENSITY, TOWN_MIN_SPACING } from '../src/core/units';
 import { ZONE_SETBACK } from '../src/network/zoning';
 import { DEFAULT_TERRAIN, generateTerrain } from '../src/terrain/generator';
 import { planTown, toBuildingLot } from '../src/terrain/town/layout';
+import { TownPlans } from '../src/terrain/town/plans';
+import { TownRoads } from '../src/app/townRoads';
+import { Network } from '../src/network/network';
+import { anchorFromNode, computePlacement, placeSegment } from '../src/network/editing';
+import { getClass } from '../src/network/classes';
+import { Vector3 } from 'three';
 import { testField } from './support/field';
 
 /**
@@ -195,5 +201,97 @@ describe('町の街路と敷地', () => {
         expect(Number.isFinite(built.lowY)).toBe(true);
       }
     }
+  });
+});
+
+describe('近くの町を実際の道路にする', () => {
+  function paved() {
+    const field = testField();
+    const { towns } = generateTerrain(field, DEFAULT_TERRAIN);
+    const plans = new TownPlans(field);
+    plans.setTowns(towns);
+    const network = new Network();
+    const events: { index: number; paved: boolean }[] = [];
+    const roads = new TownRoads(network, field, plans, (index, on) => events.push({ index, paved: on }));
+    // いちばん街路の多い町を選ぶ (村だと 1 本も敷けないことがある)。
+    let best = 0;
+    for (let i = 0; i < towns.length; i++) {
+      if ((plans.at(i)?.streets.length ?? 0) > (plans.at(best)?.streets.length ?? 0)) best = i;
+    }
+    return { field, towns, plans, network, roads, events, index: best };
+  }
+
+  it('町の上に来ると街路が実際の道路になる', () => {
+    const { towns, network, roads, index, events } = paved();
+    expect(roads.update(towns[index].x, towns[index].z)).toBe(true);
+    expect(roads.isPaved(index)).toBe(true);
+    expect(network.segments.size).toBeGreaterThan(0);
+    expect(events).toContainEqual({ index, paved: true });
+    // 敷いたものはすべて町の印を持つ。
+    for (const segment of network.segments.values()) expect(segment.town).toBe(index);
+  });
+
+  it('交わる街路が同じノードを共有する (交差点になる)', () => {
+    const { towns, network, roads, index, plans } = paved();
+    roads.update(towns[index].x, towns[index].z);
+    if ((plans.at(index)?.streets.length ?? 0) < 2) return;
+    let junctions = 0;
+    for (const node of network.nodes.values()) if (node.segments.length >= 3) junctions++;
+    expect(junctions).toBeGreaterThan(0);
+  });
+
+  it('予算を超えない', () => {
+    const { towns, roads } = paved();
+    for (const town of towns) roads.update(town.x, town.z);
+    expect(roads.count).toBeLessThanOrEqual(450);
+  });
+
+  it('離れると外れる', () => {
+    const { towns, network, roads, index } = paved();
+    roads.update(towns[index].x, towns[index].z);
+    const placed = network.segments.size;
+    expect(placed).toBeGreaterThan(0);
+    roads.update(towns[index].x + 9000, towns[index].z + 9000);
+    expect(roads.isPaved(index)).toBe(false);
+    expect(network.segments.size).toBe(0);
+  });
+
+  it('街路どうしの交差で分割されても、印は引き継がれる', () => {
+    const { network, towns, roads, index } = paved();
+    roads.update(towns[index].x, towns[index].z);
+    // 分割されたものも含めて、敷いたものはすべて印を持つ。
+    for (const segment of network.segments.values()) expect(segment.town).toBe(index);
+    expect(roads.count).toBe(network.segments.size);
+  });
+
+  it('プレイヤーが触った町は、離れても残る', () => {
+    const { field, towns, network, roads, index } = paved();
+    roads.update(towns[index].x, towns[index].z);
+    const before = network.segments.size;
+    // 街路の端から自分の道路を伸ばす (敷設ツールと同じ手順)。
+    const node = [...network.nodes.values()][0];
+    const cls = getClass('road_small');
+    const start = anchorFromNode(network, node, cls);
+    const to = new Vector3(node.pos.x + 40, 0, node.pos.z + 40);
+    to.y = field.baseHeightAt(to.x, to.z);
+    const preview = computePlacement(start, { pos: to }, { straight: true, cls });
+    placeSegment(network, 'road_small', start, { pos: to }, preview);
+    const touched = network.segments.size;
+    expect(touched).toBeGreaterThan(before);
+
+    roads.update(towns[index].x + 9000, towns[index].z + 9000);
+    // 外さない。プレイヤーの手が入ったものを消さない方が大事。
+    expect(network.segments.size).toBe(touched);
+    expect(roads.isPaved(index)).toBe(true);
+  });
+
+  it('reset で覚えている分を捨てる', () => {
+    const { towns, network, roads, index } = paved();
+    roads.update(towns[index].x, towns[index].z);
+    expect(roads.isPaved(index)).toBe(true);
+    roads.reset();
+    network.clear();
+    expect(roads.isPaved(index)).toBe(false);
+    expect(roads.count).toBe(0);
   });
 });

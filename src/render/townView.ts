@@ -5,8 +5,8 @@ import { drapedRibbon } from '../build/ribbon';
 import { buildBuilding } from '../build/buildings';
 import type { RGB } from '../build/surface';
 import type { Heightfield } from '../terrain/heightfield';
-import { planTown, toBuildingLot, type TownPlan } from '../terrain/town/layout';
-import type { Town } from '../terrain/town/site';
+import { toBuildingLot } from '../terrain/town/layout';
+import type { TownPlans } from '../terrain/town/plans';
 
 /**
  * 町の描画。
@@ -32,52 +32,40 @@ const STREET_COLOR: RGB = [0.44, 0.43, 0.41];
 export class TownView {
   readonly group = new Group();
   private readonly meshes = new Map<number, Mesh>();
-  private readonly plans = new Map<number, TownPlan>();
-  private readonly hidden = new Set<number>();
-  private towns: Town[] = [];
+  /** 実際の道路として敷いた町。街路は実物が描くので、こちらは建物だけ出す。 */
+  private readonly paved = new Set<number>();
   private centerX = Infinity;
   private centerZ = Infinity;
 
   constructor(
     private readonly field: Heightfield,
+    private readonly plans: TownPlans,
     private readonly material: Material,
   ) {
     this.group.name = 'towns';
   }
 
   /** 地形を作り直したら呼ぶ。組んだものを全部捨てる。 */
-  setTowns(towns: Town[]): void {
+  reset(): void {
     this.dispose();
-    this.towns = towns;
     this.centerX = Infinity;
     this.centerZ = Infinity;
   }
 
-  /** その町の平面 (街路と敷地)。実際の道路にする側もここから引く。 */
-  planOf(index: number): TownPlan | null {
-    const town = this.towns[index];
-    if (!town) return null;
-    let plan = this.plans.get(index);
-    if (!plan) {
-      plan = planTown(town, this.field);
-      this.plans.set(index, plan);
-    }
-    return plan;
-  }
-
   /**
-   * その町を描かない (実際の道路として敷いたとき)。
-   * 描画と実物が二重に出るのを防ぐ。
+   * その町の街路を実物が描くかどうか。
+   *
+   * 実際の道路として敷いた町では、描いた帯と本物の舗装が二重に出る。
+   * 建物はそのまま残す — 同じ折れ線から作ってあるので、実物の道路沿いに
+   * ちょうど並ぶ。
    */
-  setHidden(index: number, hidden: boolean): void {
-    if (hidden === this.hidden.has(index)) return;
-    if (hidden) {
-      this.hidden.add(index);
-      this.drop(index);
-    } else {
-      this.hidden.delete(index);
-      this.centerX = Infinity;
-    }
+  setPaved(index: number, paved: boolean): void {
+    if (paved === this.paved.has(index)) return;
+    if (paved) this.paved.add(index);
+    else this.paved.delete(index);
+    // 組み直す。次に中心を見たときに拾われる。
+    this.drop(index);
+    this.centerX = Infinity;
   }
 
   /** 見ている点のまわりの町を組む。毎フレーム呼んでよい。 */
@@ -86,11 +74,10 @@ export class TownView {
     this.centerX = x;
     this.centerZ = z;
 
+    const towns = this.plans.towns;
     const wanted: number[] = [];
-    for (let i = 0; i < this.towns.length; i++) {
-      const town = this.towns[i];
-      if (this.hidden.has(i)) continue;
-      if (Math.hypot(town.x - x, town.z - z) > DRAW_RADIUS) continue;
+    for (let i = 0; i < towns.length; i++) {
+      if (Math.hypot(towns[i].x - x, towns[i].z - z) > DRAW_RADIUS) continue;
       wanted.push(i);
     }
     const keep = new Set(wanted);
@@ -100,8 +87,7 @@ export class TownView {
     // 近い順に組む。予算を使い切ったら、次に中心が動いたときに続きを組む。
     wanted.sort(
       (a, b) =>
-        Math.hypot(this.towns[a].x - x, this.towns[a].z - z) -
-        Math.hypot(this.towns[b].x - x, this.towns[b].z - z),
+        Math.hypot(towns[a].x - x, towns[a].z - z) - Math.hypot(towns[b].x - x, towns[b].z - z),
     );
     for (const index of wanted) {
       if (this.meshes.has(index)) continue;
@@ -120,8 +106,7 @@ export class TownView {
 
   dispose(): void {
     for (const index of [...this.meshes.keys()]) this.drop(index);
-    this.plans.clear();
-    this.hidden.clear();
+    this.paved.clear();
   }
 
   private drop(index: number): void {
@@ -133,13 +118,15 @@ export class TownView {
   }
 
   private build(index: number): void {
-    const plan = this.planOf(index);
+    const plan = this.plans.at(index);
     if (!plan) return;
     const field = this.field;
     const ground = (x: number, z: number): number => field.heightAt(x, z);
     const mb = new MeshBuilder();
-    for (const street of plan.streets) {
-      drapedRibbon(mb, street.points, street.halfWidth, ground, STREET_COLOR);
+    if (!this.paved.has(index)) {
+      for (const street of plan.streets) {
+        drapedRibbon(mb, street.points, street.halfWidth, ground, STREET_COLOR);
+      }
     }
     for (const lot of plan.lots) buildBuilding(mb, toBuildingLot(lot, ground), ground);
     if (mb.isEmpty) return;

@@ -52,6 +52,15 @@ export interface NetSegment {
   gradeB: number;
   /** Station ownership for tracks generated as part of a station. */
   stationTrack?: { station: StationId; index: number };
+  /**
+   * 町の街路として敷いたものの印 (町の番号)。
+   *
+   * 離れたときに外してよいかを見るのに使う。分割しても半分ずつに
+   * 引き継がれる (街路どうしが交差すれば分割は自然に起きる)。
+   * プレイヤーが手を入れたかどうかは、印ではなく「印のない線形が
+   * 端点に繋がっているか」で見る。
+   */
+  town?: number;
 }
 
 /** ノードから見た 1 本の接続枝。交差点の解析はこの形で行う。 */
@@ -286,6 +295,7 @@ export class Network {
     const node = this.addNode(mid.pos);
 
     const classId = seg.classId;
+    const town = seg.town;
     const a = seg.a;
     const b = seg.b;
     this.removeSegment(id);
@@ -293,7 +303,7 @@ export class Network {
     const keepA = this.nodes.get(a) ?? this.restoreNode(a, first.horizontal.p0, first.vertical.y0);
     const keepB = this.nodes.get(b) ?? this.restoreNode(b, second.horizontal.p1, second.vertical.y1);
 
-    this.addSegment({
+    const firstHalf = this.addSegment({
       classId,
       a: keepA.id,
       b: node.id,
@@ -303,7 +313,7 @@ export class Network {
       gradeA: first.vertical.m0,
       gradeB: first.vertical.m1,
     });
-    this.addSegment({
+    const secondHalf = this.addSegment({
       classId,
       a: node.id,
       b: keepB.id,
@@ -313,6 +323,10 @@ export class Network {
       gradeA: second.vertical.m0,
       gradeB: second.vertical.m1,
     });
+    if (town !== undefined) {
+      firstHalf.town = town;
+      secondHalf.town = town;
+    }
     return node;
   }
 

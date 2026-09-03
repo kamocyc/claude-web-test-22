@@ -123,24 +123,30 @@ export class TerrainMesh {
    * 全チャンクを舐め直さずに済む。法線は隣の格子点を見るので、範囲は
    * 1 マス広げて判定する。
    */
-  update(region?: GridRegion | null): void {
+  update(regions?: GridRegion[] | null): void {
     const f = this.field;
     // 自然地形そのものが変わったときは、範囲に関わらず全部を作り直す。
-    const all = region === undefined || region === null || this.baseVersion !== f.baseVersion;
+    const all = regions === undefined || regions === null || this.baseVersion !== f.baseVersion;
     this.baseVersion = f.baseVersion;
     if (all) {
       for (const chunk of this.resident.values()) this.fill(chunk);
       return;
     }
     const size = TERRAIN_CHUNK_CELLS;
-    const cx0 = Math.floor((region.ix0 - 1) / size);
-    const cx1 = Math.floor((region.ix1 + 1) / size);
-    const cz0 = Math.floor((region.iz0 - 1) / size);
-    const cz1 = Math.floor((region.iz1 + 1) / size);
-    for (let cz = cz0; cz <= cz1; cz++) {
-      for (let cx = cx0; cx <= cx1; cx++) {
-        const chunk = this.resident.get(this.chunkKey(cx, cz));
-        if (chunk) this.fill(chunk);
+    const done = new Set<number>();
+    for (const region of regions) {
+      const cx0 = Math.floor((region.ix0 - 1) / size);
+      const cx1 = Math.floor((region.ix1 + 1) / size);
+      const cz0 = Math.floor((region.iz0 - 1) / size);
+      const cz1 = Math.floor((region.iz1 + 1) / size);
+      for (let cz = cz0; cz <= cz1; cz++) {
+        for (let cx = cx0; cx <= cx1; cx++) {
+          const key = this.chunkKey(cx, cz);
+          if (done.has(key)) continue;
+          done.add(key);
+          const chunk = this.resident.get(key);
+          if (chunk) this.fill(chunk);
+        }
       }
     }
   }
