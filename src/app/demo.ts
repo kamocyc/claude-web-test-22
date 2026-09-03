@@ -419,6 +419,14 @@ function siteScore(field: Heightfield, x: number, z: number): number {
 
 /** 中ほどと見なす範囲 [m]。踏切・交差点・分岐器がここに入る。 */
 const SITE_INNER = 150;
+/**
+ * 端として数えない範囲 [m]。
+ *
+ * 谷や丘が線形の端に掛かっていると、橋やトンネルが端で切れて「戻ってくる
+ * 継ぎ目」ができない。両端をこのぶん除いて数えることで、橋とトンネルが
+ * 線形の途中に収まる場所を選ぶ。
+ */
+const SITE_TAIL = 70;
 
 interface CorridorGap {
   innerAbove: number;
@@ -458,7 +466,7 @@ function corridorGap(
       if (t <= SITE_INNER) {
         if (above > gap.innerAbove) gap.innerAbove = above;
         if (below > gap.innerBelow) gap.innerBelow = below;
-      } else {
+      } else if (t <= half - SITE_TAIL) {
         if (above > gap.outerAbove) gap.outerAbove = above;
         if (below > gap.outerBelow) gap.outerBelow = below;
       }
