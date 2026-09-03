@@ -2,12 +2,15 @@ import { Group, Mesh, type Material } from 'three';
 import { VIEW_DISTANCE } from '../core/units';
 import { MeshBuilder } from '../core/meshbuilder';
 import { drapedRibbon } from '../build/ribbon';
+import { addTree } from '../build/tree';
+import { hash2 } from '../terrain/hydro/grid';
+import type { Tree } from '../terrain/vegetation';
 import { buildBuilding } from '../build/buildings';
 import type { RGB } from '../build/surface';
 import type { Network } from '../network/network';
 import type { Occupancy } from '../network/occupancy';
 import type { Heightfield } from '../terrain/heightfield';
-import { toBuildingLot } from '../terrain/town/layout';
+import { toBuildingLot, type TownLot, type TownStreet } from '../terrain/town/layout';
 import type { TownPlans } from '../terrain/town/plans';
 
 /**
@@ -33,6 +36,13 @@ const STREET_COLOR: RGB = [0.44, 0.43, 0.41];
 
 /** 敷いた線形から建物を退ける余裕 [m]。歩道と法面のぶん。 */
 const CLEAR_MARGIN = 2;
+
+/** 街路樹の間隔 [m]。 */
+const STREET_TREE_PITCH = 26;
+/** 街路樹を車道の縁から離す量 [m]。歩道の外側に立てる。 */
+const STREET_TREE_OFFSET = 3.4;
+/** 街路樹を敷いた線形から退ける余裕 [m]。 */
+const STREET_TREE_CLEAR = 2.5;
 
 export class TownView {
   readonly group = new Group();
@@ -91,7 +101,7 @@ export class TownView {
     for (const index of [...this.meshes.keys()]) {
       const plan = this.plans.at(index);
       if (!plan) continue;
-      if (this.avoidMark(plan.lots) === this.avoided.get(index)) continue;
+      if (this.avoidMark(plan) === this.avoided.get(index)) continue;
       this.drop(index);
       dropped = true;
     }
@@ -158,11 +168,18 @@ export class TownView {
    * 食い込まないことは区割りの側で保証している。
    */
   private blocked(lot: { center: { x: number; z: number }; halfFrontage: number; depth: number }): boolean {
+    return this.blockedAt(
+      lot.center.x,
+      lot.center.z,
+      Math.max(lot.halfFrontage, lot.depth / 2) + CLEAR_MARGIN,
+    );
+  }
+
+  /** その点が、町の街路でない線形に覆われているか。 */
+  private blockedAt(x: number, z: number, margin: number): boolean {
     const occupancy = this.obstacles;
     if (!occupancy) return false;
-    const hit = occupancy.at(lot.center.x, lot.center.z, {
-      margin: Math.max(lot.halfFrontage, lot.depth / 2) + CLEAR_MARGIN,
-    });
+    const hit = occupancy.at(x, z, { margin });
     if (!hit) return false;
     return !this.isStreet(hit.segment, hit.node);
   }
@@ -176,11 +193,17 @@ export class TownView {
     return n.segments.every((id) => this.network.segments.get(id)?.town !== undefined);
   }
 
-  /** 避けた敷地の並びを 1 つの数にしたもの。並びが変われば必ず変わる。 */
-  private avoidMark(lots: readonly { center: { x: number; z: number }; halfFrontage: number; depth: number }[]): number {
+  /** 避けた敷地と街路樹の並びを 1 つの数にしたもの。並びが変われば必ず変わる。 */
+  private avoidMark(plan: { lots: readonly TownLot[]; streets: readonly TownStreet[] }): number {
     let mark = 0;
-    for (let i = 0; i < lots.length; i++) {
-      if (this.blocked(lots[i])) mark = (mark * 31 + i + 1) | 0;
+    for (let i = 0; i < plan.lots.length; i++) {
+      if (this.blocked(plan.lots[i])) mark = (mark * 31 + i + 1) | 0;
+    }
+    const trees = streetTrees(plan.streets);
+    for (let i = 0; i < trees.length; i++) {
+      if (this.blockedAt(trees[i].x, trees[i].z, STREET_TREE_CLEAR)) {
+        mark = (mark * 31 + plan.lots.length + i + 1) | 0;
+      }
     }
     return mark;
   }
@@ -206,6 +229,16 @@ export class TownView {
       }
       buildBuilding(mb, toBuildingLot(lot, ground), ground);
     }
+    // 街路樹。実物の道路になった町にも並べる (見ている町は必ず実物になるので、
+    // 描いた街路と一緒に消すと街路樹がまるで見えない)。
+    const trees = streetTrees(plan.streets);
+    for (let i = 0; i < trees.length; i++) {
+      if (this.blockedAt(trees[i].x, trees[i].z, STREET_TREE_CLEAR)) {
+        mark = (mark * 31 + plan.lots.length + i + 1) | 0;
+        continue;
+      }
+      addTree(mb, { ...trees[i], y: ground(trees[i].x, trees[i].z) }, 'full');
+    }
     this.avoided.set(index, mark);
     if (mb.isEmpty) return;
     const mesh = new Mesh(mb.build(), this.material);
@@ -215,4 +248,51 @@ export class TownView {
     this.group.add(mesh);
     this.meshes.set(index, mesh);
   }
+}
+
+/**
+ * 街路樹の位置。幹線の両側に、車道の縁から離して並べる。
+ *
+ * 高さは入れない (描くときに地形から採る)。ここが位置だけを返すので、
+ * 「避けた並び」の印を数えるときに地形を触らずに済む。
+ */
+function streetTrees(streets: readonly TownStreet[]): Omit<Tree, 'y'>[] {
+  const out: Omit<Tree, 'y'>[] = [];
+  for (const street of streets) {
+    // 街路樹は幹線だけ。区画道路にも並べると町が緑で埋まる。
+    if (street.kind !== 'collector') continue;
+    const offset = street.halfWidth + STREET_TREE_OFFSET;
+    for (let i = 0; i + 1 < street.points.length; i++) {
+      const a = street.points[i];
+      const b = street.points[i + 1];
+      const dx = b.x - a.x;
+      const dz = b.z - a.z;
+      const length = Math.hypot(dx, dz);
+      if (length < 1e-3) continue;
+      const ux = dx / length;
+      const uz = dz / length;
+      // 車道に直交する向き。
+      const nx = -uz;
+      const nz = ux;
+      for (let t = STREET_TREE_PITCH / 2; t < length; t += STREET_TREE_PITCH) {
+        for (const side of [-1, 1]) {
+          const x = a.x + ux * t + nx * offset * side;
+          const z = a.z + uz * t + nz * offset * side;
+          // 位置ハッシュで 1 本おきくらいに抜く。等間隔に全部並ぶと生垣に見える。
+          if (hash2(Math.round(x), Math.round(z), 3313) < 0.25) continue;
+          const size = hash2(Math.round(x), Math.round(z), 4409);
+          out.push({
+            x,
+            z,
+            // 並木なので樹種は広葉樹に揃え、大きさだけ振る。
+            height: 7 + size * 3.5,
+            radius: 2.2 + size * 1.1,
+            species: 1,
+            angle: hash2(Math.round(x), Math.round(z), 6607) * Math.PI * 2,
+          });
+        }
+      }
+    }
+  }
+  return out;
 }
