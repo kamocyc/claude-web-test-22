@@ -37,8 +37,6 @@ export interface UpsampleInput {
   groundY: Float32Array;
   /** 1 = 海。 */
   sea: Uint8Array;
-  /** 1 = 湖。 */
-  lake: Uint8Array;
 }
 
 /**
@@ -46,7 +44,7 @@ export interface UpsampleInput {
  * (川を刻んだあとに呼ぶため)。
  */
 export function upsampleTerrain(field: Heightfield, input: UpsampleInput): void {
-  const { grid, groundY, sea, lake } = input;
+  const { grid, groundY, sea } = input;
   const n = grid.n;
   const stride = field.stride;
   const base = field.base;
@@ -71,7 +69,7 @@ export function upsampleTerrain(field: Heightfield, input: UpsampleInput): void 
         const sy = Math.min(n - 1, Math.max(0, y + oy));
         for (let ox = -1; ox <= 2; ox++) {
           const i = sy * n + Math.min(n - 1, Math.max(0, x + ox));
-          if (sea[i] || lake[i]) {
+          if (sea[i]) {
             wet = 1;
             break;
           }

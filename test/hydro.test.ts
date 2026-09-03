@@ -82,9 +82,11 @@ describe('水文エンジン', () => {
         for (let i = 0; i < world.grid.len; i++) if (world.sea[i]) expect(world.rivers[i]).toBe(0);
       });
 
-      it('湖は海面より上にある', () => {
+      it('内陸に排水の行き止まりが残らない (窪地は埋めて平らな地面にする)', () => {
         for (let i = 0; i < world.grid.len; i++) {
-          if (world.lake[i]) expect(world.terrain[i]).toBeGreaterThan(world.seaLevel);
+          if (world.sea[i]) continue;
+          // 埋め立てたあとの面がそのまま地面なので、水の溜まる余地が無い。
+          expect(world.filled[i]).toBe(world.terrain[i]);
         }
       });
     });

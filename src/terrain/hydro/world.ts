@@ -16,7 +16,6 @@ import {
   buildSuitability,
   carveAndFlatten,
   classifyRiverLandforms,
-  findLakes,
   makeSea,
   makeTerrain,
   meanderChannels,
@@ -24,7 +23,6 @@ import {
   riverThresholdFor,
   slopeMap,
 } from './hydrology';
-import { refineLakes } from './lakes';
 import type { HydroParams, HydroWorld } from './types';
 
 export function generateHydroWorld(
@@ -60,11 +58,8 @@ export function generateHydroWorld(
   for (let i = 0; i < len; i++) if (!sea[i] && accumulation[i] >= riverThreshold) rivers[i] = 1;
 
   const slope = slopeMap(g, terrain);
-  // 生の湖には、河床を埋め戻しただけの幅 1 セルの偽湖が混ざる。
-  const lake = refineLakes(g, findLakes(g, carved, hydro.filled, sea)).mask;
   const geomorph = classifyRiverLandforms(g, terrain, sea, rivers, accumulation, riverThreshold, params);
   const geo = buildSuitability(g, terrain, sea, rivers, geomorph.landform, geomorph.riverDist, params);
-  for (let i = 0; i < len; i++) if (lake[i]) geo.suitability[i] = 0;
 
   return {
     grid: g,
@@ -76,7 +71,6 @@ export function generateHydroWorld(
     parent: hydro.parent,
     accumulation,
     rivers,
-    lake,
     riverThreshold,
     slope,
     breaches: breached.breaches,

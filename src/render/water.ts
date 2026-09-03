@@ -6,7 +6,7 @@ import type { TerrainWater } from '../terrain/water';
 /**
  * 水面の描画。
  *
- * 海と湖は**マーチングスクエア**で切る。水文格子のセルをそのまま塗ると
+ * 海は**マーチングスクエア**で切る。水文格子のセルをそのまま塗ると
  * 汀線が 40 m の階段になるし、境界矩形で切ると隣の陸まで水浸しになる。
  * 地面が水面の高さを跨ぐ所を辺の上で線形に求めて、そこで切る。
  * 地形の細分も水際だけは双一次補間にしてあるので (`upsample.ts`)、
@@ -47,7 +47,6 @@ export class WaterView {
     this.dispose();
     const mb = new MeshBuilder();
     this.addSurface(mb, water, water.sea, () => water.seaY);
-    this.addSurface(mb, water, water.lake, (i) => water.lakeY[i]);
     this.addRivers(mb, water);
     if (mb.isEmpty) return;
     const mesh = new Mesh(mb.build(), this.material);
@@ -72,7 +71,7 @@ export class WaterView {
     this.mesh = null;
   }
 
-  /** 溜まり水 (海・湖) の面。 */
+  /** 溜まり水 (海) の面。 */
   private addSurface(
     mb: MeshBuilder,
     water: TerrainWater,

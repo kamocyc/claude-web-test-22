@@ -81,7 +81,7 @@ describe('水系', () => {
     for (let iz = 2; iz < n - 2; iz += 5) {
       for (let ix = 2; ix < n - 2; ix += 5) {
         const i = iz * n + ix;
-        if (hydro.sea[i] || hydro.lake[i] || hydro.rivers[i]) continue;
+        if (hydro.sea[i] || hydro.rivers[i]) continue;
         const x = hydro.grid.worldAt(ix);
         const z = hydro.grid.worldAt(iz);
         if (!field.contains(x, z) || field.baseHeightAt(x, z) < 3) continue;

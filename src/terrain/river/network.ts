@@ -94,7 +94,7 @@ interface CellStem {
 function traceStems(world: HydroWorld): CellStem[] {
   const len = world.grid.len;
   const children: number[][] = [];
-  const isRiver = (i: number): boolean => world.rivers[i] === 1 && !world.sea[i] && !world.lake[i];
+  const isRiver = (i: number): boolean => world.rivers[i] === 1 && !world.sea[i];
   for (let i = 0; i < len; i++) {
     if (!isRiver(i)) continue;
     const parent = world.parent[i];
@@ -134,7 +134,7 @@ function traceStems(world: HydroWorld): CellStem[] {
   for (let i = 0; i < len; i++) {
     if (!isRiver(i)) continue;
     const parent = world.parent[i];
-    if (parent < 0 || world.sea[parent] || world.lake[parent]) mouths.push(i);
+    if (parent < 0 || world.sea[parent]) mouths.push(i);
   }
   mouths.sort((a, b) => world.accumulation[b] - world.accumulation[a]);
   for (const mouth of mouths) {

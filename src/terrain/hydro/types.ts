@@ -53,8 +53,6 @@ export interface HydroWorld {
   accumulation: Float64Array;
   /** 1 = 川。 */
   rivers: Uint8Array;
-  /** 1 = 湖。 */
-  lake: Uint8Array;
   /** 川と判定する `accumulation` のしきい値。 */
   riverThreshold: number;
   /** 傾き (高さ / セル)。 */

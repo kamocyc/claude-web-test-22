@@ -68,10 +68,6 @@ export interface TerrainWorld {
   water: TerrainWater;
 }
 
-/** 湖の最大水深 [m]。これ以上は掘らない。 */
-const LAKE_MAX_DEPTH = 32;
-/** 湖の最小水深 [m]。 */
-const LAKE_MIN_DEPTH = 2;
 /** 汀線のすぐ内側の陸地の高さ [m]。海面と地面が同じ高さになるのを避ける。 */
 const SHORE_Y = 1.8;
 /** 海の水深の下限 [m]。汀線のすぐ外はここまで下がる。 */
@@ -100,12 +96,12 @@ export function generateTerrain(field: Heightfield, options: TerrainOptions = DE
     field.origin,
   );
 
-  const { groundY, lakeY } = toMetres(hydro, options.relief);
+  const groundY = toMetres(hydro, options.relief);
 
-  upsampleTerrain(field, { grid: hydro.grid, groundY, sea: hydro.sea, lake: hydro.lake });
+  upsampleTerrain(field, { grid: hydro.grid, groundY, sea: hydro.sea });
 
   const network = buildRiverNetwork(hydro, options.relief, SEA_LEVEL_Y);
-  const water = new TerrainWater(field, hydro.grid, hydro.sea, hydro.lake, lakeY, groundY, network);
+  const water = new TerrainWater(field, hydro.grid, hydro.sea, groundY, network);
   carveRivers(field, network, water.field);
 
   field.water = water;
@@ -116,25 +112,18 @@ export function generateTerrain(field: Heightfield, options: TerrainOptions = DE
 /**
  * 無次元の高さをメートルに直す。海面が Y 0 になる。
  *
- * 海底・湖底・陸で扱いが違う。海と湖は「水面」と「その下の地面」が別なので、
- * 地面の方を水面より確実に下げておかないと、水面板の下から地面が突き出る。
+ * 海だけ扱いが違う。海は「水面」と「その下の地面」が別なので、地面の方を
+ * 水面より確実に下げておかないと、水面板の下から地面が突き出る。
+ *
+ * 内陸の窪地は水面を持たない。埋め立て (Priority-Flood) が排水路を通した
+ * あとの面をそのまま地面にするので、溜まり水だった所は平らな地面になる。
  */
-function toMetres(hydro: HydroWorld, relief: number): { groundY: Float32Array; lakeY: Float32Array } {
+function toMetres(hydro: HydroWorld, relief: number): Float32Array {
   const len = hydro.grid.len;
   const groundY = new Float32Array(len);
-  const lakeY = new Float32Array(len);
   for (let i = 0; i < len; i++) {
     const raw = (hydro.terrain[i] - hydro.seaLevel) * relief;
-    // `filled` は窪地を埋めた面なので、湖のセルではそれが水面になる。
-    const surface = Math.max(SHORE_Y, (hydro.filled[i] - hydro.seaLevel) * relief);
-    lakeY[i] = surface;
-    if (hydro.sea[i]) {
-      groundY[i] = clamp(raw, SEA_FLOOR_Y, SHALLOW_Y);
-    } else if (hydro.lake[i]) {
-      groundY[i] = clamp(raw, surface - LAKE_MAX_DEPTH, surface - LAKE_MIN_DEPTH);
-    } else {
-      groundY[i] = Math.max(SHORE_Y, raw);
-    }
+    groundY[i] = hydro.sea[i] ? clamp(raw, SEA_FLOOR_Y, SHALLOW_Y) : Math.max(SHORE_Y, raw);
   }
-  return { groundY, lakeY };
+  return groundY;
 }

@@ -11,7 +11,7 @@ import type { Heightfield } from './heightfield';
 import { buildRiverField, type RiverField } from './river/field';
 import type { RiverNetwork } from './river/network';
 
-export type WaterKind = 'sea' | 'lake' | 'river';
+export type WaterKind = 'sea' | 'river';
 
 export interface WaterInfo {
   kind: WaterKind;
@@ -30,16 +30,13 @@ export class TerrainWater {
     private readonly terrain: Heightfield,
     readonly grid: HydroGrid,
     readonly sea: Uint8Array,
-    readonly lake: Uint8Array,
-    /** 湖ごとの水面の高さ [m] (湖でないセルは意味を持たない)。 */
-    readonly lakeY: Float32Array,
     /** 水文格子の地面の高さ [m]。水深の色分けに使う。 */
     readonly groundY: Float32Array,
     network: RiverNetwork,
   ) {
     this.network = network;
     this.field = buildRiverField(network);
-    this.coarse = buildCoarseMask(grid, sea, lake, network);
+    this.coarse = buildCoarseMask(grid, sea, network);
   }
 
   /**
@@ -55,14 +52,6 @@ export class TerrainWater {
     const gz = Math.round(this.grid.cellAt(z));
     if (gx < 0 || gz < 0 || gx >= n || gz >= n) return false;
     return this.coarse[gz * n + gx] === 1;
-  }
-
-  /** その位置を覆う水文セルの添字 (いちばん近い格子点)。 */
-  private nodeAt(x: number, z: number): number {
-    const n = this.grid.n;
-    const gx = Math.min(n - 1, Math.max(0, Math.round(this.grid.cellAt(x))));
-    const gz = Math.min(n - 1, Math.max(0, Math.round(this.grid.cellAt(z))));
-    return gz * n + gx;
   }
 
   /** まわりの水文セルに海があるか。汀線は細かい格子の高さで決める。 */
@@ -92,8 +81,6 @@ export class TerrainWater {
     if (!this.near(x, z)) return null;
     const ground = this.terrain.baseHeightAt(x, z);
     if (ground < this.seaY && this.seaNear(x, z)) return { kind: 'sea', level: this.seaY };
-    const i = this.nodeAt(x, z);
-    if (this.lake[i] && ground < this.lakeY[i]) return { kind: 'lake', level: this.lakeY[i] };
     const sample = this.field.sample(x, z);
     if (sample && sample.distance <= sample.widthM * 0.5) {
       return { kind: 'river', level: sample.waterY };
@@ -108,18 +95,13 @@ export class TerrainWater {
 
 
 /**
- * 水がありうるセルの印。海・湖のセルと、河道が通るセルを立て、
- * 取りこぼしが出ないよう 1 セル膨らませる。
+ * 水がありうるセルの印。海のセルと河道が通るセルを立て、取りこぼしが
+ * 出ないよう 1 セル膨らませる。
  */
-function buildCoarseMask(
-  grid: HydroGrid,
-  sea: Uint8Array,
-  lake: Uint8Array,
-  network: RiverNetwork,
-): Uint8Array {
+function buildCoarseMask(grid: HydroGrid, sea: Uint8Array, network: RiverNetwork): Uint8Array {
   const n = grid.n;
   const raw = new Uint8Array(n * n);
-  for (let i = 0; i < raw.length; i++) if (sea[i] || lake[i]) raw[i] = 1;
+  for (let i = 0; i < raw.length; i++) if (sea[i]) raw[i] = 1;
   for (const stem of network.stems) {
     for (const point of stem.points) {
       const gx = Math.round(grid.cellAt(point.x));
