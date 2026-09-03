@@ -4,6 +4,7 @@ import {
   DECK_THICKNESS,
   MIN_STRUCTURE_RUN,
   TUNNEL_THRESHOLD,
+  WATER_CLEARANCE,
 } from '../core/units';
 import type { Heightfield } from '../terrain/heightfield';
 
@@ -38,12 +39,20 @@ export function computeStructureProfile(
   const modes: StructureMode[] = [];
   /** 路面と自然地形の高低差 (正 = 路面が上)。 */
   const rise: number[] = [];
+  /** 水の上に架かる点。短くても地表に戻してはいけない。 */
+  const overWater: boolean[] = [];
   for (let i = 0; i < count; i++) {
     const s = s0 + ((s1 - s0) * i) / (count - 1);
     const p = alignment.sampleAt(s).pos;
     const terrain = field.baseHeightAt(p.x, p.z);
+    // 水の上に地表区間は無い。水面より上を通るなら橋、下なら (敷けないが)
+    // トンネル扱いにして、盛土で川を堰き止めないようにする。
+    const water = field.water?.waterAt(p.x, p.z) ?? null;
     stations.push(s);
-    modes.push(classify(p.y, terrain));
+    overWater.push(water !== null);
+    modes.push(
+      water ? (p.y >= water.level - WATER_CLEARANCE ? 'bridge' : 'tunnel') : classify(p.y, terrain),
+    );
     rise.push(p.y - terrain);
   }
 
@@ -60,6 +69,8 @@ export function computeStructureProfile(
     let extreme = 0;
     for (let i = 0; i < stations.length; i++) {
       if (stations[i] < run.s0 - 1e-6 || stations[i] > run.s1 + 1e-6) continue;
+      // 水の上は、桁下が浅くても橋のまま残す。地表に戻すと盛土が川を埋める。
+      if (overWater[i]) return true;
       extreme = Math.max(extreme, run.mode === 'bridge' ? rise[i] : -rise[i]);
     }
     const limit = run.mode === 'bridge' ? BRIDGE_THRESHOLD : TUNNEL_THRESHOLD;

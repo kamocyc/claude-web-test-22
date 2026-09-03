@@ -567,12 +567,20 @@ export class TerrainGrading {
     }
 
     const ceiling = this.ceiling;
+    const water = f.water;
     for (let iz = region.iz0; iz <= region.iz1; iz++) {
       const row = (iz - win.iz0) * wstride - win.ix0;
       const globalRow = iz * stride;
+      const wz = f.worldZ(iz);
       for (let ix = region.ix0; ix <= region.ix1; ix++) {
         const i = ix + row;
         const g = ix + globalRow;
+        // 水の下は触らない。盛土が川を堰き止めたり、切土が湖の底を
+        // 掘り下げたりしないように、自然地形のまま残す (水面は動かせない)。
+        if (water) {
+          const wx = f.worldX(ix);
+          if (water.near(wx, wz) && water.isWater(wx, wz)) continue;
+        }
         if (!blocked[i]) {
           const v = base[g];
           work[g] = v > upper[i] ? upper[i] : v < lower[i] ? lower[i] : v;

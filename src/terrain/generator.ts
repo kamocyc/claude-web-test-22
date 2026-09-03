@@ -108,6 +108,7 @@ export function generateTerrain(field: Heightfield, options: TerrainOptions = DE
   const water = new TerrainWater(field, hydro.grid, hydro.sea, hydro.lake, lakeY, groundY, network);
   carveRivers(field, network, water.field);
 
+  field.water = water;
   field.resetWork();
   return { hydro, water };
 }

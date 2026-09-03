@@ -23,6 +23,8 @@ export class TerrainWater {
   readonly seaY = SEA_LEVEL_Y;
   readonly network: RiverNetwork;
   readonly field: RiverField;
+  /** 水がありうる水文セル。`near` の下敷き。 */
+  private readonly coarse: Uint8Array;
 
   constructor(
     private readonly terrain: Heightfield,
@@ -37,6 +39,22 @@ export class TerrainWater {
   ) {
     this.network = network;
     this.field = buildRiverField(network);
+    this.coarse = buildCoarseMask(grid, sea, lake, network);
+  }
+
+  /**
+   * 水があるかもしれない所か (水文格子の粗い判定)。
+   *
+   * `waterAt` は空間ハッシュを引くので、整地や区画のように格子点を舐める
+   * 側から毎回呼ぶと効く。マップのほとんどは水から遠いので、まず配列 1 回で
+   * 落とす。ここが false なら水は無い (取りこぼしはしない)。
+   */
+  near(x: number, z: number): boolean {
+    const n = this.grid.n;
+    const gx = Math.round(this.grid.cellAt(x));
+    const gz = Math.round(this.grid.cellAt(z));
+    if (gx < 0 || gz < 0 || gx >= n || gz >= n) return false;
+    return this.coarse[gz * n + gx] === 1;
   }
 
   /** その位置を覆う水文セルの添字 (いちばん近い格子点)。 */
@@ -71,6 +89,7 @@ export class TerrainWater {
    * 自然地形の高さで決めるので、描いた水面と 1 セルずれない。
    */
   waterAt(x: number, z: number): WaterInfo | null {
+    if (!this.near(x, z)) return null;
     const ground = this.terrain.baseHeightAt(x, z);
     if (ground < this.seaY && this.seaNear(x, z)) return { kind: 'sea', level: this.seaY };
     const i = this.nodeAt(x, z);
@@ -85,4 +104,43 @@ export class TerrainWater {
   isWater(x: number, z: number): boolean {
     return this.waterAt(x, z) !== null;
   }
+}
+
+
+/**
+ * 水がありうるセルの印。海・湖のセルと、河道が通るセルを立て、
+ * 取りこぼしが出ないよう 1 セル膨らませる。
+ */
+function buildCoarseMask(
+  grid: HydroGrid,
+  sea: Uint8Array,
+  lake: Uint8Array,
+  network: RiverNetwork,
+): Uint8Array {
+  const n = grid.n;
+  const raw = new Uint8Array(n * n);
+  for (let i = 0; i < raw.length; i++) if (sea[i] || lake[i]) raw[i] = 1;
+  for (const stem of network.stems) {
+    for (const point of stem.points) {
+      const gx = Math.round(grid.cellAt(point.x));
+      const gz = Math.round(grid.cellAt(point.z));
+      if (gx < 0 || gz < 0 || gx >= n || gz >= n) continue;
+      raw[gz * n + gx] = 1;
+    }
+  }
+  const mask = new Uint8Array(n * n);
+  for (let z = 0; z < n; z++) {
+    for (let x = 0; x < n; x++) {
+      if (!raw[z * n + x]) continue;
+      for (let dz = -1; dz <= 1; dz++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          const nx = x + dx;
+          const nz = z + dz;
+          if (nx < 0 || nz < 0 || nx >= n || nz >= n) continue;
+          mask[nz * n + nx] = 1;
+        }
+      }
+    }
+  }
+  return mask;
 }

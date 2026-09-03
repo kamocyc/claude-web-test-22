@@ -1,5 +1,6 @@
 import { Vector3 } from 'three';
 import { TERRAIN_CELL, TERRAIN_CELLS, clamp } from '../core/units';
+import type { TerrainWater } from './water';
 
 /**
  * 地形の高さ場。
@@ -17,6 +18,15 @@ export class Heightfield {
   readonly stride: number;
   readonly base: Float32Array;
   readonly work: Float32Array;
+  /**
+   * この地形の水系 (`generateTerrain` が入れる)。
+   *
+   * 水は地形の一部で、地形を見る所はどこも水も見なければならない —
+   * 水の上は地表区間にできず、整地は水を触れず、水の上には建たない。
+   * 高さ場を配って回っている呼び出しに、もう 1 つ引数を足して回るより、
+   * 地形そのものに持たせる方が取りこぼしが起きない。
+   */
+  water: TerrainWater | null = null;
 
   constructor(cells = TERRAIN_CELLS, cell = TERRAIN_CELL) {
     this.cells = cells;

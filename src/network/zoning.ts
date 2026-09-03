@@ -314,6 +314,8 @@ function planCell(
         .addScaledVector(along, a * half)
         .addScaledVector(outward, back * ZONE_ROW_DEPTH);
       if (!field.contains(p.x, p.z)) return null;
+      // 水の上には区画を割り付けない (建物が水に浮く)。
+      if (field.water?.isWater(p.x, p.z)) return null;
       const y = field.heightAt(p.x, p.z);
       if (back === 0 && y > frontY) frontY = y;
       if (y < lowY) lowY = y;
