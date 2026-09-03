@@ -47,7 +47,7 @@
       .panel {
         position: absolute;
         top: 12px;
-        width: 248px;
+        width: 264px;
         max-height: calc(100% - 24px);
         overflow-y: auto;
         padding: 12px 14px 16px;
@@ -89,28 +89,48 @@
         flex-wrap: wrap;
       }
 
-      /* ツールの並び。3 列に揃えて、押す所の大きさを一定にする。 */
+      /*
+       * ツールの並び。道路 / 鉄道 / 区画 / 撤去 / 確認 の 5 つを 1 行に揃える。
+       * どれも 2 文字なので、押す所の大きさを一定にできる。
+       */
       .row-tools {
         display: grid;
-        grid-template-columns: repeat(3, 1fr);
-        gap: 6px;
+        grid-template-columns: repeat(5, 1fr);
+        gap: 5px;
       }
 
-      .row-tools button.chip {
+      /* 鉄道の中身 (線路・駅・路線)。一段下げて、鉄道の内側だと分かるようにする。 */
+      .row-subtools {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 5px;
+        margin: 5px 0 0 10px;
+        padding-left: 8px;
+        border-left: 2px solid var(--border);
+      }
+
+      .row-subtools[hidden] {
+        display: none;
+      }
+
+      .row-tools button.chip,
+      .row-subtools button.chip {
         display: flex;
         flex-direction: column;
         align-items: center;
         gap: 1px;
-        padding: 7px 4px;
+        padding: 7px 2px;
       }
 
-      .row-tools button.chip small {
+      .row-tools button.chip small,
+      .row-subtools button.chip small {
         color: var(--muted);
         font-size: 10px;
         letter-spacing: 0.06em;
       }
 
-      .row-tools button.chip.active small {
+      .row-tools button.chip.active small,
+      .row-subtools button.chip.active small {
         color: var(--text);
       }
 
@@ -212,17 +232,6 @@
         font-variant-numeric: tabular-nums;
       }
 
-      /* 種別の並びの中の小見出し (道路 / 線路)。 */
-      .subhead {
-        margin: 9px 0 4px;
-        font-size: 10px;
-        letter-spacing: 0.06em;
-        color: var(--muted);
-      }
-
-      .subhead:first-child {
-        margin-top: 2px;
-      }
 
       /* 区画の用途チップ。色は 3D の区画表示と揃える。 */
       button.chip.zone-residential.active {

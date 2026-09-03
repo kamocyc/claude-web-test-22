@@ -1,8 +1,8 @@
 import { Vector3 } from 'three';
-import { NETWORK_CLASSES, getClass } from '../network/classes';
+import { NETWORK_CLASSES, getClass, type NetworkKind } from '../network/classes';
 import { riskColor, viewUniforms } from '../render/materials';
 import type { BuildResult, WorldWarning } from '../render/worldBuilder';
-import type { ToolMode, ToolStatus } from './buildTool';
+import type { ToolStatus } from './buildTool';
 import type { StationToolSettings } from './buildTool';
 import { stationPlatformRange, STATION_LENGTHS, type StationId } from '../network/station';
 import { ZONE_LABELS, ZONE_TYPES, type ZoneType } from '../network/zoning';
@@ -22,8 +22,26 @@ import {
   type PointInspection,
 } from './inspect';
 
+/**
+ * 画面に出るツールの葉。
+ *
+ * `ToolMode` と種別 (道路 / 線路) の組を 1 つの名前にしたもの。敷設モードは
+ * 道路と線路の両方を兼ねていて、違うのは選んでいる種別だけなので、
+ * 並びの上ではそこを分けて見せる。
+ */
+export type ToolView = 'road' | 'track' | 'station' | 'line' | 'zone' | 'bulldoze' | 'inspect';
+
+/** 上の並びに出るまとまり。鉄道は 3 つの葉を持つ。 */
+type ToolCategory = 'road' | 'rail' | 'zone' | 'bulldoze' | 'inspect';
+
+/** その葉はどのまとまりに属するか。 */
+function categoryOf(view: ToolView): ToolCategory {
+  return view === 'track' || view === 'station' || view === 'line' ? 'rail' : view;
+}
+
 export interface UiCallbacks {
-  onMode: (mode: ToolMode) => void;
+  /** ツールを選ぶ。モードと種別の対応は呼び側が持つ。 */
+  onTool: (view: ToolView) => void;
   onStationSettings: (patch: Partial<Omit<StationToolSettings, 'heading'>>) => void;
   onStationRotate: (steps: number) => void;
   onStationRename: (id: StationId, name: string) => void;
@@ -69,9 +87,14 @@ interface ToggleSpec {
  * 3D 側と分離しておき、ここではイベントを外へ流すだけにする。
  */
 export class Ui {
-  private readonly modeButtons = new Map<ToolMode, HTMLButtonElement>();
+  private readonly categoryButtons = new Map<ToolCategory, HTMLButtonElement>();
+  private readonly subToolButtons = new Map<ToolView, HTMLButtonElement>();
+  /** 鉄道のサブツールの行。鉄道を選んでいる間だけ出す。 */
+  private readonly subToolRow: HTMLElement;
+  /** 鉄道で直前に使った葉。鉄道に戻ってきたときここへ入る。 */
+  private lastRailView: ToolView = 'track';
   /** ツールごとの設定のまとまり。選んだツールのものだけを出す。 */
-  private readonly groups: { node: HTMLElement; modes: ToolMode[] }[] = [];
+  private readonly groups: { node: HTMLElement; views: ToolView[] }[] = [];
   private readonly classButtons = new Map<string, HTMLButtonElement>();
   private readonly parallelButtons = new Map<boolean, HTMLButtonElement>();
   private readonly zoneButtons = new Map<ZoneType | null, HTMLButtonElement>();
@@ -111,54 +134,68 @@ export class Ui {
     // ツールの並び。ここだけが常に出ていて、下の設定は選んだツールのものに
     // 入れ替わる。全部を一度に並べると、いま効く設定がどれか分からない。
     left.append(sectionTitle('ツール'));
-    const modes = el('div', 'row row-tools');
-    for (const [mode, label, hint] of [
-      ['build', '敷設', 'B'],
-      ['station', '駅', 'T'],
+    const categories = el('div', 'row row-tools');
+    for (const [category, label, hint] of [
+      ['road', '道路', 'B'],
+      ['rail', '鉄道', 'R'],
       ['zone', '区画', 'Z'],
-      ['line', '路線', 'L'],
       ['bulldoze', '撤去', 'X'],
       ['inspect', '確認', 'V'],
-    ] as [ToolMode, string, string][]) {
+    ] as [ToolCategory, string, string][]) {
       const button = el('button', 'chip') as HTMLButtonElement;
       button.innerHTML = `<span>${label}</span><small>${hint}</small>`;
-      button.addEventListener('click', () => callbacks.onMode(mode));
-      this.modeButtons.set(mode, button);
-      modes.append(button);
+      // 鉄道は 3 つの葉を持つので、直前に使った葉へ入る。
+      button.addEventListener('click', () =>
+        callbacks.onTool(category === 'rail' ? this.lastRailView : category),
+      );
+      this.categoryButtons.set(category, button);
+      categories.append(button);
     }
-    left.append(modes);
+    left.append(categories);
 
-    /** ツールごとの設定のまとまり。`setMode` で出し入れする。 */
-    const group = (title: string, modes: ToolMode[]): HTMLElement => {
+    // 鉄道の中身。線路・駅・路線はどれも鉄道の仕事なので、1 段下げて並べる。
+    this.subToolRow = el('div', 'row row-subtools');
+    for (const [view, label, hint] of [
+      ['track', '線路', 'R'],
+      ['station', '駅', 'T'],
+      ['line', '路線', 'L'],
+    ] as [ToolView, string, string][]) {
+      const button = el('button', 'chip') as HTMLButtonElement;
+      button.innerHTML = `<span>${label}</span><small>${hint}</small>`;
+      button.addEventListener('click', () => callbacks.onTool(view));
+      this.subToolButtons.set(view, button);
+      this.subToolRow.append(button);
+    }
+    left.append(this.subToolRow);
+
+    /** ツールごとの設定のまとまり。`setTool` で出し入れする。 */
+    const group = (title: string, views: ToolView[]): HTMLElement => {
       const node = el('div', 'group');
       node.append(sectionTitle(title));
-      this.groups.push({ node, modes });
+      this.groups.push({ node, views });
       left.append(node);
       return node;
     };
 
-    // ---- 敷設
-    const classGroup = group('種別', ['build']);
-    let lastKind = '';
-    for (const cls of NETWORK_CLASSES) {
-      // 道路と線路の切れ目に小見出しを挟む。並びの意味が一目で分かる。
-      if (cls.kind !== lastKind) {
-        lastKind = cls.kind;
-        const head = el('div', 'subhead');
-        head.textContent = cls.kind === 'rail' ? '線路' : '道路';
-        classGroup.append(head);
+    /** 種別の一覧。道路と線路で別のまとまりにする (同時には片方しか出ない)。 */
+    const classGroup = (view: ToolView, kind: NetworkKind): void => {
+      const node = group('種別', [view]);
+      for (const cls of NETWORK_CLASSES) {
+        if (cls.kind !== kind) continue;
+        const button = el('button', 'chip wide') as HTMLButtonElement;
+        button.innerHTML = `<span>${cls.label}</span><small>R≧${cls.minRadius} / ≦${(
+          cls.maxGrade * 100
+        ).toFixed(1)}%</small>`;
+        button.addEventListener('click', () => callbacks.onClass(cls.id));
+        this.classButtons.set(cls.id, button);
+        node.append(button);
       }
-      const button = el('button', 'chip wide') as HTMLButtonElement;
-      button.innerHTML = `<span>${cls.label}</span><small>R≧${cls.minRadius} / ≦${(
-        cls.maxGrade * 100
-      ).toFixed(1)}%</small>`;
-      button.addEventListener('click', () => callbacks.onClass(cls.id));
-      this.classButtons.set(cls.id, button);
-      classGroup.append(button);
-    }
+    };
+    classGroup('road', 'road');
+    classGroup('track', 'rail');
 
     // 高さは駅にも効く (高架駅・地下駅)。
-    const elevationGroup = group('高さ', ['build', 'station']);
+    const elevationGroup = group('高さ', ['road', 'track', 'station']);
     const elevationRow = el('div', 'row');
     elevationRow.append(
       button('−', () => callbacks.onElevation(-1)),
@@ -167,7 +204,7 @@ export class Ui {
     );
     elevationGroup.append(elevationRow, hint('PageUp / PageDown でも変更できます'));
 
-    const parallelGroup = group('平行スナップ', ['build']);
+    const parallelGroup = group('平行スナップ', ['road', 'track']);
     const parallelRow = el('div', 'row');
     for (const [on, label] of [
       [true, 'あり'],
@@ -409,12 +446,20 @@ export class Ui {
     root.append(left, right, help, undergroundBadge);
   }
 
-  setMode(mode: ToolMode): void {
-    for (const [key, button] of this.modeButtons) {
-      button.classList.toggle('active', key === mode);
+  /** 選んでいるツールを反映する。 */
+  setTool(view: ToolView): void {
+    const category = categoryOf(view);
+    if (category === 'rail') this.lastRailView = view;
+    for (const [key, button] of this.categoryButtons) {
+      button.classList.toggle('active', key === category);
+    }
+    // 鉄道の中身は、鉄道を選んでいる間だけ出す。
+    this.subToolRow.hidden = category !== 'rail';
+    for (const [key, button] of this.subToolButtons) {
+      button.classList.toggle('active', key === view);
     }
     // 選んだツールの設定だけを出す。
-    for (const group of this.groups) group.node.hidden = !group.modes.includes(mode);
+    for (const group of this.groups) group.node.hidden = !group.views.includes(view);
   }
 
   setClass(classId: string): void {

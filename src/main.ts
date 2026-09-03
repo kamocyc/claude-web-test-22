@@ -1,9 +1,10 @@
 import { Vector3 } from 'three';
-import { BuildTool, type ToolMode } from './app/buildTool';
+import { BuildTool } from './app/buildTool';
 import { buildDemoNetwork, buildInterchangeDemo, demoSite } from './app/demo';
 import { Ride } from './app/ride';
-import { Ui } from './app/ui';
+import { Ui, type ToolView } from './app/ui';
 import { Viewport } from './app/viewport';
+import { getClass, type NetworkKind } from './network/classes';
 import { Network } from './network/network';
 import { createPropMaterial, createTerrainMaterial, createWaterMaterial } from './render/materials';
 import { WaterView } from './render/water';
@@ -71,16 +72,16 @@ const ride = new Ride();
 let undergroundView = false;
 
 const ui = new Ui(uiRoot, {
-  onMode: (mode) => setMode(mode),
+  onTool: (view) => setTool(view),
   onStationSettings: (patch) => tool.setStationSettings(patch),
   onStationRotate: (steps) => tool.rotateStation(steps),
   onZone: (zone) => tool.setZone(zone),
   onLineNew: () => {
-    setMode('line');
+    setTool('line');
     tool.newLine();
   },
   onLineSelect: (id) => {
-    setMode('line');
+    setTool('line');
     tool.selectLine(id);
   },
   onLineRemove: (id) => tool.removeLine(id),
@@ -95,6 +96,7 @@ const ui = new Ui(uiRoot, {
   onClass: (classId) => {
     tool.setClass(classId);
     ui.setClass(classId);
+    lastClass[getClass(classId).kind] = classId;
   },
   onElevation: (steps) => tool.adjustElevation(steps),
   onParallelSnap: (on) => tool.setParallelSnap(on),
@@ -202,14 +204,32 @@ function focusOn(position: Vector3): void {
   ]);
 }
 
-function setMode(mode: ToolMode): void {
+/**
+ * 種類ごとに直前の種別を覚える。道路と鉄道を行き来しても選び直さなくていい。
+ */
+const lastClass: Record<NetworkKind, string> = { road: 'road_medium', rail: 'rail_single' };
+
+/**
+ * ツールを選ぶ。
+ *
+ * 画面の並びは 道路 / 鉄道 (線路・駅・路線) / 区画 / 撤去 / 確認 だが、敷設の
+ * モードは 1 つで、道路と線路の違いは種別だけ。ここでその対応を付ける。
+ */
+function setTool(view: ToolView): void {
   // ツールを使うなら乗車モードから降りる (敷設中は俯瞰でないと使えない)。
   stopRide();
-  tool.setMode(mode);
-  ui.setMode(mode);
+  if (view === 'road' || view === 'track') {
+    const classId = lastClass[view === 'road' ? 'road' : 'rail'];
+    tool.setClass(classId);
+    ui.setClass(classId);
+    tool.setMode('build');
+  } else {
+    tool.setMode(view);
+  }
+  ui.setTool(view);
   // 区画のマス目は区画を塗っている間、路線の経路は路線を引いている間だけ出す。
-  world.setZoneView(mode === 'zone');
-  world.setLineView(mode === 'line');
+  world.setZoneView(view === 'zone');
+  world.setLineView(view === 'line');
 }
 
 function applyUndergroundView(on: boolean): void {
@@ -270,7 +290,7 @@ function stopRide(): void {
   ui.setRideState('off');
 }
 
-setMode('build');
+setTool('road');
 ui.setClass(tool.classId);
 ui.setZone(tool.zoneType);
 ui.setParallelSnap(tool.parallelSnap);
@@ -503,27 +523,31 @@ window.addEventListener('keydown', (event) => {
       break;
     case 'b':
     case 'B':
-      setMode('build');
+      setTool('road');
+      break;
+    case 'r':
+    case 'R':
+      setTool('track');
       break;
     case 't':
     case 'T':
-      setMode('station');
+      setTool('station');
       break;
     case 'z':
     case 'Z':
-      setMode('zone');
+      setTool('zone');
       break;
     case 'l':
     case 'L':
-      setMode('line');
+      setTool('line');
       break;
     case 'x':
     case 'X':
-      setMode('bulldoze');
+      setTool('bulldoze');
       break;
     case 'v':
     case 'V':
-      setMode('inspect');
+      setTool('inspect');
       break;
     case 'u':
     case 'U':
