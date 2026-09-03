@@ -65,6 +65,18 @@ export const NOISE_SPAN = 5120;
  */
 export const TERRAIN_RELIEF = 390;
 
+/**
+ * 町の密度 [件/km²]。
+ *
+ * 移植元は 5.1 km 四方に 19 件 (0.95 件/km²) 置いていたが、20,480 m 四方に
+ * そのまま当てると 400 件になる。町 1 つは街路と建物を持つので、地図として
+ * 自然に見える範囲で落としてある。0.25 で 20,480 m 四方に 105 件。
+ */
+export const TOWN_DENSITY = 0.25;
+
+/** 町どうしの最小間隔 [m]。これより詰めては置かない。 */
+export const TOWN_MIN_SPACING = 400;
+
 /** 海面の高さ [m]。地形はここが 0 になるように作る。 */
 export const SEA_LEVEL_Y = 0;
 

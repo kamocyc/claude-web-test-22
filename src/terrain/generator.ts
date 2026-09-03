@@ -12,6 +12,7 @@ import type { HydroWorld } from './hydro/types';
 import { buildRiverNetwork } from './river/network';
 import { carveRivers, upsampleTerrain } from './upsample';
 import { TerrainWater } from './water';
+import { chooseTowns, type Town } from './town/site';
 
 /**
  * 地形生成。
@@ -62,10 +63,11 @@ export const DEFAULT_TERRAIN: TerrainOptions = {
   relief: TERRAIN_RELIEF,
 };
 
-/** 生成した地形と、その水系。 */
+/** 生成した地形と、その水系・町。 */
 export interface TerrainWorld {
   hydro: HydroWorld;
   water: TerrainWater;
+  towns: Town[];
 }
 
 /** 汀線のすぐ内側の陸地の高さ [m]。海面と地面が同じ高さになるのを避ける。 */
@@ -106,7 +108,16 @@ export function generateTerrain(field: Heightfield, options: TerrainOptions = DE
 
   field.water = water;
   field.resetWork();
-  return { hydro, water };
+
+  // 町は水系まで出来てから選ぶ。適性の場は川と海岸からの距離を見ている。
+  const towns = chooseTowns({
+    grid: hydro.grid,
+    suitability: hydro.suitability,
+    water: hydro.sea,
+    seed: options.seed,
+  });
+
+  return { hydro, water, towns };
 }
 
 /**
