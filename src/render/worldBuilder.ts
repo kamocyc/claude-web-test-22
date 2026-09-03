@@ -289,7 +289,11 @@ export class WorldBuilder {
   private gates: CrossingGate[] = [];
   private props: PropPlacement[] = [];
   /** 直近の rebuild で作った占有索引。小物の位置決めに使う。 */
-  private occupancy!: Occupancy;
+  /**
+   * 敷いた線形が地面のどこを覆っているか。小物の配置に使うほか、
+   * 町の描画が建物を退けるのにも見る (`TownView.setObstacles`)。
+   */
+  occupancy!: Occupancy;
   /** 直近の rebuild で使った、踏切に合わせた高さ補正。 */
   private blends = new Map<SegmentId, SurfaceBlend[]>();
   private cant = new Map<SegmentId, CantProfile>();
@@ -668,12 +672,14 @@ export class WorldBuilder {
       diagnostics.set(seg.id, diag);
       stats.totalLength += alignment.length;
       stats.cost += alignment.length * cls.costPerMeter;
-      for (const message of diag.messages) {
-        warnings.push({
-          message,
-          position: alignment.sampleAt(alignment.length / 2).pos,
-          severity: 'warning',
-        });
+      if (!this.townOnly(seg.id)) {
+        for (const message of diag.messages) {
+          warnings.push({
+            message,
+            position: alignment.sampleAt(alignment.length / 2).pos,
+            severity: 'warning',
+          });
+        }
       }
 
       this.buildSegment(
@@ -713,6 +719,7 @@ export class WorldBuilder {
     // 継ぎ目で縦断が折れている所。均しは規格の範囲でしか動かせないので、
     // 詰めきれずに残ることがある。黙って作らずに報せる。
     for (const brk of findGradeBreaks(network)) {
+      if (this.townOnlyAt(brk.node)) continue;
       warnings.push({
         message: gradeBreakMessage(brk),
         position: brk.pos.clone(),
@@ -723,6 +730,7 @@ export class WorldBuilder {
     // 継ぎ目で平面線形が切れている所 (線路)。レールは曲がり角にも曲率の
     // 飛びにも折り合えないので、残っていたら同じように報せる。
     for (const brk of findCurveBreaks(network)) {
+      if (this.townOnlyAt(brk.node)) continue;
       warnings.push({
         message: curveBreakMessage(brk),
         position: brk.pos.clone(),
@@ -1685,6 +1693,23 @@ export class WorldBuilder {
 
   // -------------------------------------------------------------- 交差点
 
+  /**
+   * その線形は町の街路か。
+   *
+   * 町の街路は視点の近くへ来ると自動で敷かれるものなので、そこで閉じた
+   * 注意はプレイヤーに直しようがない。黙って作る。
+   */
+  private townOnly(segment: SegmentId): boolean {
+    return this.network.segments.get(segment)?.town !== undefined;
+  }
+
+  /** その継ぎ目に集まる線形が、町の街路だけか。 */
+  private townOnlyAt(node: NodeId): boolean {
+    const n = this.network.nodes.get(node);
+    if (!n || n.segments.length === 0) return false;
+    return n.segments.every((id) => this.townOnly(id));
+  }
+
   private buildJunction(
     surface: MeshBuilder,
     overlay: MeshBuilder,
@@ -1696,11 +1721,13 @@ export class WorldBuilder {
     tint?: RGB,
   ): void {
     const node = this.network.getNode(junction.node);
-    for (const message of junction.warnings) {
-      warnings.push({ message, position: node.pos.clone(), severity: 'warning' });
-    }
-    for (const message of junction.errors) {
-      warnings.push({ message, position: node.pos.clone(), severity: 'error' });
+    if (!this.townOnlyAt(junction.node)) {
+      for (const message of junction.warnings) {
+        warnings.push({ message, position: node.pos.clone(), severity: 'warning' });
+      }
+      for (const message of junction.errors) {
+        warnings.push({ message, position: node.pos.clone(), severity: 'error' });
+      }
     }
 
     if (junction.kind === 'intersection') stats.intersections++;

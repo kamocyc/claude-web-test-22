@@ -36,12 +36,12 @@ waterView.build(terrain.water);
 
 // 町。街路と敷地の控えは 1 か所に持ち、描く側と実際の道路にする側が
 // 同じ折れ線を見る。
+const network = new Network();
 const townPlans = new TownPlans(field);
 townPlans.setTowns(terrain.towns);
-const townView = new TownView(field, townPlans, createPropMaterial());
+const townView = new TownView(field, network, townPlans, createPropMaterial());
 viewport.scene.add(townView.group);
 
-const network = new Network();
 // 視点の近くの町は、街路を実際の道路として敷く。
 const townRoads = new TownRoads(network, field, townPlans, (index, paved) =>
   townView.setPaved(index, paved),
@@ -121,7 +121,7 @@ const ui = new Ui(uiRoot, {
       townView.reset();
       // 地形が変われば、見本を建てるのに向いた場所も変わる。視点は動かさない
       // — 敷いたネットワークはそのまま残るので、そこから離れると困る。
-      home = demoSite(field);
+      home = demoSite(field, next.towns);
       dirty = true;
     });
   },
@@ -276,7 +276,7 @@ ui.setParallelSnap(tool.parallelSnap);
  * 見本を置く場所。地形は生成のたびに変わるので、原点が海の底ということも
  * ある。地形から選んだ場所に見本を建て、視点もそこへ置く。
  */
-let home = demoSite(field);
+let home = demoSite(field, terrain.towns);
 buildDemoNetwork(network, field, home);
 lookHome();
 
@@ -302,6 +302,8 @@ declare global {
       ride: Ride;
       towns: typeof terrain.towns;
       townRoads: TownRoads;
+      /** 次のフレームで組み立て直す (ネットワークを直に触ったときに使う)。 */
+      invalidate: () => void;
       /** 指定した地点を、指定した距離・方位から見る。 */
       lookAt: (x: number, z: number, distance?: number, azimuth?: number) => void;
     };
@@ -317,6 +319,9 @@ window.trackBuilder = {
   ride,
   towns: terrain.towns,
   townRoads,
+  invalidate: () => {
+    dirty = true;
+  },
   lookAt: (x, z, distance = 120, azimuth = Math.PI * 0.25) => {
     const y = field.heightAt(x, z);
     viewport.controls.target.set(x, y, z);
@@ -559,6 +564,8 @@ function frame(): void {
   if (dirty) {
     dirty = false;
     const result = world.rebuild();
+    // 敷いた線形に掛かる町の建物は出さない。
+    townView.setObstacles(world.occupancy);
     ui.updateBuild(result);
   }
 

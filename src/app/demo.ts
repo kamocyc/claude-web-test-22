@@ -361,7 +361,7 @@ const DRY_Y = 1.5;
  * 「交差点・踏切・分岐器・橋・トンネルが一通り出る」ことを見せるものなので、
  * それが成り立つ場所を地形から探す。
  */
-export function demoSite(field: Heightfield): { x: number; z: number } {
+export function demoSite(field: Heightfield, towns: TownSite[] = []): { x: number; z: number } {
   const margin = DEMO_REACH + field.cell * 2;
   const lo = field.worldMin + margin;
   const hi = field.worldMax - margin;
@@ -372,7 +372,9 @@ export function demoSite(field: Heightfield): { x: number; z: number } {
   let bestScore = -Infinity;
   for (let z = lo; z <= hi; z += step) {
     for (let x = lo; x <= hi; x += step) {
-      const score = siteScore(field, x, z);
+      const town = townTerm(towns, x, z);
+      if (town === null) continue;
+      const score = siteScore(field, x, z) + town;
       if (score > bestScore) {
         bestScore = score;
         best = { x, z };
@@ -381,6 +383,44 @@ export function demoSite(field: Heightfield): { x: number; z: number } {
   }
   return best;
 }
+
+/** 見本の場所選びが見る町。位置と市街地の広がりだけ要る。 */
+interface TownSite {
+  x: number;
+  z: number;
+  radiusM: number;
+}
+
+/**
+ * 町の近くを選ぶための項。町の中なら `null` (そこには置かない)。
+ *
+ * 踏切も交差点も、町の隣にあってこそ地図の中で意味を持つ。ただし
+ * **町の中には置かない** — 実物になった街路と見本の線形が重なると、
+ * どちらも敷けなくなる。市街地の外側に見本の届く範囲 (`DEMO_REACH`) を
+ * 足した所から先を可とし、そこからさらに `TOWN_BAND` までを厚く見る。
+ */
+function townTerm(towns: TownSite[], x: number, z: number): number | null {
+  if (towns.length === 0) return 0;
+  let nearest = Infinity;
+  for (const town of towns) {
+    const distance = Math.hypot(town.x - x, town.z - z);
+    const keep = town.radiusM + DEMO_REACH;
+    if (distance < keep) return null;
+    nearest = Math.min(nearest, distance - keep);
+  }
+  // 町の外へ出た所がいちばん厚く、離れるほど薄れる。
+  return TOWN_WEIGHT * Math.max(0, 1 - nearest / TOWN_BAND);
+}
+
+/** 町の近さを見る幅 [m]。市街地の外縁からこのぶんまでを近いと見る。 */
+const TOWN_BAND = 900;
+/**
+ * 町の近さの重み。
+ *
+ * `siteScore` は「規格の勾配で追えない高さの差」をメートルで数えた減点なので、
+ * 単位はメートル。町の隣を選ぶために、谷や丘の出来を数メートルぶん譲る。
+ */
+const TOWN_WEIGHT = 6;
 
 /**
  * 見本の場所の点数。

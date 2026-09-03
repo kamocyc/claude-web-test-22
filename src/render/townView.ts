@@ -4,6 +4,8 @@ import { MeshBuilder } from '../core/meshbuilder';
 import { drapedRibbon } from '../build/ribbon';
 import { buildBuilding } from '../build/buildings';
 import type { RGB } from '../build/surface';
+import type { Network } from '../network/network';
+import type { Occupancy } from '../network/occupancy';
 import type { Heightfield } from '../terrain/heightfield';
 import { toBuildingLot } from '../terrain/town/layout';
 import type { TownPlans } from '../terrain/town/plans';
@@ -29,16 +31,24 @@ const BUILD_BUDGET = 2;
 /** 街路の色 (舗装)。 */
 const STREET_COLOR: RGB = [0.44, 0.43, 0.41];
 
+/** 敷いた線形から建物を退ける余裕 [m]。歩道と法面のぶん。 */
+const CLEAR_MARGIN = 2;
+
 export class TownView {
   readonly group = new Group();
   private readonly meshes = new Map<number, Mesh>();
   /** 実際の道路として敷いた町。街路は実物が描くので、こちらは建物だけ出す。 */
   private readonly paved = new Set<number>();
+  /** 組んだときに避けていた敷地の印。線形が動いたかを見るのに使う。 */
+  private readonly avoided = new Map<number, number>();
+  /** プレイヤーが敷いた線形。ここに掛かる敷地には建てない。 */
+  private obstacles: Occupancy | null = null;
   private centerX = Infinity;
   private centerZ = Infinity;
 
   constructor(
     private readonly field: Heightfield,
+    private readonly network: Network,
     private readonly plans: TownPlans,
     private readonly material: Material,
   ) {
@@ -66,6 +76,27 @@ export class TownView {
     // 組み直す。次に中心を見たときに拾われる。
     this.drop(index);
     this.centerX = Infinity;
+  }
+
+  /**
+   * プレイヤーが敷いた線形を知らせる。`rebuild()` のあとに呼ぶ。
+   *
+   * 町の建物は地形のものなので、線形を敷くたびに全部組み直すことはしない。
+   * 代わりに「どの敷地を避けたか」を印にして持っておき、それが変わった町
+   * だけを捨てる。線形の無い所では印が変わらないので、何も起きない。
+   */
+  setObstacles(occupancy: Occupancy | null): void {
+    this.obstacles = occupancy;
+    let dropped = false;
+    for (const index of [...this.meshes.keys()]) {
+      const plan = this.plans.at(index);
+      if (!plan) continue;
+      if (this.avoidMark(plan.lots) === this.avoided.get(index)) continue;
+      this.drop(index);
+      dropped = true;
+    }
+    // 捨てた町は、次に中心を見たときに組み直す。
+    if (dropped) this.centerX = Infinity;
   }
 
   /** 見ている点のまわりの町を組む。毎フレーム呼んでよい。 */
@@ -107,14 +138,51 @@ export class TownView {
   dispose(): void {
     for (const index of [...this.meshes.keys()]) this.drop(index);
     this.paved.clear();
+    this.avoided.clear();
   }
 
   private drop(index: number): void {
+    this.avoided.delete(index);
     const mesh = this.meshes.get(index);
     if (!mesh) return;
     mesh.geometry.dispose();
     this.group.remove(mesh);
     this.meshes.delete(index);
+  }
+
+  /**
+   * その敷地が、プレイヤーの敷いた線形に掛かっているか。
+   *
+   * 町の街路そのものは数えない。実物にした町では自分の街路が敷地のすぐ前に
+   * あるので、そこまで数えると町じゅうの建物が消えてしまう。敷地が街路に
+   * 食い込まないことは区割りの側で保証している。
+   */
+  private blocked(lot: { center: { x: number; z: number }; halfFrontage: number; depth: number }): boolean {
+    const occupancy = this.obstacles;
+    if (!occupancy) return false;
+    const hit = occupancy.at(lot.center.x, lot.center.z, {
+      margin: Math.max(lot.halfFrontage, lot.depth / 2) + CLEAR_MARGIN,
+    });
+    if (!hit) return false;
+    return !this.isStreet(hit.segment, hit.node);
+  }
+
+  /** その占有が町の街路のものか (交差点はそこに集まる線形で見る)。 */
+  private isStreet(segment?: number, node?: number): boolean {
+    if (segment !== undefined) return this.network.segments.get(segment)?.town !== undefined;
+    if (node === undefined) return false;
+    const n = this.network.nodes.get(node);
+    if (!n || n.segments.length === 0) return false;
+    return n.segments.every((id) => this.network.segments.get(id)?.town !== undefined);
+  }
+
+  /** 避けた敷地の並びを 1 つの数にしたもの。並びが変われば必ず変わる。 */
+  private avoidMark(lots: readonly { center: { x: number; z: number }; halfFrontage: number; depth: number }[]): number {
+    let mark = 0;
+    for (let i = 0; i < lots.length; i++) {
+      if (this.blocked(lots[i])) mark = (mark * 31 + i + 1) | 0;
+    }
+    return mark;
   }
 
   private build(index: number): void {
@@ -128,7 +196,17 @@ export class TownView {
         drapedRibbon(mb, street.points, street.halfWidth, ground, STREET_COLOR);
       }
     }
-    for (const lot of plan.lots) buildBuilding(mb, toBuildingLot(lot, ground), ground);
+    let mark = 0;
+    for (let i = 0; i < plan.lots.length; i++) {
+      const lot = plan.lots[i];
+      // プレイヤーが敷いた線形に掛かる敷地には建てない。
+      if (this.blocked(lot)) {
+        mark = (mark * 31 + i + 1) | 0;
+        continue;
+      }
+      buildBuilding(mb, toBuildingLot(lot, ground), ground);
+    }
+    this.avoided.set(index, mark);
     if (mb.isEmpty) return;
     const mesh = new Mesh(mb.build(), this.material);
     mesh.name = `town-${plan.town.name}`;

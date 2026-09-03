@@ -5,10 +5,13 @@ import { DEFAULT_TERRAIN, generateTerrain } from '../src/terrain/generator';
 import { planTown, toBuildingLot } from '../src/terrain/town/layout';
 import { TownPlans } from '../src/terrain/town/plans';
 import { TownRoads } from '../src/app/townRoads';
+import { TownView } from '../src/render/townView';
+import { Occupancy } from '../src/network/occupancy';
+import { demoSite } from '../src/app/demo';
 import { Network } from '../src/network/network';
 import { anchorFromNode, computePlacement, placeSegment } from '../src/network/editing';
 import { getClass } from '../src/network/classes';
-import { Vector3 } from 'three';
+import { MeshStandardMaterial, Vector2, Vector3, type Mesh } from 'three';
 import { testField } from './support/field';
 
 /**
@@ -293,5 +296,94 @@ describe('近くの町を実際の道路にする', () => {
     network.clear();
     expect(roads.isPaved(index)).toBe(false);
     expect(roads.count).toBe(0);
+  });
+});
+
+describe('町の描画', () => {
+  /** 町 1 つぶんのメッシュの頂点数。組めていなければ 0。 */
+  function vertices(view: TownView, name: string): number {
+    let total = 0;
+    for (const child of view.group.children) {
+      if (child.name !== `town-${name}`) continue;
+      total += (child as Mesh).geometry.attributes.position.count;
+    }
+    return total;
+  }
+
+  function drawn() {
+    const field = testField();
+    const { towns } = generateTerrain(field, DEFAULT_TERRAIN);
+    const plans = new TownPlans(field);
+    plans.setTowns(towns);
+    // いちばん敷地の多い町で見る。
+    let index = 0;
+    for (let i = 0; i < towns.length; i++) {
+      if ((plans.at(i)?.lots.length ?? 0) > (plans.at(index)?.lots.length ?? 0)) index = i;
+    }
+    const network = new Network();
+    const view = new TownView(field, network, plans, new MeshStandardMaterial());
+    return { field, towns, plans, network, view, index };
+  }
+
+  it('敷いた線形に掛かる建物は出さない', () => {
+    const { towns, network, view, index, field } = drawn();
+    const town = towns[index];
+    view.setCenter(town.x, town.z);
+    const before = vertices(view, town.name);
+    expect(before).toBeGreaterThan(0);
+
+    // 町を突っ切る道路を敷く。
+    const a = { x: town.x - town.radiusM, z: town.z - town.radiusM };
+    const b = { x: town.x + town.radiusM, z: town.z + town.radiusM };
+    const na = network.addNode(new Vector3(a.x, field.heightAt(a.x, a.z), a.z));
+    const nb = network.addNode(new Vector3(b.x, field.heightAt(b.x, b.z), b.z));
+    network.addSegment({
+      classId: 'road_large',
+      a: na.id,
+      b: nb.id,
+      ctrlA: new Vector2(a.x + (b.x - a.x) / 3, a.z + (b.z - a.z) / 3),
+      ctrlB: new Vector2(a.x + (2 * (b.x - a.x)) / 3, a.z + (2 * (b.z - a.z)) / 3),
+      gradeA: 0,
+      gradeB: 0,
+    });
+
+    view.setObstacles(new Occupancy(network));
+    view.setCenter(town.x, town.z);
+    const after = vertices(view, town.name);
+    // 道路の通り道の建物が抜けるので、必ず減る。町ごと消えてはいけない。
+    expect(after).toBeGreaterThan(0);
+    expect(after).toBeLessThan(before);
+  });
+
+  it('町の街路そのものは建物を退けない', () => {
+    const { towns, network, view, index, plans, field } = drawn();
+    const town = towns[index];
+    view.setCenter(town.x, town.z);
+    const before = vertices(view, town.name);
+
+    // 街路を実際の道路として敷く (印が付く)。
+    const roads = new TownRoads(network, field, plans, () => {});
+    roads.update(town.x, town.z);
+    expect(network.segments.size).toBeGreaterThan(0);
+
+    view.setObstacles(new Occupancy(network));
+    view.setCenter(town.x, town.z);
+    // 街路は自分の敷地の前を通るだけなので、1 棟も消えない。
+    expect(vertices(view, town.name)).toBe(before);
+  });
+});
+
+describe('見本を建てる場所と町', () => {
+  const { field, towns } = world();
+
+  it('町の中には建てない', () => {
+    const site = demoSite(field, towns);
+    for (const town of towns) {
+      expect(Math.hypot(town.x - site.x, town.z - site.z)).toBeGreaterThan(town.radiusM);
+    }
+  });
+
+  it('同じ町なら同じ場所を選ぶ', () => {
+    expect(demoSite(field, towns)).toEqual(demoSite(field, towns));
   });
 });
