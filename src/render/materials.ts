@@ -136,6 +136,37 @@ if (uBlocked > 0.5) {
 }
 
 /**
+ * 手続き的なノイズ (GLSL)。
+ *
+ * この計画はテクスチャ画像を 1 枚も持たない。地面のむらは値ノイズで作る。
+ * `hash21` は 2 次元 → 0..1、`vnoise` はその双一次補間、`fbm2` は 3 オクターブ。
+ * オクターブを増やすほど地面の情報は増えるが、地形は画面のほとんどを覆うので
+ * フラグメントの計算はそのままフレーム時間に効く。3 で止めてある。
+ */
+const NOISE_GLSL = `
+float hash21(vec2 p) {
+  p = fract(p * vec2(123.34, 456.21));
+  p += dot(p, p + 45.32);
+  return fract(p.x * p.y);
+}
+
+float vnoise(vec2 p) {
+  vec2 i = floor(p);
+  vec2 f = fract(p);
+  f = f * f * (3.0 - 2.0 * f);
+  float a = hash21(i);
+  float b = hash21(i + vec2(1.0, 0.0));
+  float c = hash21(i + vec2(0.0, 1.0));
+  float d = hash21(i + vec2(1.0, 1.0));
+  return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+
+float fbm2(vec2 p) {
+  return vnoise(p) * 0.5 + vnoise(p * 2.03) * 0.3 + vnoise(p * 4.01) * 0.2;
+}
+`;
+
+/**
  * 地形マテリアル。傾斜による色分け、標高による色味、等高線を入れる。
  */
 export function createTerrainMaterial(): MeshStandardMaterial {
@@ -170,7 +201,7 @@ uniform float uContour;
 uniform float uSlopeHeat;
 varying vec3 vWorldPos;
 varying vec3 vWorldNormal;
-
+${NOISE_GLSL}
 vec3 slopeHeat(float slopeDeg) {
   vec3 flat0 = vec3(0.16, 0.52, 0.78);
   vec3 mid = vec3(0.98, 0.85, 0.30);
@@ -179,19 +210,64 @@ vec3 slopeHeat(float slopeDeg) {
   return t < 0.5 ? mix(flat0, mid, t * 2.0) : mix(mid, steep, (t - 0.5) * 2.0);
 }
 
-vec3 terrainColor(float slopeDeg, float height) {
+/**
+ * 地面の色。
+ *
+ * 傾斜と標高だけで決めると、同じ高さの平地がどこまでも同じ緑になる。
+ * 3 段のむら — 大 (150 m) で草地と乾いた草・土の混ざりを動かし、中 (18 m) と
+ * 小 (1.1 m と 3.6 m) で明るさを振る — を掛けて、面の中に情報を持たせる。
+ * 小さいむらは detail で遠くから消す (遠景は地形が 8 m・16 m 格子に落ちるので、
+ * 残すとちらつく)。
+ */
+vec3 terrainColor(float slopeDeg, float height, vec2 xz, float detail) {
   vec3 grass = vec3(0.28, 0.45, 0.19);
   vec3 grassDry = vec3(0.40, 0.47, 0.23);
   vec3 dirt = vec3(0.44, 0.35, 0.22);
   vec3 rock = vec3(0.42, 0.41, 0.40);
   vec3 sand = vec3(0.66, 0.61, 0.46);
 
-  vec3 c = mix(grass, grassDry, clamp(height / 60.0, 0.0, 1.0));
+  float macro = fbm2(xz / 150.0);
+  float meso = vnoise(xz / 18.0);
+  float micro = vnoise(xz / 1.1) * 0.6 + vnoise(xz / 3.6) * 0.4;
+
+  // 乾いた草は標高だけでなく、大きなむらでも顔を出す。
+  float dryness = clamp(height / 60.0 + (macro - 0.5) * 0.55, 0.0, 1.0);
+  vec3 c = mix(grass, grassDry, dryness);
+  // 草地の中に土が透ける所を作る。
+  c = mix(c, dirt, smoothstep(0.62, 0.92, macro) * 0.35);
   c = mix(c, dirt, smoothstep(14.0, 27.0, slopeDeg));
   c = mix(c, rock, smoothstep(29.0, 42.0, slopeDeg));
   // 水際だけ砂浜にする。
   c = mix(sand, c, smoothstep(0.0, 1.6, height));
+
+  // 明るさのむら。岩肌と砂浜にも通す (平らに見えないように)。
+  c *= 1.0 + (meso - 0.5) * 0.12 + (micro - 0.5) * 0.13 * detail;
   return c;
+}`,
+      )
+      // 粗さを振る。一様な艶消しだと、陽の当たり方が面のどこでも同じになる。
+      // `roughnessFactor` はこの include が宣言するので、必ずこの後で触る。
+      .replace(
+        '#include <roughnessmap_fragment>',
+        `#include <roughnessmap_fragment>
+roughnessFactor = clamp(roughnessFactor - (vnoise(vWorldPos.xz / 26.0) - 0.5) * 0.3, 0.6, 1.0);`,
+      )
+      // 法線を微かに揺らす。地面が幾何的に平らでも、陰影に細かい起伏が出る。
+      //
+      // 揺らすのは照明に使う `normal` だけで、`vWorldNormal` は触らない。
+      // 傾斜の色分け・等高線・傾斜ヒートマップはそちらを見ているので、
+      // 見た目の意味が変わらない。近くだけ計算する (遠くではちらつくだけ)。
+      .replace(
+        '#include <normal_fragment_begin>',
+        `#include <normal_fragment_begin>
+{
+  float bumpFade = 1.0 - smoothstep(90.0, 300.0, length(vWorldPos - cameraPosition));
+  if (bumpFade > 0.01) {
+    float e = 0.5;
+    float nx = vnoise((vWorldPos.xz + vec2(e, 0.0)) / 1.9) - vnoise((vWorldPos.xz - vec2(e, 0.0)) / 1.9);
+    float nz = vnoise((vWorldPos.xz + vec2(0.0, e)) / 1.9) - vnoise((vWorldPos.xz - vec2(0.0, e)) / 1.9);
+    normal = normalize(normal + vec3(-nx, 0.0, -nz) * 0.7 * bumpFade);
+  }
 }`,
       )
       .replace(
@@ -199,7 +275,12 @@ vec3 terrainColor(float slopeDeg, float height) {
         `#include <color_fragment>
 {
   float slopeDeg = degrees(acos(clamp(normalize(vWorldNormal).y, -1.0, 1.0)));
-  vec3 base = terrainColor(slopeDeg, vWorldPos.y);
+  // 近くだけ細かいむらを出す。1 画素が覆う地面が広い所では、あっても
+  // ちらつくだけなので、1 画素が覆う幅 (fwidth) でも落とす。
+  float viewDist = length(vWorldPos - cameraPosition);
+  float texel = fwidth(vWorldPos.x) + fwidth(vWorldPos.z);
+  float detail = (1.0 - smoothstep(120.0, 420.0, viewDist)) * (1.0 - smoothstep(0.6, 1.6, texel));
+  vec3 base = terrainColor(slopeDeg, vWorldPos.y, vWorldPos.xz, detail);
   base = mix(base, slopeHeat(slopeDeg), uSlopeHeat);
 
   if (uContour > 0.0) {
