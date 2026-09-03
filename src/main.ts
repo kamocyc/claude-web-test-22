@@ -5,8 +5,9 @@ import { Ride } from './app/ride';
 import { Ui } from './app/ui';
 import { Viewport } from './app/viewport';
 import { Network } from './network/network';
-import { createTerrainMaterial, createWaterMaterial } from './render/materials';
+import { createPropMaterial, createTerrainMaterial, createWaterMaterial } from './render/materials';
 import { WaterView } from './render/water';
+import { TownView } from './render/townView';
 import { SnapView } from './render/snapView';
 import { WorldBuilder } from './render/worldBuilder';
 import { DEFAULT_TERRAIN, generateTerrain } from './terrain/generator';
@@ -26,10 +27,15 @@ const terrain = generateTerrain(field, { ...DEFAULT_TERRAIN, seed: terrainSeed }
 const terrainMesh = new TerrainMesh(field, createTerrainMaterial());
 viewport.scene.add(terrainMesh.group);
 
-// 海・湖・川の水面。地形を作り直したときだけ組み立て直す。
+// 海と川の水面。地形を作り直したときだけ組み立て直す。
 const waterView = new WaterView(createWaterMaterial());
 viewport.scene.add(waterView.group);
 waterView.build(terrain.water);
+
+// 町。カメラのまわりのぶんだけ組む。
+const townView = new TownView(field, createPropMaterial());
+viewport.scene.add(townView.group);
+townView.setTowns(terrain.towns);
 
 const network = new Network();
 const world = new WorldBuilder(network, field, terrainMesh);
@@ -102,6 +108,7 @@ const ui = new Ui(uiRoot, {
       terrainSeed = (terrainSeed * 1664525 + 1013904223) >>> 0;
       const next = generateTerrain(field, { ...DEFAULT_TERRAIN, seed: terrainSeed });
       waterView.build(next.water);
+      townView.setTowns(next.towns);
       // 地形が変われば、見本を建てるのに向いた場所も変わる。視点は動かさない
       // — 敷いたネットワークはそのまま残るので、そこから離れると困る。
       home = demoSite(field);
@@ -195,6 +202,7 @@ function applyUndergroundView(on: boolean): void {
   world.setUndergroundView(on);
   // 水面は地形より手前に描くので、透かすときは一緒に消す。
   waterView.setUndergroundView(on);
+  townView.setUndergroundView(on);
   document.body.classList.toggle('underground-view', on);
 }
 
@@ -266,6 +274,7 @@ function lookHome(): void {
   viewport.camera.position.set(home.x + 150, y + 180, home.z + 220);
   viewport.controls.update();
   terrainMesh.setCenter(home.x, home.z);
+  townView.setCenter(home.x, home.z);
 }
 
 // 動作確認・デバッグ用に主要オブジェクトを公開する。
@@ -278,6 +287,7 @@ declare global {
       field: Heightfield;
       tool: BuildTool;
       ride: Ride;
+      towns: typeof terrain.towns;
       /** 指定した地点を、指定した距離・方位から見る。 */
       lookAt: (x: number, z: number, distance?: number, azimuth?: number) => void;
     };
@@ -291,6 +301,7 @@ window.trackBuilder = {
   field,
   tool,
   ride,
+  towns: terrain.towns,
   lookAt: (x, z, distance = 120, azimuth = Math.PI * 0.25) => {
     const y = field.heightAt(x, z);
     viewport.controls.target.set(x, y, z);
@@ -539,6 +550,7 @@ function frame(): void {
   updateKeyboardPan(dt);
   // 地形は視界のぶんだけ常駐させる。カメラが見ている地面の点で決める。
   terrainMesh.setCenter(viewport.controls.target.x, viewport.controls.target.z);
+  townView.setCenter(viewport.controls.target.x, viewport.controls.target.z);
   // 警告の目印は、しばらくしたら自分で消える。
   if (focusUntil > 0 && now >= focusUntil) {
     focusUntil = 0;
