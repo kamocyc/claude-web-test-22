@@ -202,7 +202,18 @@ function buildAbutment(
   deckBottom: number,
   inward: number,
 ): void {
-  const ground = field.baseHeightAt(sample.pos.x, sample.pos.z);
+  const half = cls.halfWidth + 0.6;
+  // 地面は継ぎ目のまわりの**いちばん低い所**で見る。橋の下は整地が遮断されて
+  // 自然地形のまま残るので、継ぎ目の内側と外側で地面の高さが飛ぶ。その段差を
+  // 塞ぐのが橋台なので、中心線 1 点で決めると桁の際に隙間が残る。
+  let ground = Infinity;
+  for (const across of [-half, 0, half]) {
+    for (const along of [-4, -2, 0, 2, 4]) {
+      const x = sample.pos.x + sample.right.x * across + sample.forward.x * along;
+      const z = sample.pos.z + sample.right.z * across + sample.forward.z * along;
+      ground = Math.min(ground, field.baseHeightAt(x, z), field.heightAt(x, z));
+    }
+  }
   const top = sample.pos.y + deckBottom + 0.2;
   const bottom = Math.min(ground, sample.pos.y - 12) - 1.0;
   const height = top - bottom;
@@ -219,7 +230,7 @@ function buildAbutment(
     sample.right,
     UP,
     sample.forward,
-    { x: cls.halfWidth + 0.6, y: height / 2, z: 0.9 },
+    { x: half, y: height / 2, z: 0.9 },
     CONCRETE,
   );
 }

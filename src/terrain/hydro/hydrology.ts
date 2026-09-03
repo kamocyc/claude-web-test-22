@@ -56,12 +56,28 @@ export function makeTerrain(g: HydroGrid, p: HydroParams): Float32Array {
       plains[i] = fbm(u * 2.0, v * 2.0, p.seed + 1409, 3);
       // 外周は 3.6 乗で落として海に沈める。これが「有限マップ」の作り。
       const edge = Math.pow(Math.max(Math.abs(cx), Math.abs(cy)) * 2, 3.6) * 0.24;
-      let z = continent + mountain + detail - edge;
-      for (const basin of basins) {
-        const d = Math.hypot(u - basin.x, v - basin.y) / basin.r;
-        if (d < 1) z -= basin.d * (1 - d * d) ** 2;
+      h[i] = continent + mountain + detail - edge;
+    }
+  }
+
+  // 盆地は自分の半径の中にしか効かない。全セル × 盆地の数だけ距離を測ると、
+  // 広いマップでは盆地の数も比例して増えるので二乗で効いてくる。
+  const toCell = (uv: number): number => (uv / span) * (n - 1);
+  for (const basin of basins) {
+    const cxc = toCell(basin.x);
+    const cyc = toCell(basin.y);
+    const rc = toCell(basin.r);
+    const x0 = Math.max(0, Math.ceil(cxc - rc));
+    const x1 = Math.min(n - 1, Math.floor(cxc + rc));
+    const y0 = Math.max(0, Math.ceil(cyc - rc));
+    const y1 = Math.min(n - 1, Math.floor(cyc + rc));
+    for (let y = y0; y <= y1; y++) {
+      for (let x = x0; x <= x1; x++) {
+        const dx = (x - cxc) / rc;
+        const dy = (y - cyc) / rc;
+        const dd = dx * dx + dy * dy;
+        if (dd < 1) h[y * n + x] -= basin.d * (1 - dd) ** 2;
       }
-      h[i] = z;
     }
   }
 

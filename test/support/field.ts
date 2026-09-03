@@ -6,9 +6,9 @@ import { Heightfield } from '../../src/terrain/heightfield';
  *
  * 本番のマップ (`MAP_SIZE`) をそのまま作ると、地形メッシュだけで 1 シーン
  * 数十 MB になり、何十シーンも組み立てるテストではメモリが持たない。
- * 試験に要る範囲 (線形はどれも原点から数百 m 以内) に絞る。
+ * 見本のネットワークが収まる範囲 (原点から 1 km ほど) に絞る。
  */
-export const TEST_MAP_SIZE = 2048;
+export const TEST_MAP_SIZE = 4096;
 
 /**
  * テスト用の高さ場。

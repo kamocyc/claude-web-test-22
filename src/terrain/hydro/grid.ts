@@ -14,14 +14,33 @@
 export const DX = [-1, 0, 1, -1, 1, -1, 0, 1];
 export const DY = [-1, -1, -1, 0, 0, 1, 1, 1];
 
-/** 格子の大きさ。`len` は格子点の総数。 */
+/**
+ * 格子。`len` は格子点の総数で、`cell` は 1 セルの辺長 [m]。
+ *
+ * 水文の定数はすべて「セル単位の距離」で書かれているので、`cell` は
+ * 移植元と同じ 40 m を保つ (マップを広げるときは格子の数を増やす)。
+ */
 export interface HydroGrid {
   readonly n: number;
   readonly len: number;
+  readonly cell: number;
+  /** 添字 0 に対応するワールド座標 (X, Z 共通)。 */
+  readonly origin: number;
+  /** 格子座標 → ワールド座標 [m]。 */
+  worldAt(index: number): number;
+  /** ワールド座標 [m] → 格子座標 (実数)。 */
+  cellAt(world: number): number;
 }
 
-export function makeGrid(n: number): HydroGrid {
-  return { n, len: n * n };
+export function makeGrid(n: number, cell = 40, origin = -((n - 1) * cell) / 2): HydroGrid {
+  return {
+    n,
+    len: n * n,
+    cell,
+    origin,
+    worldAt: (index: number) => origin + index * cell,
+    cellAt: (world: number) => (world - origin) / cell,
+  };
 }
 
 export const clamp = (v: number, a = 0, b = 1): number => Math.max(a, Math.min(b, v));

@@ -1598,6 +1598,10 @@ export class WorldBuilder {
 
   /** 小物を立ててよい場所か (自分の線形は除く)。 */
   private canPlaceProp(x: number, z: number, y: number | undefined, own: SegmentId[]): boolean {
+    // 地面が路面より高い所には立てない。坑門の際や切土の法面では、整地が
+    // 遮断されて地形が路面の何 m も上に残る。そこに柱を建てると、柱だけが
+    // 地中に埋まって見える。
+    if (y !== undefined && this.field.heightAt(x, z) - y > PROP_MAX_RISE) return false;
     return this.occupancy.isFree(x, z, {
       exceptSegments: own,
       margin: PROP_CLEARANCE,

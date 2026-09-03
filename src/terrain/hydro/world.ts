@@ -27,8 +27,13 @@ import {
 import { refineLakes } from './lakes';
 import type { HydroParams, HydroWorld } from './types';
 
-export function generateHydroWorld(cells: number, params: HydroParams): HydroWorld {
-  const g: HydroGrid = makeGrid(cells + 1);
+export function generateHydroWorld(
+  cells: number,
+  params: HydroParams,
+  cell = 40,
+  origin = -(cells * cell) / 2,
+): HydroWorld {
+  const g: HydroGrid = makeGrid(cells + 1, cell, origin);
   const len = g.len;
 
   const raw = makeTerrain(g, params);
@@ -75,6 +80,7 @@ export function generateHydroWorld(cells: number, params: HydroParams): HydroWor
     riverThreshold,
     slope,
     breaches: breached.breaches,
+    landform: geomorph.landform,
     suitability: geo.suitability,
     coastDistance: geo.coastDistance,
     riverDistance: geomorph.riverDist,

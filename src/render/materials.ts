@@ -222,6 +222,25 @@ vec3 terrainColor(float slopeDeg, float height) {
 }
 
 /** 路面標示など、路面のすぐ上に重ねる薄い面のマテリアル。 */
+/**
+ * 水面の材質。
+ *
+ * 頂点カラーで深さを塗り分ける。`depthWrite` を切ってあるのは、水面の下の
+ * 地形や、水に架かる橋の桁が水面に隠されないようにするため。両面にするのは
+ * 水中から見上げる (地下ビュー・乗車モード) ことがあるから。
+ */
+export function createWaterMaterial(): MeshStandardMaterial {
+  return new MeshStandardMaterial({
+    vertexColors: true,
+    transparent: true,
+    opacity: 0.82,
+    roughness: 0.12,
+    metalness: 0,
+    depthWrite: false,
+    side: DoubleSide,
+  });
+}
+
 export function createOverlayMaterial(): MeshStandardMaterial {
   const material = new MeshStandardMaterial({
     vertexColors: true,

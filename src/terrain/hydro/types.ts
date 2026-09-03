@@ -61,6 +61,8 @@ export interface HydroWorld {
   slope: Float32Array;
   /** 開削した盆地の数。 */
   breaches: number;
+  /** 河川地形の区分 (0 なし / 1 氾濫原 / 2 自然堤防 / 3 後背湿地 / 4 河岸段丘)。 */
+  landform: Uint8Array;
   /** 集落の置きやすさ。見本の配置と初期視点に使う。 */
   suitability: Float32Array;
   /** 海岸からの距離 (セル)。 */

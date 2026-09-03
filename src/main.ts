@@ -1,11 +1,12 @@
 import { Vector3 } from 'three';
 import { BuildTool, type ToolMode } from './app/buildTool';
-import { buildDemoNetwork, buildInterchangeDemo } from './app/demo';
+import { buildDemoNetwork, buildInterchangeDemo, demoSite } from './app/demo';
 import { Ride } from './app/ride';
 import { Ui } from './app/ui';
 import { Viewport } from './app/viewport';
 import { Network } from './network/network';
-import { createTerrainMaterial } from './render/materials';
+import { createTerrainMaterial, createWaterMaterial } from './render/materials';
+import { WaterView } from './render/water';
 import { SnapView } from './render/snapView';
 import { WorldBuilder } from './render/worldBuilder';
 import { DEFAULT_TERRAIN, generateTerrain } from './terrain/generator';
@@ -20,10 +21,15 @@ const viewport = new Viewport(canvas);
 
 const field = new Heightfield();
 let terrainSeed = DEFAULT_TERRAIN.seed;
-generateTerrain(field, { ...DEFAULT_TERRAIN, seed: terrainSeed });
+const terrain = generateTerrain(field, { ...DEFAULT_TERRAIN, seed: terrainSeed });
 
 const terrainMesh = new TerrainMesh(field, createTerrainMaterial());
 viewport.scene.add(terrainMesh.group);
+
+// 海・湖・川の水面。地形を作り直したときだけ組み立て直す。
+const waterView = new WaterView(createWaterMaterial());
+viewport.scene.add(waterView.group);
+waterView.build(terrain.water);
 
 const network = new Network();
 const world = new WorldBuilder(network, field, terrainMesh);
@@ -92,11 +98,15 @@ const ui = new Ui(uiRoot, {
   },
   onRegenerate: () => {
     terrainSeed = (terrainSeed * 1664525 + 1013904223) >>> 0;
-    generateTerrain(field, { ...DEFAULT_TERRAIN, seed: terrainSeed });
+    const next = generateTerrain(field, { ...DEFAULT_TERRAIN, seed: terrainSeed });
+    waterView.build(next.water);
+    // 地形が変われば、見本を建てるのに向いた場所も変わる。
+    home = demoSite(field);
+    lookHome();
     dirty = true;
   },
   onDemo: () => {
-    buildDemoNetwork(network, field);
+    buildDemoNetwork(network, field, home);
     tool.cancel();
     dirty = true;
   },
@@ -154,6 +164,8 @@ function applyUndergroundView(on: boolean): void {
   if (on) stopRide();
   undergroundView = on;
   world.setUndergroundView(on);
+  // 水面は地形より手前に描くので、透かすときは一緒に消す。
+  waterView.setUndergroundView(on);
   document.body.classList.toggle('underground-view', on);
 }
 
@@ -209,7 +221,23 @@ setMode('build');
 ui.setClass(tool.classId);
 ui.setZone(tool.zoneType);
 ui.setParallelSnap(tool.parallelSnap);
-buildDemoNetwork(network, field);
+
+/**
+ * 見本を置く場所。地形は生成のたびに変わるので、原点が海の底ということも
+ * ある。地形から選んだ場所に見本を建て、視点もそこへ置く。
+ */
+let home = demoSite(field);
+buildDemoNetwork(network, field, home);
+lookHome();
+
+/** 見本の場所を見下ろす位置に視点を置く。 */
+function lookHome(): void {
+  const y = field.heightAt(home.x, home.z);
+  viewport.controls.target.set(home.x, y, home.z);
+  viewport.camera.position.set(home.x + 150, y + 180, home.z + 220);
+  viewport.controls.update();
+  terrainMesh.setCenter(home.x, home.z);
+}
 
 // 動作確認・デバッグ用に主要オブジェクトを公開する。
 declare global {
@@ -480,6 +508,8 @@ function frame(): void {
   }
 
   updateKeyboardPan(dt);
+  // 地形は視界のぶんだけ常駐させる。カメラが見ている地面の点で決める。
+  terrainMesh.setCenter(viewport.controls.target.x, viewport.controls.target.z);
   // 警告の目印は、しばらくしたら自分で消える。
   if (focusUntil > 0 && now >= focusUntil) {
     focusUntil = 0;

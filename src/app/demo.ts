@@ -30,8 +30,10 @@ function findAtGradePoint(
     if (!hit) continue;
     const delta = Math.abs(hit.pos.y - field.baseHeightAt(hit.pos.x, hit.pos.z));
     const grade = Math.abs(network.alignmentOf(hit.segment).vertical.gradeAt(hit.s));
-    // 勾配 1% を高さのずれ 0.4 m と同じ重みで嫌う。
-    const cost = delta + grade * 40;
+    // 勾配を強く嫌う。踏切では線路は水平で、道路の舗装だけが道路の縦断に
+    // 沿うので、勾配のある所に置くと外側のレールの上で舗装が railhead から
+    // 浮く (4.5 m 離れた複線では 3% で 13 cm)。
+    const cost = delta + grade * 150;
     if (cost < bestCost) {
       bestCost = cost;
       bestDelta = delta;
@@ -116,14 +118,18 @@ function attachTerminus(
  * 起動時に置くサンプル。切土・盛土、橋、トンネル、交差点、踏切、分岐器、
  * 立体交差が一通り含まれるように配置する。
  */
-export function buildDemoNetwork(network: Network, field: Heightfield): void {
+export function buildDemoNetwork(
+  network: Network,
+  field: Heightfield,
+  origin: { x: number; z: number } = demoSite(field),
+): void {
   network.clear();
 
   // 幹線道路。自然地形をならした縦断で東西に通す。谷では高架、丘では
   // トンネル、それ以外は切土・盛土で地形に馴染む。
-  const roadZ = -40;
+  const roadZ = origin.z - 40;
   const trunk: Waypoint[] = [];
-  for (let x = -430; x <= 430; x += 60) trunk.push({ x, z: roadZ });
+  for (let x = -430; x <= 430; x += 60) trunk.push({ x: origin.x + x, z: roadZ });
   // 縦断は規格 (13.5%) より大幅に緩い 6% までにする。地形をそのまま
   // なぞらせると切土・盛土だけで通ってしまい、谷の高架も丘のトンネルも
   // 出てこない。
@@ -134,8 +140,8 @@ export function buildDemoNetwork(network: Network, field: Heightfield): void {
   });
 
   // 幹線道路が地面に接している所を探して、そこに踏切を作る。
-  const crossing = findAtGradePoint(network, field, roadZ, [-300, 300]);
-  const railX = crossing ? crossing.x : -220;
+  const crossing = findAtGradePoint(network, field, roadZ, [origin.x - 300, origin.x + 300]);
+  const railX = crossing ? crossing.x : origin.x - 220;
   const railY = crossing ? crossing.y : field.baseHeightAt(railX, roadZ);
 
   // 線路。踏切の位置だけ道路と同じ高さに固定し、あとは 3% 以内で
@@ -146,9 +152,10 @@ export function buildDemoNetwork(network: Network, field: Heightfield): void {
   // 分岐器のトリムに耐えるよう、区間長は 60 m 以上にしておく。
   const levelZ = [roadZ - 105, roadZ - 45, roadZ + 45, roadZ + 105];
   const railZ: number[] = [...levelZ];
-  for (let z = roadZ - 195; z >= -300; z -= 90) railZ.push(Math.max(z, -300));
-  for (let z = roadZ + 195; z <= 300; z += 90) railZ.push(Math.min(z, 300));
-  railZ.push(-300, 300);
+  const railEnd = 300;
+  for (let z = roadZ - 195; z >= origin.z - railEnd; z -= 90) railZ.push(Math.max(z, origin.z - railEnd));
+  for (let z = roadZ + 195; z <= origin.z + railEnd; z += 90) railZ.push(Math.min(z, origin.z + railEnd));
+  railZ.push(origin.z - railEnd, origin.z + railEnd);
   railZ.sort((a, b) => a - b);
   // 近すぎる点を落として、短いセグメントができないようにする。
   for (let i = railZ.length - 1; i > 0; i--) {
@@ -166,16 +173,22 @@ export function buildDemoNetwork(network: Network, field: Heightfield): void {
       passes: 6,
       lift: 0,
       fixed: fixedIndices,
+      // 側線 (最大 3%) が本線から分かれてしばらく同じ縦断で走れるよう、
+      // 本線もその範囲に収める。規格 (5.5%) いっぱいまで使うと地形を
+      // そのままなぞってしまい、丘のトンネルも出てこない。
+      grade: 0.03,
     }),
     { straight: true, count: 2 },
   );
 
   // 起動直後から路線を引けるよう、本線の両端の先に駅を 1 つずつ繋ぐ。
-  attachTerminus(network, 'みどり台', railX, 300, 1);
-  attachTerminus(network, '南浜', railX, -300, -1);
+  attachTerminus(network, 'みどり台', railX, origin.z + railEnd, 1);
+  attachTerminus(network, '南浜', railX, origin.z - railEnd, -1);
 
   // 側線への分岐。分岐器ができる。
-  const branchNode = network.findNodeNear(new Vector3(railX, railY, roadZ + 120), 40);
+  // 側線は本線の勾配をそのまま引き継ぐので、本線が側線の規格 (3%) に収まる
+  // 所から分ける。踏切の近くは避ける (分岐器と踏切が重なると置けない)。
+  const branchNode = flattestNodeAlong(network, railX, origin.z - 240, origin.z + 240, roadZ);
   if (branchNode) {
     // 分岐器として成り立つよう、本線からごく浅い角度で分ける。
     const yard: Waypoint[] = [
@@ -183,18 +196,27 @@ export function buildDemoNetwork(network: Network, field: Heightfield): void {
       { x: railX + 22, z: branchNode.pos.z + 110 },
       { x: railX + 90, z: branchNode.pos.z + 180 },
     ];
-    draw(
-      network,
-      field,
-      'rail_yard',
-      smoothProfile(field, yard, 'rail_yard', { passes: 4, lift: 0, startY: branchNode.pos.y }),
-    );
+    // 側線は本線と同じ縦断で通す。地形に沿わせると、本線が勾配の途中に
+    // あるときに縦断が分かれ、分岐器のすぐ先で側線の道床が本線の軌道面より
+    // 上に出る (分かれてしばらくは道床が重なっているので、そのまま埋まる)。
+    // 構内の線路が一定勾配なのは実際の作りでもある。
+    const beside = network.findSegmentNear(new Vector3(railX, branchNode.pos.y, yard[1].z), 60);
+    const span1 = Math.hypot(yard[1].x - yard[0].x, yard[1].z - yard[0].z);
+    const limit = getClass('rail_yard').maxGrade * 0.9;
+    const wanted = beside ? (beside.pos.y - branchNode.pos.y) / span1 : 0;
+    const grade = Math.max(-limit, Math.min(limit, wanted));
+    let along = 0;
+    const yardProfile: Waypoint[] = yard.map((p, i) => {
+      if (i > 0) along += Math.hypot(p.x - yard[i - 1].x, p.z - yard[i - 1].z);
+      return { ...p, y: branchNode.pos.y + grade * along };
+    });
+    draw(network, field, 'rail_yard', yardProfile);
   }
 
   // 線路を跨ぐ道路。桁下を確保しているので立体交差になる。
   // 側線の終端 (z = branchNode.z + 180 ≒ 245) から離しておく。9 m の
   // 盛土の裾がかかると、側線の道床が盛土に埋まる。
-  const overpassZ = 270;
+  const overpassZ = origin.z + 270;
   const railUnder = network.findSegmentNear(new Vector3(railX, 0, overpassZ), 30);
   const overpassY = (railUnder ? railUnder.pos.y : railY) + 9;
   draw(
@@ -211,7 +233,7 @@ export function buildDemoNetwork(network: Network, field: Heightfield): void {
 
   // 幹線道路から分かれる生活道路。4 叉路の交差点と信号ができる。
   // 踏切から十分離れた、地面に近い所を選ぶ。
-  const junction = findAtGradePoint(network, field, roadZ, [-330, 330], {
+  const junction = findAtGradePoint(network, field, roadZ, [origin.x - 330, origin.x + 330], {
     x: railX,
     radius: 140,
   });
@@ -258,11 +280,12 @@ export function buildInterchangeDemo(
 
 /** 本線と側道が通る十字の範囲で、いちばん起伏の小さい場所と向きを選ぶ。 */
 function flattestSpot(field: Heightfield): { center: { x: number; z: number }; angle: number } {
-  let best = { center: { x: 0, z: 0 }, angle: 0 };
+  const site = demoSite(field);
+  let best = { center: site, angle: 0 };
   let bestRange = Infinity;
   for (const angle of [0, Math.PI / 2]) {
-    for (let x = -120; x <= 120; x += 60) {
-      for (let z = -120; z <= 120; z += 60) {
+    for (let x = site.x - 120; x <= site.x + 120; x += 60) {
+      for (let z = site.z - 120; z <= site.z + 120; z += 60) {
         const range = crossRange(field, x, z, angle);
         if (range < bestRange) {
           bestRange = range;
@@ -294,4 +317,133 @@ function crossRange(field: Heightfield, x: number, z: number, angle: number): nu
     }
   }
   return hi - lo;
+}
+
+/**
+ * その区間で、本線の勾配がいちばん緩いノードを選ぶ。
+ *
+ * 側線は分かれてからしばらく本線のすぐ脇を走る。本線が勾配の途中だと、
+ * 地形に沿う側線と縦断が分かれて、側線の道床が本線の軌道面より上に出る。
+ */
+function flattestNodeAlong(
+  network: Network,
+  x: number,
+  z0: number,
+  z1: number,
+  avoidZ: number,
+): ReturnType<Network['findNodeNear']> {
+  let best: ReturnType<Network['findNodeNear']> = null;
+  let bestGrade = Infinity;
+  for (let z = z0; z <= z1; z += 20) {
+    if (Math.abs(z - avoidZ) < 130) continue;
+    const node = network.findNodeNear(new Vector3(x, 0, z), 30);
+    if (!node) continue;
+    const hit = network.findSegmentNear(node.pos, 6);
+    const grade = hit ? Math.abs(network.alignmentOf(hit.segment).vertical.gradeAt(hit.s)) : 1;
+    if (grade < bestGrade) {
+      bestGrade = grade;
+      best = node;
+    }
+  }
+  return best;
+}
+
+/** 見本の道路と線路が伸びる範囲 [m]。マップの端からこれだけ内側を探す。 */
+const DEMO_REACH = 700;
+
+/** 陸と見なす高さ [m]。海面ぎりぎりの砂浜には敷かない。 */
+const DRY_Y = 1.5;
+
+/**
+ * 見本のネットワークを置く場所を選ぶ。
+ *
+ * 地形は生成のたびに変わるので、原点が海の底ということもある。見本は
+ * 「交差点・踏切・分岐器・橋・トンネルが一通り出る」ことを見せるものなので、
+ * それが成り立つ場所を地形から探す。
+ */
+export function demoSite(field: Heightfield): { x: number; z: number } {
+  const margin = DEMO_REACH + field.cell * 2;
+  const lo = field.worldMin + margin;
+  const hi = field.worldMax - margin;
+  const center = { x: 0, z: 0 };
+  if (hi <= lo) return center;
+  const step = Math.max(120, field.cell * 16);
+  let best = center;
+  let bestScore = -Infinity;
+  for (let z = lo; z <= hi; z += step) {
+    for (let x = lo; x <= hi; x += step) {
+      const score = siteScore(field, x, z);
+      if (score > bestScore) {
+        bestScore = score;
+        best = { x, z };
+      }
+    }
+  }
+  return best;
+}
+
+/**
+ * 見本の場所の点数。
+ *
+ * 「起伏がある」だけでは橋にもトンネルにもならない。線形は規格の勾配までしか
+ * 折れないので、**その勾配で追いつけない所**が谷なら橋、丘ならトンネルになる。
+ * 中心から外へ勾配を制限しながら地形を追う縦断を引いて、そこから地形が
+ * どれだけ離れるかで見る。起伏が大きすぎるのも困る (切土・盛土で路面が地面から
+ * 離れ、踏切と交差点を置ける「地面と同じ高さの所」が無くなる) ので、
+ * 足りない分は強く、余る分は弱く引く。
+ */
+function siteScore(field: Heightfield, x: number, z: number): number {
+  const roadZ = z - 40;
+  const railX = x - 220;
+  const trunk = corridorGap(field, x, roadZ, 1, 0, 430, 0.06);
+  if (!trunk) return -Infinity;
+  const rail = corridorGap(field, railX, z, 0, 1, 320, 0.03);
+  if (!rail) return -Infinity;
+  /** 幅から外れた分。足りなくても余っても引く。 */
+  const miss = (value: number, min: number, max: number): number =>
+    value < min ? min - value : value > max ? value - max : 0;
+  return -(
+    // 道路が渡る谷。橋 1 つぶん (BRIDGE_THRESHOLD 8 m) は要るが、
+    // 40 m の谷を渡らせると見本が延々と高架になる。
+    miss(trunk.below, 10, 22) +
+    // 線路が抜ける丘。TUNNEL_THRESHOLD (12 m) を確実に超える所。
+    miss(rail.above, 14, 28) * 1.5 +
+    // 逆向きの起伏は少ないほどよい。地面と同じ高さの所が残らないと、
+    // 踏切も交差点も置けない。
+    miss(trunk.above, 0, 14) +
+    miss(rail.below, 0, 10) * 1.5
+  );
+}
+
+/**
+ * 中心から両側へ勾配を制限して地形を追い、地形が縦断からどれだけ離れるかを
+ * 返す。`above` は追いつけない丘 (トンネル)、`below` は谷 (橋)。
+ * 通る範囲に水があれば null。
+ */
+function corridorGap(
+  field: Heightfield,
+  x: number,
+  z: number,
+  ux: number,
+  uz: number,
+  half: number,
+  grade: number,
+): { above: number; below: number } | null {
+  const step = 25;
+  const start = field.baseHeightAt(x, z);
+  if (start < DRY_Y) return null;
+  let above = 0;
+  let below = 0;
+  for (const side of [1, -1]) {
+    let profile = start;
+    for (let t = step; t <= half; t += step) {
+      const y = field.baseHeightAt(x + ux * t * side, z + uz * t * side);
+      if (y < DRY_Y) return null;
+      const reach = grade * step;
+      profile = Math.min(profile + reach, Math.max(profile - reach, y));
+      if (y - profile > above) above = y - profile;
+      if (profile - y > below) below = profile - y;
+    }
+  }
+  return { above, below };
 }
