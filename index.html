@@ -47,7 +47,7 @@
       .panel {
         position: absolute;
         top: 12px;
-        width: 236px;
+        width: 248px;
         max-height: calc(100% - 24px);
         overflow-y: auto;
         padding: 12px 14px 16px;
@@ -60,6 +60,8 @@
 
       .panel-left {
         left: 12px;
+        /* 左下の操作の一覧に重ならない高さで止める。 */
+        max-height: calc(100% - 68px);
       }
 
       .panel-right {
@@ -87,6 +89,81 @@
         flex-wrap: wrap;
       }
 
+      /* ツールの並び。3 列に揃えて、押す所の大きさを一定にする。 */
+      .row-tools {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 6px;
+      }
+
+      .row-tools button.chip {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 1px;
+        padding: 7px 4px;
+      }
+
+      .row-tools button.chip small {
+        color: var(--muted);
+        font-size: 10px;
+        letter-spacing: 0.06em;
+      }
+
+      .row-tools button.chip.active small {
+        color: var(--text);
+      }
+
+      /* ツールごとの設定のまとまり。選んだツールのものだけが出る。 */
+      .group {
+        margin-top: 13px;
+      }
+
+      .group[hidden] {
+        display: none;
+      }
+
+      /*
+       * ツールに依らない設定 (表示・視点・マップ) の引き出し。
+       * 畳んでおくと、いつも見えているのは「ツール + そのツールの設定」だけになる。
+       */
+      details.drawer {
+        margin-top: 12px;
+        border-top: 1px solid var(--border);
+      }
+
+      details.drawer > summary {
+        list-style: none;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 8px 0 6px;
+        font-size: 11px;
+        font-weight: 600;
+        letter-spacing: 0.08em;
+        color: var(--muted);
+        text-transform: uppercase;
+        cursor: pointer;
+      }
+
+      details.drawer > summary::-webkit-details-marker {
+        display: none;
+      }
+
+      details.drawer > summary::before {
+        content: '▸';
+        font-size: 10px;
+        transition: rotate 0.12s ease;
+      }
+
+      details.drawer[open] > summary::before {
+        rotate: 90deg;
+      }
+
+      details.drawer > summary:hover {
+        color: var(--text);
+      }
+
       button.chip {
         flex: 1 1 auto;
         min-width: 0;
@@ -109,17 +186,41 @@
         border-color: var(--accent);
       }
 
+      /* 一覧に並べるチップ。名前と規格を 1 行に収めて縦を詰める。 */
       button.chip.wide {
-        display: block;
+        display: flex;
         width: 100%;
+        gap: 4px 8px;
+        /* 名前が長い種別だけ規格が下の行に落ちる。語の途中では折らない。 */
+        flex-wrap: wrap;
+        align-items: baseline;
+        justify-content: space-between;
         text-align: left;
-        margin-bottom: 5px;
+        margin-bottom: 4px;
+      }
+
+      button.chip.wide > span {
+        white-space: nowrap;
       }
 
       button.chip.wide small {
-        display: block;
+        flex: 0 0 auto;
+        margin-left: auto;
         color: var(--muted);
-        font-size: 11px;
+        font-size: 10px;
+        white-space: nowrap;
+        font-variant-numeric: tabular-nums;
+      }
+
+      /* 種別の並びの中の小見出し (道路 / 線路)。 */
+      .subhead {
+        margin: 9px 0 4px;
+        font-size: 10px;
+        letter-spacing: 0.06em;
+        color: var(--muted);
+      }
+
+      .subhead:first-child {
         margin-top: 2px;
       }
 
@@ -365,17 +466,53 @@
         color: #f0776b;
       }
 
+      /* 操作の一覧。畳めるようにして、要らないときは画面を空ける。 */
       .help {
         position: absolute;
         left: 12px;
         bottom: 12px;
-        padding: 9px 12px;
+        max-width: 460px;
+        padding: 7px 12px;
         background: var(--panel);
         border: 1px solid var(--border);
         border-radius: 10px;
         color: var(--muted);
         line-height: 1.6;
         pointer-events: auto;
+      }
+
+      .help > summary {
+        list-style: none;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 11px;
+        font-weight: 600;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        cursor: pointer;
+      }
+
+      .help > summary::-webkit-details-marker {
+        display: none;
+      }
+
+      .help > summary::before {
+        content: '▸';
+        font-size: 10px;
+        transition: rotate 0.12s ease;
+      }
+
+      .help[open] > summary::before {
+        rotate: 90deg;
+      }
+
+      .help > summary:hover {
+        color: var(--text);
+      }
+
+      .help-body {
+        margin-top: 6px;
       }
 
       .underground-badge {

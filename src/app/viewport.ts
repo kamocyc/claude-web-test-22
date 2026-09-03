@@ -29,6 +29,37 @@ import { VIEW_DISTANCE } from '../core/units';
 const RIDE_NEAR = 0.4;
 
 /**
+ * 注視点が地面へ追いつく時定数 [s]。
+ *
+ * 平行移動しても注視点の高さがそのままだと、山から平野へ動いたときに
+ * 注視点だけが空中に取り残される。そうなると寄っても実際には地面から
+ * 遠いままで、距離に比例する平行移動が「見えている範囲のわりに遅い」
+ * 動きになる。崖を越えても飛ばないよう、少しずつ追いつかせる。
+ */
+const GROUND_TAU = 0.22;
+
+/** 注視点の高さの差がこれ以下なら、その場で合わせる [m]。 */
+const GROUND_SNAP = 0.05;
+
+/**
+ * カメラを地面から浮かせておく高さ [m]。
+ *
+ * 寄れる限界を近くしたので、伏せた角度では地面にめり込む。めり込むと
+ * 何も見えないので、視点の側だけ持ち上げる (注視点は動かさない)。
+ */
+const EYE_CLEARANCE = 2.5;
+
+/**
+ * 近クリップ面 [m]。注視点までの距離に対する比と、その上下限。
+ *
+ * 寄ったときは小さく (足元が切れない)、引いたときは大きく (遠くの
+ * 奥行きの精度が上がる) する。
+ */
+const NEAR_RATIO = 0.03;
+const NEAR_MIN = 0.5;
+const NEAR_MAX = 3;
+
+/**
  * 3D 表示まわり。レンダラ・カメラ・光源・空と、地形へのレイキャストを持つ。
  */
 export class Viewport {
@@ -45,6 +76,10 @@ export class Viewport {
   private savedView: { position: Vector3; target: Vector3; near: number } | null = null;
   /** 進行中の注視点移動 (`panTo`)。 */
   private flight: { from: Vector3; to: Vector3; start: number; duration: number } | null = null;
+  /** 地面の高さ。注視点を地面に追従させるのに使う。 */
+  private groundAt: ((x: number, z: number) => number) | null = null;
+  /** 前のフレームの時刻 [ms]。追従の時定数に使う。 */
+  private lastFrame = performance.now();
 
   constructor(readonly canvas: HTMLCanvasElement) {
     this.renderer = new WebGLRenderer({ canvas, antialias: true });
@@ -63,7 +98,9 @@ export class Viewport {
     this.controls = new MapControls(this.camera, canvas);
     this.controls.enableDamping = true;
     this.controls.dampingFactor = 0.12;
-    this.controls.minDistance = 20;
+    // 建物や車両を間近で見られるところまで寄せる。近クリップ面は
+    // 距離に合わせて動かすので、寄っても足元が切れない。
+    this.controls.minDistance = 4;
     // 引ける上限は見通す距離まで。マップに比例させると、広いマップでは
     // 何も見えない高さまで引けてしまう。
     this.controls.maxDistance = VIEW_DISTANCE * 0.75;
@@ -93,6 +130,51 @@ export class Viewport {
 
     window.addEventListener('resize', () => this.resize());
     this.resize();
+  }
+
+  /**
+   * 地面の高さを教える。注視点をここに追従させる。
+   *
+   * 追従しないと、平行移動で地形の高さが変わったぶんだけ注視点が地面から
+   * 離れ、`viewDistance` が「見えている高さ」と食い違う。寄せる操作も
+   * 平行移動の速さも距離を基準にしているので、そのずれがそのまま
+   * 操作感の狂いになる。
+   */
+  setGround(sample: (x: number, z: number) => number): void {
+    this.groundAt = sample;
+    const target = this.controls.target;
+    const dy = sample(target.x, target.z) - target.y;
+    target.y += dy;
+    this.camera.position.y += dy;
+  }
+
+  /** 注視点を地面へ寄せる。カメラも同じだけ動かすので、向きも距離も変わらない。 */
+  private followGround(dt: number): void {
+    const sample = this.groundAt;
+    if (!sample) return;
+    const target = this.controls.target;
+    const gap = sample(target.x, target.z) - target.y;
+    if (gap === 0) return;
+    const dy = Math.abs(gap) <= GROUND_SNAP ? gap : gap * (1 - Math.exp(-dt / GROUND_TAU));
+    target.y += dy;
+    this.camera.position.y += dy;
+  }
+
+  /** カメラが地面にめり込まないように持ち上げる。 */
+  private liftAboveGround(): void {
+    const sample = this.groundAt;
+    if (!sample) return;
+    const floor = sample(this.camera.position.x, this.camera.position.z) + EYE_CLEARANCE;
+    if (this.camera.position.y < floor) this.camera.position.y = floor;
+  }
+
+  /** 近クリップ面を注視点までの距離に合わせる。 */
+  private updateNear(): void {
+    const near = Math.min(NEAR_MAX, Math.max(NEAR_MIN, this.viewDistance * NEAR_RATIO));
+    // 毎フレーム行列を作り直さない。見た目に出ない差は無視する。
+    if (Math.abs(near - this.camera.near) < this.camera.near * 0.05) return;
+    this.camera.near = near;
+    this.camera.updateProjectionMatrix();
   }
 
   resize(): void {
@@ -221,10 +303,18 @@ export class Viewport {
   }
 
   render(): void {
+    const now = performance.now();
+    // 描画が詰まったフレームでも追従が止まらないように、上限は広く取る。
+    // 動くのは高さだけなので、まとめて詰めても視点は横に飛ばない。
+    const dt = Math.min(0.5, (now - this.lastFrame) / 1000);
+    this.lastFrame = now;
     // 一人称視点の間は、カメラを外から置いている。
     if (this.controls.enabled) {
       this.updateFlight();
+      this.followGround(dt);
       this.controls.update();
+      this.liftAboveGround();
+      this.updateNear();
     }
     // 空は視点に付いて回る。置いたままにすると、引いたときにドームの縁が
     // 空の中に見えてしまう。

@@ -70,6 +70,8 @@ interface ToggleSpec {
  */
 export class Ui {
   private readonly modeButtons = new Map<ToolMode, HTMLButtonElement>();
+  /** ツールごとの設定のまとまり。選んだツールのものだけを出す。 */
+  private readonly groups: { node: HTMLElement; modes: ToolMode[] }[] = [];
   private readonly classButtons = new Map<string, HTMLButtonElement>();
   private readonly parallelButtons = new Map<boolean, HTMLButtonElement>();
   private readonly zoneButtons = new Map<ZoneType | null, HTMLButtonElement>();
@@ -106,8 +108,10 @@ export class Ui {
   ) {
     const left = el('div', 'panel panel-left');
 
+    // ツールの並び。ここだけが常に出ていて、下の設定は選んだツールのものに
+    // 入れ替わる。全部を一度に並べると、いま効く設定がどれか分からない。
     left.append(sectionTitle('ツール'));
-    const modes = el('div', 'row');
+    const modes = el('div', 'row row-tools');
     for (const [mode, label, hint] of [
       ['build', '敷設', 'B'],
       ['station', '駅', 'T'],
@@ -117,14 +121,74 @@ export class Ui {
       ['inspect', '確認', 'V'],
     ] as [ToolMode, string, string][]) {
       const button = el('button', 'chip') as HTMLButtonElement;
-      button.textContent = `${label} (${hint})`;
+      button.innerHTML = `<span>${label}</span><small>${hint}</small>`;
       button.addEventListener('click', () => callbacks.onMode(mode));
       this.modeButtons.set(mode, button);
       modes.append(button);
     }
     left.append(modes);
 
-    left.append(sectionTitle('駅の設定'));
+    /** ツールごとの設定のまとまり。`setMode` で出し入れする。 */
+    const group = (title: string, modes: ToolMode[]): HTMLElement => {
+      const node = el('div', 'group');
+      node.append(sectionTitle(title));
+      this.groups.push({ node, modes });
+      left.append(node);
+      return node;
+    };
+
+    // ---- 敷設
+    const classGroup = group('種別', ['build']);
+    let lastKind = '';
+    for (const cls of NETWORK_CLASSES) {
+      // 道路と線路の切れ目に小見出しを挟む。並びの意味が一目で分かる。
+      if (cls.kind !== lastKind) {
+        lastKind = cls.kind;
+        const head = el('div', 'subhead');
+        head.textContent = cls.kind === 'rail' ? '線路' : '道路';
+        classGroup.append(head);
+      }
+      const button = el('button', 'chip wide') as HTMLButtonElement;
+      button.innerHTML = `<span>${cls.label}</span><small>R≧${cls.minRadius} / ≦${(
+        cls.maxGrade * 100
+      ).toFixed(1)}%</small>`;
+      button.addEventListener('click', () => callbacks.onClass(cls.id));
+      this.classButtons.set(cls.id, button);
+      classGroup.append(button);
+    }
+
+    // 高さは駅にも効く (高架駅・地下駅)。
+    const elevationGroup = group('高さ', ['build', 'station']);
+    const elevationRow = el('div', 'row');
+    elevationRow.append(
+      button('−', () => callbacks.onElevation(-1)),
+      (this.elevationLabel = el('span', 'elevation')),
+      button('＋', () => callbacks.onElevation(1)),
+    );
+    elevationGroup.append(elevationRow, hint('PageUp / PageDown でも変更できます'));
+
+    const parallelGroup = group('平行スナップ', ['build']);
+    const parallelRow = el('div', 'row');
+    for (const [on, label] of [
+      [true, 'あり'],
+      [false, 'なし'],
+    ] as [boolean, string][]) {
+      const button = el('button', 'chip') as HTMLButtonElement;
+      button.textContent = label;
+      button.addEventListener('click', () => {
+        callbacks.onParallelSnap(on);
+        this.setParallelSnap(on);
+      });
+      this.parallelButtons.set(on, button);
+      parallelRow.append(button);
+    }
+    parallelGroup.append(
+      parallelRow,
+      hint('既存の線路・道路の隣から引くと、その線形に平行してスナップします (Ctrl で一時解除)'),
+    );
+
+    // ---- 駅
+    const stationGroup = group('駅の設定', ['station']);
     this.stationNameInput = document.createElement('input');
     this.stationNameInput.className = 'text-input';
     this.stationNameInput.value = '駅 1';
@@ -133,7 +197,7 @@ export class Ui {
     this.stationNameInput.addEventListener('input', () =>
       callbacks.onStationSettings({ name: this.stationNameInput.value }),
     );
-    left.append(this.stationNameInput);
+    stationGroup.append(this.stationNameInput);
 
     const stationCounts = el('div', 'row');
     this.stationTrackSelect = select(
@@ -153,7 +217,6 @@ export class Ui {
     );
     this.refreshPlatformOptions(2);
     stationCounts.append(this.stationTrackSelect, this.stationPlatformSelect);
-    left.append(stationCounts);
 
     const stationLengthRow = el('div', 'row');
     this.stationLengthSelect = select(
@@ -161,14 +224,21 @@ export class Ui {
       '120',
       (value) => callbacks.onStationSettings({ length: Number(value) as (typeof STATION_LENGTHS)[number] }),
     );
-    const rotateLeft = button('↺ (N)', () => callbacks.onStationRotate(-1));
-    const rotateRight = button('↻ (M)', () => callbacks.onStationRotate(1));
     this.stationHeadingLabel = el('span', 'elevation');
-    stationLengthRow.append(this.stationLengthSelect, rotateLeft, rotateRight, this.stationHeadingLabel);
-    left.append(stationLengthRow);
-    left.append(hint('駅長を選び、N / M で回転して空き地をクリックします'));
+    stationLengthRow.append(
+      this.stationLengthSelect,
+      button('↺ (N)', () => callbacks.onStationRotate(-1)),
+      button('↻ (M)', () => callbacks.onStationRotate(1)),
+      this.stationHeadingLabel,
+    );
+    stationGroup.append(
+      stationCounts,
+      stationLengthRow,
+      hint('駅長を選び、N / M で回転して空き地をクリックします'),
+    );
 
-    left.append(sectionTitle('区画の用途'));
+    // ---- 区画
+    const zoneGroup = group('区画の用途', ['zone']);
     const zoneRow = el('div', 'row');
     for (const [zone, label] of [
       ...ZONE_TYPES.map((zone) => [zone, ZONE_LABELS[zone]] as [ZoneType | null, string]),
@@ -184,15 +254,15 @@ export class Ui {
       this.zoneButtons.set(zone, button);
       zoneRow.append(button);
     }
-    left.append(zoneRow);
-    left.append(
+    zoneGroup.append(
+      zoneRow,
       hint('道路沿いのマス目を塗ると建物が建ちます。広く塗るほどマスがまとまって大きな建物になります'),
     );
 
-    left.append(sectionTitle('路線'));
+    // ---- 路線
+    const lineGroup = group('路線', ['line']);
     const lineRow = el('div', 'row');
     lineRow.append(button('＋ 新しい路線', callbacks.onLineNew));
-    left.append(lineRow);
     this.lineBody = el('div', 'line-list');
     this.lineBody.addEventListener('click', (event) => {
       const target = event.target as HTMLElement;
@@ -202,52 +272,33 @@ export class Ui {
       if (target.closest('[data-remove]')) callbacks.onLineRemove(id);
       else callbacks.onLineSelect(id);
     });
-    left.append(this.lineBody);
-    left.append(
+    lineGroup.append(
+      lineRow,
+      this.lineBody,
       hint('駅のホームを順にクリックすると路線になり、列車がその経路を走ります (Esc で区切り)'),
     );
 
-    left.append(sectionTitle('種別'));
-    for (const cls of NETWORK_CLASSES) {
-      const button = el('button', 'chip wide') as HTMLButtonElement;
-      button.innerHTML = `<span>${cls.label}</span><small>R≧${cls.minRadius}m / 勾配≦${(
-        cls.maxGrade * 100
-      ).toFixed(1)}%</small>`;
-      button.addEventListener('click', () => callbacks.onClass(cls.id));
-      this.classButtons.set(cls.id, button);
-      left.append(button);
-    }
-
-    left.append(sectionTitle('高さ'));
-    const elevationRow = el('div', 'row');
-    const down = button('−', () => callbacks.onElevation(-1));
-    const up = button('＋', () => callbacks.onElevation(1));
-    this.elevationLabel = el('span', 'elevation');
-    elevationRow.append(down, this.elevationLabel, up);
-    left.append(elevationRow);
-    left.append(hint('PageUp / PageDown でも変更できます'));
-
-    left.append(sectionTitle('平行スナップ'));
-    const parallelRow = el('div', 'row');
-    for (const [on, label] of [
-      [true, 'あり'],
-      [false, 'なし'],
-    ] as [boolean, string][]) {
-      const button = el('button', 'chip') as HTMLButtonElement;
-      button.textContent = label;
-      button.addEventListener('click', () => {
-        callbacks.onParallelSnap(on);
-        this.setParallelSnap(on);
-      });
-      this.parallelButtons.set(on, button);
-      parallelRow.append(button);
-    }
-    left.append(parallelRow);
-    left.append(
-      hint('既存の線路・道路の隣から引くと、その線形に平行してスナップします (Ctrl で一時解除)'),
+    // ---- 撤去・確認 (設定は無い。何が起きるかだけ言う)
+    group('撤去', ['bulldoze']).append(
+      hint('線形・駅・区画をクリックで撤去します。区画は塗りだけが消え、道路は残ります'),
+    );
+    group('確認', ['inspect']).append(
+      hint('線形をクリックすると、その区間の曲率と勾配を右のグラフに出します'),
     );
 
-    left.append(sectionTitle('表示'));
+    // ---- ここから下はツールに依らない設定。折りたたんでおく。
+    const drawer = (title: string, open = false): HTMLElement => {
+      const node = document.createElement('details');
+      node.className = 'drawer';
+      node.open = open;
+      const summary = document.createElement('summary');
+      summary.textContent = title;
+      node.append(summary);
+      left.append(node);
+      return node;
+    };
+
+    const viewDrawer = drawer('表示');
     const toggles: ToggleSpec[] = [
       {
         id: 'diag',
@@ -290,22 +341,22 @@ export class Ui {
     for (const toggle of toggles) {
       const box = checkbox(toggle.label, toggle.initial, toggle.apply);
       inputs.set(toggle.id, box.input);
-      left.append(box.node);
+      viewDrawer.append(box.node);
       toggle.apply(toggle.initial);
     }
     this.vehiclesToggle = inputs.get('vehicles')!;
     this.undergroundToggle = inputs.get('underground')!;
 
-    left.append(sectionTitle('視点'));
+    const rideDrawer = drawer('視点');
     const rideRow = el('div', 'row');
     this.rideButton = button('乗車 (F)', callbacks.onRide);
     rideRow.append(this.rideButton, button('次の車両 (N)', callbacks.onRideNext));
-    left.append(rideRow);
-    left.append(
+    rideDrawer.append(
+      rideRow,
       hint('乗る車両をクリックで選びます。運転台に乗ったら、ドラッグで見回し、Esc / F で降ります'),
     );
 
-    left.append(sectionTitle('マップ'));
+    const mapDrawer = drawer('マップ');
     const mapRow = el('div', 'row');
     mapRow.append(
       button('地形を再生成', callbacks.onRegenerate),
@@ -314,7 +365,7 @@ export class Ui {
       button('トランペット IC', () => callbacks.onInterchange('trumpet')),
       button('全消去', callbacks.onClear),
     );
-    left.append(mapRow);
+    mapDrawer.append(mapRow);
 
     const right = el('div', 'panel panel-right');
     right.append(sectionTitle('状態'));
@@ -331,8 +382,14 @@ export class Ui {
     this.warningBody = el('div', 'readout warnings');
     right.append(this.warningBody);
 
-    const help = el('div', 'help');
-    help.innerHTML = [
+    const help = document.createElement('details');
+    help.className = 'help';
+    const helpSummary = document.createElement('summary');
+    helpSummary.textContent = '操作';
+    help.append(helpSummary);
+    const helpBody = el('div', 'help-body');
+    help.append(helpBody);
+    helpBody.innerHTML = [
       '<b>左クリック</b> 始点 → もう一度で確定 (続けて連結)',
       '<b>右クリック / Esc</b> 中断',
       '<b>Shift</b> 直線・15° スナップ / <b>Ctrl</b> スナップ解除',
@@ -356,6 +413,8 @@ export class Ui {
     for (const [key, button] of this.modeButtons) {
       button.classList.toggle('active', key === mode);
     }
+    // 選んだツールの設定だけを出す。
+    for (const group of this.groups) group.node.hidden = !group.modes.includes(mode);
   }
 
   setClass(classId: string): void {

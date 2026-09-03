@@ -25,6 +25,9 @@ const viewport = new Viewport(canvas);
 const field = new Heightfield();
 let terrainSeed = DEFAULT_TERRAIN.seed;
 const terrain = generateTerrain(field, { ...DEFAULT_TERRAIN, seed: terrainSeed });
+// 注視点を地面に貼り付ける。寄せる操作も平行移動の速さも注視点までの
+// 距離で決まるので、注視点が地面から浮くとどちらも狂う。
+viewport.setGround((x, z) => field.heightAt(x, z));
 
 const terrainMesh = new TerrainMesh(field, createTerrainMaterial());
 viewport.scene.add(terrainMesh.group);
@@ -369,6 +372,13 @@ const heldPanKeys = new Set<string>();
  */
 const PAN_SPEED = 0.8;
 /**
+ * 1 秒あたりに動く距離の下限 [m/s]。
+ *
+ * 距離に比例させるだけだと、寄り切ったとき (4 m) は秒速 3 m しか出ず、
+ * 隣の街区まで動くのにも時間がかかる。画面の何倍か進める速さは残す。
+ */
+const PAN_MIN_SPEED = 7;
+/**
  * 1 フレームで進める時間の上限 [s]。
  *
  * 描画が詰まった直後の 1 フレームは dt が大きく、そのぶんを一度に動かすと
@@ -392,7 +402,8 @@ function updateKeyboardPan(dt: number): void {
   // 斜めが速くならないように正規化する。
   const length = Math.hypot(forward, right);
   if (length < 1e-6) return;
-  const step = (viewport.viewDistance * PAN_SPEED * Math.min(dt, PAN_MAX_STEP)) / length;
+  const speed = Math.max(PAN_MIN_SPEED, viewport.viewDistance * PAN_SPEED);
+  const step = (speed * Math.min(dt, PAN_MAX_STEP)) / length;
   viewport.panScreen(forward * step, right * step);
 }
 let pointerDownAt: { x: number; y: number; time: number } | null = null;
