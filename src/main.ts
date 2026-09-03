@@ -97,13 +97,16 @@ const ui = new Ui(uiRoot, {
     else startRide();
   },
   onRegenerate: () => {
-    terrainSeed = (terrainSeed * 1664525 + 1013904223) >>> 0;
-    const next = generateTerrain(field, { ...DEFAULT_TERRAIN, seed: terrainSeed });
-    waterView.build(next.water);
-    // 地形が変われば、見本を建てるのに向いた場所も変わる。
-    home = demoSite(field);
-    lookHome();
-    dirty = true;
+    // 数秒かかるので、覆いを 1 フレーム描いてから計算に入る。
+    withLoading(() => {
+      terrainSeed = (terrainSeed * 1664525 + 1013904223) >>> 0;
+      const next = generateTerrain(field, { ...DEFAULT_TERRAIN, seed: terrainSeed });
+      waterView.build(next.water);
+      // 地形が変われば、見本を建てるのに向いた場所も変わる。
+      home = demoSite(field);
+      lookHome();
+      dirty = true;
+    });
   },
   onDemo: () => {
     buildDemoNetwork(network, field, home);
@@ -124,6 +127,30 @@ const ui = new Ui(uiRoot, {
   },
   onFocus: (position) => focusOn(position),
 });
+
+/**
+ * 地形を作り直す間、覆いを出す。
+ *
+ * 生成は数秒かかり、その間ブラウザは止まる。覆いを出しただけでは描かれない
+ * ので、2 フレーム待って**実際に描かれてから**計算に入る。
+ */
+function withLoading(work: () => void): void {
+  const loading = document.querySelector<HTMLElement>('#loading');
+  if (!loading) {
+    work();
+    return;
+  }
+  loading.hidden = false;
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
+      try {
+        work();
+      } finally {
+        loading.hidden = true;
+      }
+    });
+  });
+}
 
 // ---------------------------------------------------------------- 警告から飛ぶ
 
@@ -526,6 +553,9 @@ function frame(): void {
   tool.update(ride.active || ride.aiming ? null : cursor, modifiers);
   ui.updateStatus(tool.status(), riding);
   viewport.render();
+  // 最初の 1 枚を描いたら、起動時の覆いを外す。
+  const loading = document.querySelector<HTMLElement>('#loading');
+  if (loading && !loading.hidden) loading.hidden = true;
   requestAnimationFrame(frame);
 }
 

@@ -16,11 +16,20 @@ import { channelHeight } from './river/carve';
 import type { RiverField } from './river/field';
 import type { RiverNetwork } from './river/network';
 
-const spline = (a: number, b: number, c: number, d: number, t: number): number => {
+/**
+ * Catmull-Rom の重み。
+ *
+ * 格子点ごとに多項式を解くと 650 万点 × 5 回になる。粗いセルの中の位置は
+ * 分割数ぶんしか種類が無いので、重みを先に作っておいて掛け合わせるだけにする。
+ */
+function catmullWeights(t: number, out: Float32Array, at: number): void {
   const t2 = t * t;
   const t3 = t2 * t;
-  return 0.5 * (2 * b + (-a + c) * t + (2 * a - 5 * b + 4 * c - d) * t2 + (-a + 3 * b - 3 * c + d) * t3);
-};
+  out[at] = 0.5 * (-t + 2 * t2 - t3);
+  out[at + 1] = 0.5 * (2 - 5 * t2 + 3 * t3);
+  out[at + 2] = 0.5 * (t + 4 * t2 - 3 * t3);
+  out[at + 3] = 0.5 * (-t2 + t3);
+}
 
 export interface UpsampleInput {
   grid: HydroGrid;
@@ -75,11 +84,13 @@ export function upsampleTerrain(field: Heightfield, input: UpsampleInput): void 
   // 格子点ごとの粗いセルと、その中の位置。X と Z で同じ並びなので 1 組でよい。
   const cellOf = new Int32Array(stride);
   const fracOf = new Float32Array(stride);
+  const weightOf = new Float32Array(stride * 4);
   for (let i = 0; i < stride; i++) {
     const g = clamp(grid.cellAt(field.worldX(i)), 0, n - 1);
     const c = Math.min(n - 2, Math.floor(g));
     cellOf[i] = c;
     fracOf[i] = g - c;
+    catmullWeights(g - c, weightOf, i * 4);
   }
 
   for (let iz = 0; iz < stride; iz++) {
@@ -92,6 +103,10 @@ export function upsampleTerrain(field: Heightfield, input: UpsampleInput): void 
     const r2 = (cz + 2) * pn;
     const r3 = (cz + 3) * pn;
     const waterRow = cz * n;
+    const wz0 = weightOf[iz * 4];
+    const wz1 = weightOf[iz * 4 + 1];
+    const wz2 = weightOf[iz * 4 + 2];
+    const wz3 = weightOf[iz * 4 + 3];
     for (let ix = 0; ix < stride; ix++) {
       const cx = cellOf[ix];
       const tx = fracOf[ix];
@@ -109,11 +124,17 @@ export function upsampleTerrain(field: Heightfield, input: UpsampleInput): void 
       // 探すので、ここだけ別の補間にすると汀線が水面板の下から動き、
       // 地面が水を突き抜ける。
       if (!nearWater[waterRow + cx]) {
-        const a = spline(padded[r0 + cx], padded[r0 + c1], padded[r0 + c1 + 1], padded[r0 + c1 + 2], tx);
-        const b = spline(padded[r1 + cx], h00, h10, padded[r1 + c1 + 2], tx);
-        const c = spline(padded[r2 + cx], h01, h11, padded[r2 + c1 + 2], tx);
-        const d = spline(padded[r3 + cx], padded[r3 + c1], padded[r3 + c1 + 1], padded[r3 + c1 + 2], tx);
-        const smooth = spline(a, b, c, d, tz);
+        const wx0 = weightOf[ix * 4];
+        const wx1 = weightOf[ix * 4 + 1];
+        const wx2 = weightOf[ix * 4 + 2];
+        const wx3 = weightOf[ix * 4 + 3];
+        const a =
+          wx0 * padded[r0 + cx] + wx1 * padded[r0 + c1] + wx2 * padded[r0 + c1 + 1] + wx3 * padded[r0 + c1 + 2];
+        const b = wx0 * padded[r1 + cx] + wx1 * h00 + wx2 * h10 + wx3 * padded[r1 + c1 + 2];
+        const c = wx0 * padded[r2 + cx] + wx1 * h01 + wx2 * h11 + wx3 * padded[r2 + c1 + 2];
+        const d =
+          wx0 * padded[r3 + cx] + wx1 * padded[r3 + c1] + wx2 * padded[r3 + c1 + 1] + wx3 * padded[r3 + c1 + 2];
+        const smooth = wz0 * a + wz1 * b + wz2 * c + wz3 * d;
         // 補間の行き過ぎで無い山や無い窪みを作らないよう、2x2 の範囲で挟む。
         const lo = h00 < h10 ? h00 : h10;
         const lo2 = h01 < h11 ? h01 : h11;

@@ -25,8 +25,14 @@ export const TERRAIN_CELL = 4;
 /** ハイトマップの格子数 (セル数)。頂点数はこれ + 1。 */
 export const TERRAIN_CELLS = MAP_SIZE / TERRAIN_CELL;
 
-/** 地形メッシュを分割するチャンクの一辺のセル数。 */
-export const TERRAIN_CHUNK_CELLS = 64;
+/**
+ * 地形メッシュを分割するチャンクの一辺のセル数。
+ *
+ * 4 m 格子では 512 m 角。20,480 m 四方をカメラのまわりだけ持つと、
+ * これで常駐 200 枚ほどになる。64 (256 m 角) にすると 1 枚あたりの
+ * 書き換えは軽くなるが、常駐が 800 枚を超えて描画呼び出しの方が重くなる。
+ */
+export const TERRAIN_CHUNK_CELLS = 128;
 
 /**
  * 地形を作る水文格子の 1 セルの辺長 [m]。
@@ -75,8 +81,10 @@ export const WATER_CLEARANCE = 0.5;
  *
  * マップの広さではなく**見える距離**の話なので、`MAP_SIZE` からは切り離す。
  * マップに比例させると、広いマップでは端まで引けてしまう。
+ * 20,480 m 四方に広げたぶん、地形を見渡せるところまでは伸ばしてある
+ * (遠くの地形は `terrainMesh` が間引くので、頂点数は距離の 2 乗では効かない)。
  */
-export const VIEW_DISTANCE = 2400;
+export const VIEW_DISTANCE = 3600;
 
 /** 線形をサンプリングする既定間隔 [m]。 */
 export const SAMPLE_SPACING = 2.0;
