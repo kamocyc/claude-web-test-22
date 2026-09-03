@@ -38,7 +38,14 @@ const TANGENT_BREAK_WARNING = MIN_SMOOTHED_DEFLECTION;
  * ことが起きていたら報せます。実物の設計で許す急変を目安にした値です。
  * 速度から決めるので、遅い側線では大きな曲率差まで許されます。
  */
-const CURVE_BREAK_ACCEL = 0.3;
+/**
+ * 継ぎ目で許す曲率の飛びを決める、横方向の加速度 [m/s²]。
+ *
+ * 半径 R の曲線を速度 V で通ると横加速度は `V²/R` なので、飛んでよい曲率は
+ * `この値 / V²`。駅の待避線を本線に繋ぐ喉 (`network/stationRetrofit.ts`) も、
+ * 飛びが出ない長さをここから逆算する。
+ */
+export const CURVE_BREAK_ACCEL = 0.3;
 
 
 

@@ -7,9 +7,12 @@ import {
   planStationLayout,
   straightStationPath,
   validateStationSpec,
+  type PlannedStationLayout,
   type Station,
   type StationId,
+  type StationLength,
   type StationSpec,
+  type StationTrack,
 } from './station';
 
 export type NodeId = number;
@@ -53,6 +56,14 @@ export interface NetSegment {
   gradeB: number;
   /** Station ownership for tracks generated as part of a station. */
   stationTrack?: { station: StationId; index: number };
+  /**
+   * 待避線を本線に繋ぐために駅が作った線形 (のど)。
+   *
+   * 構内線ではないので普通に分割でき、線路としても普通に働く。ただし駅の
+   * 持ち物なので、駅を撤去すれば一緒に消える。ID ではなく印で覚えるのは、
+   * あとから分割されても取りこぼさないため。
+   */
+  stationThroat?: StationId;
 }
 
 /** ノードから見た 1 本の接続枝。交差点の解析はこの形で行う。 */
@@ -125,6 +136,7 @@ export class Network {
     gradeA: number;
     gradeB: number;
     stationTrack?: { station: StationId; index: number };
+    stationThroat?: StationId;
   }): NetSegment {
     const seg: NetSegment = {
       id: this.nextSegmentId++,
@@ -136,6 +148,7 @@ export class Network {
       gradeA: params.gradeA,
       gradeB: params.gradeB,
       stationTrack: params.stationTrack,
+      stationThroat: params.stationThroat,
     };
     if (params.via && params.via.length > 0) seg.via = params.via.map((p) => p.clone());
     this.segments.set(seg.id, seg);
@@ -186,14 +199,21 @@ export class Network {
   removeSegment(id: SegmentId): void {
     const seg = this.segments.get(id);
     if (!seg) return;
-    if (seg.stationTrack) {
-      this.removeStation(seg.stationTrack.station);
+    // 構内線も、待避線を繋ぐのども駅の持ち物。どこを指しても駅ごと消える。
+    const owner = seg.stationTrack?.station ?? seg.stationThroat;
+    if (owner !== undefined) {
+      this.removeStation(owner);
       return;
     }
     this.removeSegmentOnly(id);
   }
 
-  private removeSegmentOnly(id: SegmentId): void {
+  /**
+   * 駅の連鎖削除を起こさずに 1 本だけ消す。
+   *
+   * 駅の付け替え (既設の線路を構内線にまとめる) でも使うので公開している。
+   */
+  removeSegmentOnly(id: SegmentId): void {
     const seg = this.segments.get(id);
     if (!seg) return;
     this.segments.delete(id);
@@ -289,7 +309,10 @@ export class Network {
     const classId = seg.classId;
     const a = seg.a;
     const b = seg.b;
-    this.removeSegment(id);
+    // のどは分割しても駅の持ち物のまま。印を引き継がないと、駅を消したときに
+    // 切れ端だけが本線から生えたまま残る。
+    const stationThroat = seg.stationThroat;
+    this.removeSegmentOnly(id);
     // removeSegment は孤立したノードを消すので、端点が生きているか確認する。
     const keepA = this.nodes.get(a) ?? this.restoreNode(a, first.horizontal.p0, first.vertical.y0);
     const keepB = this.nodes.get(b) ?? this.restoreNode(b, second.horizontal.p1, second.vertical.y1);
@@ -303,6 +326,7 @@ export class Network {
       via: first.horizontal.via,
       gradeA: first.vertical.m0,
       gradeB: first.vertical.m1,
+      stationThroat,
     });
     this.addSegment({
       classId,
@@ -313,6 +337,7 @@ export class Network {
       via: second.horizontal.via,
       gradeA: second.vertical.m0,
       gradeB: second.vertical.m1,
+      stationThroat,
     });
     return node;
   }
@@ -500,7 +525,6 @@ export class Network {
       maxOffset: layout.maxOffset,
       path: straightStationPath(spec),
       adopted: null,
-      approaches: [],
     };
     this.stations.set(id, station);
     this.touch();
@@ -517,13 +541,80 @@ export class Network {
     this.touch();
   }
 
+  /**
+   * 駅を撤去する。
+   *
+   * 既設の線路から取り込んだ番線は**普通の線路として残す**。もともとそこに
+   * あった線路を駅と一緒に消すと、路線に穴が空いてしまう。位置も制御点も
+   * 変えていないので、構内線の印を外すだけで元の線路に戻る。
+   */
   removeStation(id: StationId): void {
     const station = this.stations.get(id);
     if (!station) return;
     this.stations.delete(id);
-    for (const track of station.tracks) this.removeSegmentOnly(track.segment);
+    for (const seg of [...this.segments.values()]) {
+      if (seg.stationThroat === id) this.removeSegmentOnly(seg.id);
+    }
+    for (const track of station.tracks) {
+      if (track.index === station.adopted) {
+        const seg = this.segments.get(track.segment);
+        if (seg) delete seg.stationTrack;
+      } else {
+        this.removeSegmentOnly(track.segment);
+      }
+    }
     this.pruneOrphanNodes();
     this.touch();
+  }
+
+  /**
+   * 駅の番号を先に取る。
+   *
+   * 既設の線路を取り込む駅 (`network/stationRetrofit.ts`) は、構内線に印を
+   * 付けるのに駅の番号が先に要る。台帳に載せるのは `registerStation`。
+   */
+  allocateStationId(): StationId {
+    return this.nextStationId++;
+  }
+
+  /**
+   * 中心線と構内線が揃った駅を台帳に載せる。
+   *
+   * 空き地に置く駅 (`addStation`) と、既設の線路を取り込む駅の共通の出口。
+   * `center` と `heading` は中心線の中央から導く。
+   */
+  registerStation(params: {
+    id: StationId;
+    name: string;
+    path: Alignment;
+    length: StationLength;
+    trackCount: number;
+    platformCount: number;
+    elevated: boolean;
+    tracks: StationTrack[];
+    layout: PlannedStationLayout;
+    adopted: number | null;
+  }): Station {
+    const middle = params.path.sampleAt(params.path.length / 2);
+    const station: Station = {
+      id: params.id,
+      name: params.name.trim(),
+      center: middle.pos.clone(),
+      heading: Math.atan2(middle.forwardXZ.y, middle.forwardXZ.x),
+      length: params.length,
+      trackCount: params.trackCount,
+      platformCount: params.platformCount,
+      elevated: params.elevated,
+      tracks: params.tracks,
+      platforms: params.layout.platforms,
+      minOffset: params.layout.minOffset,
+      maxOffset: params.layout.maxOffset,
+      path: params.path,
+      adopted: params.adopted,
+    };
+    this.stations.set(station.id, station);
+    this.touch();
+    return station;
   }
 
   stationForSegment(id: SegmentId): Station | null {

@@ -75,8 +75,6 @@ export interface Station {
    * 駅と一緒に消してしまうと、路線に穴が空く。
    */
   adopted: number | null;
-  /** 待避線を本線に繋ぐために作った線形。駅と一緒に消す。 */
-  approaches: SegmentId[];
 }
 
 export interface PlannedStationLayout {

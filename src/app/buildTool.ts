@@ -47,6 +47,12 @@ import {
 } from '../network/station';
 import type { LineId, LineMap } from '../network/line';
 import { checkStationPlacement } from '../network/stationPlacement';
+import {
+  applyStationRetrofit,
+  isAdoptable,
+  planStationRetrofit,
+  type StationRetrofitPlan,
+} from '../network/stationRetrofit';
 import { ZONE_COLORS, ZONE_EMPTY_COLOR } from '../build/buildings';
 import type { ZoneMap, ZoneType } from '../network/zoning';
 import {
@@ -127,6 +133,13 @@ export interface ToolStatus {
   line: { id: LineId; name: string; stops: string[] } | null;
   /** 路線ツールで、カーソルの下にある駅 (無ければ null)。 */
   hoverStation: Station | null;
+  /**
+   * 既設の線路に駅を後付けしようとしている状態 (そうでなければ null)。
+   *
+   * `trackIndex` は既設の線路が何番線になるか、`reversed` は駅舎と待避線が
+   * 線路のどちら側に来るか。N / M で巡回する。
+   */
+  stationAdopt: { trackIndex: number; reversed: boolean } | null;
 }
 
 /** カーソルの行き先 (吸い付いた点と、その目印)。 */
@@ -174,6 +187,9 @@ const JUNCTION_SNAP = 15;
 /** カーソルが構造物 (橋の路面) に当たっているとみなす、地形との差 [m]。 */
 const ON_STRUCTURE = 2;
 const ANGLE_SNAP = 15 * DEG;
+
+/** 駅モードで「線路を指した」とみなす距離 [m]。 */
+const STATION_ADOPT_RADIUS = 10;
 
 /**
  * 道路・線路を敷設するツール。
@@ -234,6 +250,10 @@ export class BuildTool {
   private inspection: PointInspection | null = null;
   private selectedStationId: StationId | null = null;
   private stationCandidate: Station | null = null;
+  /** 既設の線路に後付けする計画 (空き地に置くときは null)。 */
+  private stationPlan: StationRetrofitPlan | null = null;
+  /** 後付けで、既設の線路をどの番線にするか・断面を左右どちらに開くか。 */
+  private stationAdopt = { trackIndex: 0, reversed: false };
   /** 路線ツールで駅を足している路線。 */
   private editingLineId: LineId | null = null;
   /** 路線ツールで、カーソルの下にある駅。 */
@@ -302,10 +322,31 @@ export class BuildTool {
       range.min,
       range.max,
     );
+    this.stationAdopt.trackIndex = clamp(
+      this.stationAdopt.trackIndex,
+      0,
+      this.stationSettings.trackCount - 1,
+    );
     this.updateStationPreview();
   }
 
+  /**
+   * N / M の割り当て。
+   *
+   * 空き地では駅の向きを 15° ずつ回す。既設の線路に後付けしているときは向きは
+   * 線路が決めるので、代わりに**既設の線路が何番線になるか**と**駅舎を線路の
+   * どちら側に置くか**を巡回する。
+   */
   rotateStation(steps: number): void {
+    if (this.stationPlan) {
+      const tracks = this.stationSettings.trackCount;
+      const total = tracks * 2;
+      const current = this.stationAdopt.trackIndex + (this.stationAdopt.reversed ? tracks : 0);
+      const next = (((current + steps) % total) + total) % total;
+      this.stationAdopt = { trackIndex: next % tracks, reversed: next >= tracks };
+      this.updateStationPreview();
+      return;
+    }
     this.stationSettings.heading += steps * ANGLE_SNAP;
     this.stationSettings.heading = Math.atan2(
       Math.sin(this.stationSettings.heading),
@@ -360,6 +401,7 @@ export class BuildTool {
     this.inspection = null;
     this.inspectProfile = null;
     this.stationCandidate = null;
+    this.stationPlan = null;
     this.selectedStationId = null;
     // 路線は「ここまで」で区切る。次にクリックしたら新しい路線を作る。
     this.editingLineId = null;
@@ -447,10 +489,14 @@ export class BuildTool {
   private updateStationPreview(): void {
     if (this.mode !== 'station' || !this.cursor) {
       this.stationCandidate = null;
+      this.stationPlan = null;
       this.elevationGuideView.update([]);
       if (this.mode === 'station') this.updatePreviewMesh();
       return;
     }
+    // 線路を指していれば、その線路を取り込む駅にする。
+    if (this.previewAdoption()) return;
+
     const y = this.field.heightAt(this.cursor.x, this.cursor.z) + Math.max(0, this.elevationOffset);
     const spec: StationSpec = {
       ...this.stationSettings,
@@ -468,7 +514,6 @@ export class BuildTool {
       maxOffset: layout.maxOffset,
       path: straightStationPath(spec),
       adopted: null,
-      approaches: [],
     };
     this.blockers = [
       ...(this.elevationOffset < 0 ? ['地下駅には対応していません'] : []),
@@ -482,6 +527,56 @@ export class BuildTool {
       this.elevationOffset > 0 && this.stationCandidate ? [this.stationCandidate.center] : [],
     );
     this.updatePreviewMesh();
+  }
+
+  /**
+   * カーソルが既設の線路の上なら、その線路を取り込む駅を立案する。
+   *
+   * 高さ設定は見ない (高架かどうかは線路が決める)。立案は毎フレーム行うが、
+   * ネットワークには一切触らない。
+   */
+  private previewAdoption(): boolean {
+    const cursor = this.cursor!;
+    const y = this.workingY(cursor);
+    const hit = this.network.findSegmentNear(cursor, STATION_ADOPT_RADIUS, {
+      y,
+      tolerance: SNAP_HEIGHT,
+    });
+    if (!hit || !isAdoptable(this.network, hit.segment)) {
+      this.stationPlan = null;
+      return false;
+    }
+
+    const result = planStationRetrofit(
+      this.network,
+      {
+        name: this.stationSettings.name,
+        length: this.stationSettings.length,
+        trackCount: this.stationSettings.trackCount,
+        platformCount: this.stationSettings.platformCount,
+        adopt: { segment: hit.segment, s: hit.s },
+        trackIndex: this.stationAdopt.trackIndex,
+        reversed: this.stationAdopt.reversed,
+      },
+      this.field,
+    );
+    this.stationPlan = result.plan;
+    this.stationCandidate = result.plan?.preview ?? null;
+    this.blockers = [
+      ...validateStationSpec({
+        ...this.stationSettings,
+        center: hit.pos.clone(),
+        elevated: false,
+      }),
+      ...result.blockers,
+    ];
+    this.blockedPlaces = result.places.map((place) => place.clone());
+    this.snapKind = 'segment';
+    this.preview = null;
+    this.showMarkers([this.segmentMarker(hit, this.network.classOf(this.network.getSegment(hit.segment)))]);
+    this.elevationGuideView.update([]);
+    this.updatePreviewMesh();
+    return true;
   }
 
   /**
@@ -1152,15 +1247,19 @@ export class BuildTool {
     }
     if (this.mode === 'station') {
       if (!this.stationCandidate || this.blockers.length > 0) return;
-      this.network.addStation({
-        name: this.stationCandidate.name,
-        center: this.stationCandidate.center,
-        heading: this.stationCandidate.heading,
-        length: this.stationCandidate.length,
-        trackCount: this.stationCandidate.trackCount,
-        platformCount: this.stationCandidate.platformCount,
-        elevated: this.stationCandidate.elevated,
-      });
+      if (this.stationPlan) {
+        applyStationRetrofit(this.network, this.stationPlan);
+      } else {
+        this.network.addStation({
+          name: this.stationCandidate.name,
+          center: this.stationCandidate.center,
+          heading: this.stationCandidate.heading,
+          length: this.stationCandidate.length,
+          trackCount: this.stationCandidate.trackCount,
+          platformCount: this.stationCandidate.platformCount,
+          elevated: this.stationCandidate.elevated,
+        });
+      }
       this.stationSettings.name = this.nextStationName();
       this.onChanged();
       this.updateStationPreview();
@@ -1410,6 +1509,7 @@ export class BuildTool {
       parallelTo: this.parallel?.segment ?? null,
       line: this.lineStatus(),
       hoverStation: this.mode === 'line' ? this.hoverStation : null,
+      stationAdopt: this.stationPlan ? { ...this.stationAdopt } : null,
     };
   }
 

@@ -3,7 +3,13 @@ import { Mesh, MeshBasicMaterial, Vector2, Vector3 } from 'three';
 import { BuildTool } from '../src/app/buildTool';
 import { solveJunctions } from '../src/network/junction';
 import { Network, type SegmentId } from '../src/network/network';
-import { planStationLayout, stationPlatformRange } from '../src/network/station';
+import {
+  planStationLayout,
+  stationLocal,
+  stationPlatformRange,
+  stationPointOn,
+} from '../src/network/station';
+import { applyStationRetrofit, planStationRetrofit } from '../src/network/stationRetrofit';
 import { WorldBuilder } from '../src/render/worldBuilder';
 import { buildLaneGraph } from '../src/sim/lanegraph';
 import { STATION_DWELL, Traffic } from '../src/sim/traffic';
@@ -237,5 +243,233 @@ describe('列車の駅停車', () => {
     expect(stoppedUntil! - stoppedFrom!).toBeGreaterThanOrEqual(STATION_DWELL - 0.15);
     expect(centred).toBe(true);
     expect(departed).toBe(true);
+  });
+});
+
+
+/** 直線の線路を `pieces` 本に分けて敷く。 */
+function rail(network: Network, from: Vector3, to: Vector3, pieces = 1): void {
+  let prev = network.addNode(from.clone());
+  for (let i = 1; i <= pieces; i++) {
+    const at = from.clone().lerp(to, i / pieces);
+    const node = network.addNode(at);
+    straight(network, prev, node);
+    prev = node;
+  }
+}
+
+/** 半径 `radius` の円弧の線路。中心角 `sweep` [rad] を `pieces` 本に分ける。 */
+function curvedRail(network: Network, radius: number, sweep: number, pieces = 6): void {
+  const at = (t: number): Vector3 =>
+    new Vector3(Math.sin(t) * radius, 0, Math.cos(t) * radius - radius);
+  let prev = network.addNode(at(-sweep / 2));
+  for (let i = 1; i <= pieces; i++) {
+    const t0 = -sweep / 2 + (sweep * (i - 1)) / pieces;
+    const t1 = -sweep / 2 + (sweep * i) / pieces;
+    const node = network.addNode(at(t1));
+    const a = new Vector2(prev.pos.x, prev.pos.z);
+    const b = new Vector2(node.pos.x, node.pos.z);
+    // 円弧に近づく制御点 (端の接線方向へ弦長の 1/3)。
+    const handle = a.distanceTo(b) / 3;
+    network.addSegment({
+      classId: 'rail_single',
+      a: prev.id,
+      b: node.id,
+      ctrlA: a.clone().add(new Vector2(Math.cos(t0), -Math.sin(t0)).multiplyScalar(handle)),
+      ctrlB: b.clone().sub(new Vector2(Math.cos(t1), -Math.sin(t1)).multiplyScalar(handle)),
+      gradeA: 0,
+      gradeB: 0,
+    });
+    prev = node;
+  }
+}
+
+/** 指した所に駅を後付けする。 */
+function retrofit(
+  network: Network,
+  at: Vector3,
+  settings: { length?: 80 | 120 | 160 | 200; trackCount?: number; platformCount?: number } = {},
+) {
+  const hit = network.findSegmentNear(at, 30);
+  if (!hit) throw new Error('線路が見つかりません');
+  return planStationRetrofit(
+    network,
+    {
+      name: '後付け駅',
+      length: settings.length ?? 120,
+      trackCount: settings.trackCount ?? 1,
+      platformCount: settings.platformCount ?? 1,
+      adopt: { segment: hit.segment, s: hit.s },
+      trackIndex: 0,
+      reversed: false,
+    },
+    flatField(),
+  );
+}
+
+describe('既設の線路への駅の後付け', () => {
+  it('線路を取り込んで構内線にし、撤去すると普通の線路に戻る', () => {
+    const network = new Network();
+    rail(network, new Vector3(-300, 0, 0), new Vector3(300, 0, 0));
+    const result = retrofit(network, new Vector3(0, 0, 0));
+    expect(result.blockers).toEqual([]);
+
+    const station = applyStationRetrofit(network, result.plan!);
+    expect(station.adopted).toBe(0);
+    // 元の 1 本が「手前・構内・先」の 3 本に分かれる。
+    expect(network.segments.size).toBe(3);
+    const host = network.getSegment(station.tracks[0].segment);
+    expect(host.stationTrack).toEqual({ station: station.id, index: 0 });
+    expect(network.alignmentOf(host.id).length).toBeCloseTo(120, 1);
+
+    // 撤去しても線路は残る (路線に穴を空けない)。
+    network.removeStation(station.id);
+    expect(network.stations.size).toBe(0);
+    expect(network.segments.size).toBe(3);
+    expect(network.getSegment(host.id).stationTrack).toBeUndefined();
+  });
+
+  it('複数の区間にまたがっても1本の構内線にまとまる', () => {
+    const network = new Network();
+    rail(network, new Vector3(-300, 0, 0), new Vector3(300, 0, 0), 8);
+    const result = retrofit(network, new Vector3(0, 0, 0), { length: 200 });
+    expect(result.blockers).toEqual([]);
+
+    const station = applyStationRetrofit(network, result.plan!);
+    const host = network.getSegment(station.tracks[0].segment);
+    // 継ぎ目をまたいだので連結ベジエになる。形は元の線路のまま。
+    expect(host.via?.length ?? 0).toBeGreaterThan(0);
+    expect(network.alignmentOf(host.id).length).toBeCloseTo(200, 0);
+    const alignment = network.alignmentOf(host.id);
+    for (let i = 0; i <= 10; i++) {
+      const p = alignment.sampleAt((alignment.length * i) / 10).pos;
+      expect(Math.abs(p.z)).toBeLessThan(0.05);
+    }
+  });
+
+  it('曲線の線路に置くと、ホームも曲線に沿う', () => {
+    const network = new Network();
+    curvedRail(network, 400, 1.2);
+    const result = retrofit(network, new Vector3(0, 0, 0));
+    expect(result.blockers).toEqual([]);
+    const station = applyStationRetrofit(network, result.plan!);
+
+    // 中心線が曲がっている。
+    expect(station.path.horizontal.extremeCurvature(48).minRadius).toBeLessThan(600);
+
+    // ホーム上の点は中心線から一定の横距にあり、直線には乗らない。
+    const platform = station.platforms[0];
+    const points = [-40, 0, 40].map((along) => stationPointOn(station, along, platform.offset));
+    for (const point of points) {
+      expect(stationLocal(station, point.x, point.z).across).toBeCloseTo(platform.offset, 1);
+    }
+    const chord = points[0].clone().lerp(points[2], 0.5);
+    expect(points[1].distanceTo(chord)).toBeGreaterThan(0.5);
+
+    // 曲線の駅でも組み立てが通る。
+    const field = flatField();
+    const world = new WorldBuilder(network, field, new TerrainMesh(field, new MeshBasicMaterial()));
+    const built = world.rebuild();
+    expect(built.warnings.filter((w) => w.severity === 'error')).toEqual([]);
+    expect(built.stats.stations).toBe(1);
+  });
+
+  it('待避線を足すと、駅の前後で本線に合流する', () => {
+    const network = new Network();
+    rail(network, new Vector3(-600, 0, 0), new Vector3(600, 0, 0));
+    const result = retrofit(network, new Vector3(0, 0, 0), { trackCount: 2, platformCount: 1 });
+    expect(result.blockers).toEqual([]);
+    expect(result.plan!.throats).toHaveLength(2);
+
+    const station = applyStationRetrofit(network, result.plan!);
+    expect(station.tracks).toHaveLength(2);
+    const throats = [...network.segments.values()].filter((s) => s.stationThroat === station.id);
+    expect(throats).toHaveLength(2);
+
+    // 分岐器ができ、ぜんぶひと繋がりのまま。
+    const field = flatField();
+    const world = new WorldBuilder(network, field, new TerrainMesh(field, new MeshBasicMaterial()));
+    const built = world.rebuild();
+    expect(built.stats.turnouts).toBe(2);
+    expect(built.stats.railNetworks).toBe(1);
+    expect(built.warnings.filter((w) => w.severity === 'error')).toEqual([]);
+
+    // 両方の番線にホームの停車位置がある。
+    const graph = laneGraphOf(network);
+    const stops = new Set(
+      graph.lanes.filter((lane) => lane.stationStop).map((lane) => lane.segment),
+    );
+    expect(stops.size).toBe(2);
+
+    // 撤去すると待避線と取り付きは消え、本線は残る。
+    network.removeStation(station.id);
+    expect([...network.segments.values()].every((s) => s.stationThroat === undefined)).toBe(true);
+    expect(network.stations.size).toBe(0);
+    const remaining = [...network.segments.values()];
+    expect(remaining.every((s) => s.stationTrack === undefined)).toBe(true);
+  });
+
+  it('分岐のある所や線路の端では置けない', () => {
+    const network = new Network();
+    rail(network, new Vector3(-300, 0, 0), new Vector3(300, 0, 0), 2);
+    // 中央のノードから支線を分ける。
+    const middle = network.findNodeNear(new Vector3(0, 0, 0), 1)!;
+    const branch = network.addNode(new Vector3(60, 0, 120));
+    straight(network, middle, branch);
+    const overBranch = retrofit(network, new Vector3(-40, 0, 0));
+    expect(overBranch.plan).toBeNull();
+    expect(overBranch.blockers.join()).toMatch(/分岐/);
+
+    const short = new Network();
+    rail(short, new Vector3(-30, 0, 0), new Vector3(30, 0, 0));
+    const tooLong = retrofit(short, new Vector3(0, 0, 0), { length: 120 });
+    expect(tooLong.plan).toBeNull();
+    expect(tooLong.blockers.join()).toMatch(/線路の端/);
+  });
+
+  it('曲線に対して敷地が広すぎると置けない', () => {
+    // 半径 20 m の曲線に 6 線 (敷地の半幅 33 m) を並べると、内側の縁が
+    // 自分と交わってしまう。
+    const network = new Network();
+    curvedRail(network, 20, 6, 24);
+    const result = retrofit(network, new Vector3(0, 0, 0), {
+      length: 80,
+      trackCount: 6,
+      platformCount: 4,
+    });
+    expect(result.blockers.join()).toMatch(/曲線/);
+  });
+});
+
+describe('駅ツールの後付け操作', () => {
+  it('線路を指すと後付けに切り替わり、N / M で取り込む番線が変わる', () => {
+    const field = flatField();
+    const network = new Network();
+    rail(network, new Vector3(-400, 0, 0), new Vector3(400, 0, 0));
+    const tool = new BuildTool(network, field, () => {});
+    tool.setMode('station');
+    tool.setStationSettings({ name: '取り込み', trackCount: 2, platformCount: 1, length: 120 });
+
+    // 空き地では今までどおり向きが回る。
+    tool.update(new Vector3(0, 0, 200), { straight: false, noSnap: false });
+    expect(tool.status().stationAdopt).toBeNull();
+    const heading = tool.status().station.heading;
+    tool.rotateStation(1);
+    expect(tool.status().station.heading).not.toBeCloseTo(heading);
+
+    // 線路の上では取り込みに切り替わり、N / M は番線を変える。
+    tool.update(new Vector3(0, 0, 0), { straight: false, noSnap: false });
+    expect(tool.status().stationAdopt).toEqual({ trackIndex: 0, reversed: false });
+    expect(tool.status().blockers).toEqual([]);
+    const turned = tool.status().station.heading;
+    tool.rotateStation(1);
+    expect(tool.status().stationAdopt).toEqual({ trackIndex: 1, reversed: false });
+    expect(tool.status().station.heading).toBeCloseTo(turned);
+
+    tool.click();
+    const station = [...network.stations.values()][0];
+    expect(station).toBeDefined();
+    expect(station.adopted).toBe(1);
+    expect(network.getSegment(station.tracks[1].segment).stationTrack).toBeDefined();
   });
 });

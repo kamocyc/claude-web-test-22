@@ -21,15 +21,24 @@ const VERTICAL_CLEARANCE = 8;
  */
 type Footprint = StationArea;
 
-/** その点が敷地の中なら局所座標を返す。外なら null。 */
+/**
+ * その点が敷地の中なら局所座標を返す。外なら null。
+ *
+ * `opening` は両端に開けておく隙間 [m]。既設の線路に置く駅では、駅の端に
+ * 本線が必ず接するので、そこを「重なっている」と数えては置けなくなる。
+ * `checkAlignmentAgainstStations` が構内線の端に線路を繋がせるために開けて
+ * いるのと同じ隙間。
+ */
 function localInside(
   shape: Footprint,
   x: number,
   z: number,
   margin = 0,
+  opening = 0,
 ): { along: number; across: number } | null {
   const local = stationLocal(shape, x, z);
-  if (Math.abs(local.along) > shape.length / 2 + margin) return null;
+  const half = opening > 0 ? shape.length / 2 - opening : shape.length / 2 + margin;
+  if (Math.abs(local.along) > half) return null;
   if (local.across < shape.minOffset - margin) return null;
   if (local.across > shape.maxOffset + margin) return null;
   return local;
@@ -60,6 +69,13 @@ export interface StationPlacementOptions {
    * 「敷地に線形が掛かっています」で必ず弾かれる。
    */
   ignore?: ReadonlySet<SegmentId>;
+  /**
+   * 敷地の両端に開けておく隙間 [m]。
+   *
+   * 既設の線路に置く駅では、駅の端で本線が必ず接する。ここを開けておかないと
+   * 「敷地が線路と重なっています」で必ず弾かれる。
+   */
+  opening?: number;
 }
 
 /** 駅を置けるか。置けない理由を並べて返す。 */
@@ -76,7 +92,7 @@ export function checkStationPlacement(
     const steps = Math.max(2, Math.ceil(alignment.length / 4));
     for (let i = 0; i <= steps; i++) {
       const p = alignment.sampleAt((alignment.length * i) / steps).pos;
-      const local = localInside(candidate, p.x, p.z, cls.halfWidth + 1);
+      const local = localInside(candidate, p.x, p.z, cls.halfWidth + 1, options.opening);
       if (local && Math.abs(p.y - deckY(candidate, local.along)) < VERTICAL_CLEARANCE) {
         return ['駅の敷地が既存の道路・線路と重なっています'];
       }

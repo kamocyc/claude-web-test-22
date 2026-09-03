@@ -179,7 +179,13 @@ export class Ui {
     this.stationHeadingLabel = el('span', 'elevation');
     stationLengthRow.append(this.stationLengthSelect, rotateLeft, rotateRight, this.stationHeadingLabel);
     left.append(stationLengthRow);
-    left.append(hint('駅長を選び、N / M で回転して空き地をクリックします'));
+    left.append(
+      hint(
+        '駅長を選び、空き地をクリックすると新しい駅を置きます。' +
+          '既にある線路を指すと、その線路を取り込んで駅にします (曲線でも置けます)。' +
+          'N / M は向き / 取り込む番線を変えます',
+      ),
+    );
 
     left.append(sectionTitle('区画の用途'));
     const zoneRow = el('div', 'row');
@@ -427,6 +433,12 @@ export class Ui {
       rows.push([status.mode === 'station' ? '線路総延長' : '延長', `${status.length.toFixed(1)} m`]);
       if (status.mode === 'station') {
         rows.push(['駅', `${status.station.trackCount}線 / ${status.station.platformCount}ホーム`]);
+        if (status.stationAdopt) {
+          rows.push([
+            '既設の線路',
+            `${status.stationAdopt.trackIndex + 1}番線として取り込み`,
+          ]);
+        }
       } else {
         rows.push([
           '曲線半径',
@@ -441,7 +453,7 @@ export class Ui {
       rows.push([
         '操作',
         status.mode === 'build' ? 'クリックで始点を指定'
-          : status.mode === 'station' ? '空き地をクリックして駅を配置'
+          : status.mode === 'station' ? '線路か空き地をクリックして駅を配置'
           : status.mode === 'zone'
             ? `道路沿いをクリックして${status.zone ? ZONE_LABELS[status.zone] : '用途を解除'}`
           : status.mode === 'line'
@@ -508,17 +520,26 @@ export class Ui {
       this.markEditingLine();
     }
     this.updateGraph(!ride && status.mode === 'inspect' ? status.inspect : null);
-    this.syncStationControls(status.station);
+    this.syncStationControls(status.station, status.stationAdopt);
     this.updateStationEditor(status);
   }
 
-  private syncStationControls(settings: StationToolSettings): void {
+  private syncStationControls(
+    settings: StationToolSettings,
+    adopt: ToolStatus['stationAdopt'],
+  ): void {
     if (document.activeElement !== this.stationNameInput) this.stationNameInput.value = settings.name;
     this.stationTrackSelect.value = String(settings.trackCount);
     this.refreshPlatformOptions(settings.trackCount, settings.platformCount);
     this.stationLengthSelect.value = String(settings.length);
-    const degrees = ((settings.heading * 180) / Math.PI + 360) % 360;
-    this.stationHeadingLabel.textContent = `${degrees.toFixed(0)}°`;
+    // 線路に後付けしているときは向きを線路が決めるので、代わりに何番線に
+    // 取り込むかを出す (N / M の効き先が変わることを示す)。
+    if (adopt) {
+      this.stationHeadingLabel.textContent = `${adopt.trackIndex + 1}番線${adopt.reversed ? ' (逆側)' : ''}`;
+    } else {
+      const degrees = ((settings.heading * 180) / Math.PI + 360) % 360;
+      this.stationHeadingLabel.textContent = `${degrees.toFixed(0)}°`;
+    }
   }
 
   private refreshPlatformOptions(trackCount: number, selected?: number): void {
