@@ -4,7 +4,7 @@ import {
   ZONE_CELL,
   ZONE_ROW_DEPTH,
   positionHash,
-  type Lot,
+  type BuildingLot,
   type ZoneCell,
   type ZoneType,
 } from '../network/zoning';
@@ -147,7 +147,7 @@ function offsetPoint(cell: ZoneCell, along: number, out: number): Vector3 {
  * そこから基礎を、footprint の下でいちばん低い所まで下ろす。傾いた土地でも
  * 建物が浮かず、道路との境に段差も出ない。
  */
-export function buildBuilding(mb: MeshBuilder, lot: Lot, ground: GroundQuery): void {
+export function buildBuilding(mb: MeshBuilder, lot: BuildingLot, ground: GroundQuery): void {
   const rand = mulberry32(positionHash(lot.center.x, lot.center.z));
   const zone = lot.zone;
 
@@ -199,14 +199,14 @@ export function buildBuilding(mb: MeshBuilder, lot: Lot, ground: GroundQuery): v
 
 const UP = new Vector3(0, 1, 0);
 
-function footprintCorner(center: Vector3, lot: Lot, along: number, out: number): Vector3 {
+function footprintCorner(center: Vector3, lot: BuildingLot, along: number, out: number): Vector3 {
   return center.clone().addScaledVector(lot.along, along).addScaledVector(lot.outward, out);
 }
 
 /** 住宅。1〜2 階の切妻屋根で、道路側に玄関ポーチを付ける。 */
 function buildHouse(
   mb: MeshBuilder,
-  lot: Lot,
+  lot: BuildingLot,
   base: Vector3,
   halfAlong: number,
   halfDepth: number,
@@ -259,7 +259,7 @@ function buildHouse(
 /** 商業。低層の店舗ビル。1 階は間口いっぱいの店先、上に事務所が載る。 */
 function buildShop(
   mb: MeshBuilder,
-  lot: Lot,
+  lot: BuildingLot,
   base: Vector3,
   halfAlong: number,
   halfDepth: number,
@@ -327,7 +327,7 @@ function buildShop(
 /** 工業。平屋の大きな建屋に、屋根の越屋根と煙突を載せる。 */
 function buildFactory(
   mb: MeshBuilder,
-  lot: Lot,
+  lot: BuildingLot,
   base: Vector3,
   halfAlong: number,
   halfDepth: number,
@@ -398,7 +398,7 @@ const ZONE_COLOR_LIST: RGB[] = [
 function addGableRoof(
   mb: MeshBuilder,
   eaves: Vector3,
-  lot: Lot,
+  lot: BuildingLot,
   halfAlong: number,
   halfDepth: number,
   height: number,

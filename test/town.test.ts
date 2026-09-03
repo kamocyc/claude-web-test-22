@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { TOWN_DENSITY, TOWN_MIN_SPACING } from '../src/core/units';
+import { ZONE_SETBACK } from '../src/network/zoning';
 import { DEFAULT_TERRAIN, generateTerrain } from '../src/terrain/generator';
+import { planTown, toBuildingLot } from '../src/terrain/town/layout';
 import { testField } from './support/field';
 
 /**
@@ -86,5 +88,112 @@ describe('町の位置', () => {
   it('シードが違えば違う町になる', () => {
     const other = world(DEFAULT_TERRAIN.seed + 1);
     expect(other.towns.map((t) => `${t.x},${t.z}`)).not.toEqual(towns.map((t) => `${t.x},${t.z}`));
+  });
+});
+
+describe('町の街路と敷地', () => {
+  const { field, towns, water } = world();
+  const plans = towns.map((town) => planTown(town, field));
+
+  it('街路と敷地ができる', () => {
+    const streets = plans.reduce((n, p) => n + p.streets.length, 0);
+    const lots = plans.reduce((n, p) => n + p.lots.length, 0);
+    expect(streets).toBeGreaterThan(0);
+    expect(lots).toBeGreaterThan(0);
+    // どの街路も 2 点以上で、最小の長さを超えている。
+    for (const plan of plans) {
+      for (const street of plan.streets) {
+        expect(street.points.length).toBeGreaterThanOrEqual(2);
+        let length = 0;
+        for (let i = 1; i < street.points.length; i++) {
+          length += Math.hypot(
+            street.points[i].x - street.points[i - 1].x,
+            street.points[i].z - street.points[i - 1].z,
+          );
+        }
+        expect(length).toBeGreaterThanOrEqual(60);
+      }
+    }
+  });
+
+  it('同じ町なら同じ街路になる (整地の影響を受けない)', () => {
+    for (const town of towns) {
+      const again = planTown(town, field);
+      const before = plans[towns.indexOf(town)];
+      expect(again.streets.map((s) => s.points.map((p) => `${p.x},${p.z}`).join(' '))).toEqual(
+        before.streets.map((s) => s.points.map((p) => `${p.x},${p.z}`).join(' ')),
+      );
+      expect(again.lots.length).toBe(before.lots.length);
+    }
+  });
+
+  it('街路も敷地も水の上に来ない', () => {
+    for (const plan of plans) {
+      for (const street of plan.streets) {
+        for (const p of street.points) {
+          expect(field.contains(p.x, p.z)).toBe(true);
+          expect(water.isWater(p.x, p.z)).toBe(false);
+        }
+      }
+      for (const lot of plan.lots) {
+        expect(water.isWater(lot.center.x, lot.center.z)).toBe(false);
+      }
+    }
+  });
+
+  it('街路の縦断が規格に収まる', () => {
+    for (const plan of plans) {
+      for (const street of plan.streets) {
+        for (let i = 1; i < street.points.length; i++) {
+          const a = street.points[i - 1];
+          const b = street.points[i];
+          const run = Math.hypot(b.x - a.x, b.z - a.z);
+          const rise = Math.abs(field.baseHeightAt(b.x, b.z) - field.baseHeightAt(a.x, a.z));
+          expect(rise / run).toBeLessThanOrEqual(0.1 + 1e-9);
+        }
+      }
+    }
+  });
+
+  it('敷地が街路に食い込まない', () => {
+    for (const plan of plans) {
+      for (const lot of plan.lots) {
+        for (const street of plan.streets) {
+          for (let i = 0; i + 1 < street.points.length; i++) {
+            const a = street.points[i];
+            const b = street.points[i + 1];
+            const ex = b.x - a.x;
+            const ez = b.z - a.z;
+            const lengthSq = ex * ex + ez * ez;
+            const t = Math.max(0, Math.min(1, ((lot.center.x - a.x) * ex + (lot.center.z - a.z) * ez) / lengthSq));
+            const d = Math.hypot(a.x + ex * t - lot.center.x, a.z + ez * t - lot.center.z);
+            expect(d).toBeGreaterThanOrEqual(street.halfWidth + ZONE_SETBACK - 1e-9);
+          }
+        }
+      }
+    }
+  });
+
+  it('市街地の広がりに収まる', () => {
+    for (const plan of plans) {
+      for (const street of plan.streets) {
+        for (const p of street.points) {
+          expect(Math.hypot(p.x - plan.town.x, p.z - plan.town.z)).toBeLessThan(plan.extent * 1.3);
+        }
+      }
+    }
+  });
+
+  it('高さは描くときの地形から入る', () => {
+    const ground = (x: number, z: number): number => field.heightAt(x, z);
+    for (const plan of plans) {
+      for (const lot of plan.lots.slice(0, 20)) {
+        const built = toBuildingLot(lot, ground);
+        // 床は敷地の中の地形の範囲に収まり、基礎はそれより下へ届く。
+        expect(built.padY).toBeGreaterThanOrEqual(built.lowY);
+        expect(built.center.y).toBe(built.padY);
+        expect(Number.isFinite(built.lowY)).toBe(true);
+      }
+    }
   });
 });

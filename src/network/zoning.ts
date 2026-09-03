@@ -57,14 +57,14 @@ export const ZONE_PAINT_CELL = 4;
  * 建物の床は道路に接する縁の高さに合わせる (`Lot.padY`) ので、背後の地形が
  * これより高いと建物が斜面に埋まってしまう。切土の法面はここで弾かれる。
  */
-const ZONE_MAX_RISE = 4.0;
+export const ZONE_MAX_RISE = 4.0;
 
 /**
  * 敷地の中で、道路側の高さより地形が**低く**なってよい量 [m]。
  *
  * こちらは基礎を伸ばせば吸収できるので、高くなる側よりずっと甘くてよい。
  */
-const ZONE_MAX_DROP = 8.0;
+export const ZONE_MAX_DROP = 8.0;
 
 /** 1 棟にまとめてよいマスの数 (間口方向)。用途ごとに大きさの性格を変える。 */
 const MAX_WIDTH: Record<ZoneType, number> = {
@@ -119,10 +119,13 @@ export interface ZoneCell {
   buildable: boolean;
 }
 
-/** 建物 1 棟ぶんの敷地 (マスを 1 つ以上まとめたもの)。 */
-export interface Lot {
-  segment: SegmentId;
-  side: 1 | -1;
+/**
+ * 建物を建てるのに要るぶんの敷地。
+ *
+ * `buildBuilding` が読むのはここまでで、道路への参照は要らない。
+ * 町の街路沿いの敷地 (`src/terrain/town/layout.ts`) も同じ形で作る。
+ */
+export interface BuildingLot {
   zone: ZoneType;
   /** 敷地の中心 (地表高)。 */
   center: Vector3;
@@ -144,6 +147,12 @@ export interface Lot {
   padY: number;
   /** 敷地の中の地形のいちばん低い所。基礎はここまで下ろす。 */
   lowY: number;
+}
+
+/** 道路沿いの敷地 (マスを 1 つ以上まとめたもの)。 */
+export interface Lot extends BuildingLot {
+  segment: SegmentId;
+  side: 1 | -1;
   /** まとめたマスの数 (間口方向 × 奥行き方向)。 */
   cells: { wide: number; deep: number };
 }
