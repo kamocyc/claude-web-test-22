@@ -403,21 +403,34 @@ function siteScore(field: Heightfield, x: number, z: number): number {
   const miss = (value: number, min: number, max: number): number =>
     value < min ? min - value : value > max ? value - max : 0;
   return -(
-    // 道路が渡る谷。橋 1 つぶん (BRIDGE_THRESHOLD 8 m) は要るが、
-    // 40 m の谷を渡らせると見本が延々と高架になる。
-    miss(trunk.below, 10, 22) +
-    // 線路が抜ける丘。TUNNEL_THRESHOLD (12 m) を確実に超える所。
-    miss(rail.above, 14, 28) * 1.5 +
-    // 逆向きの起伏は少ないほどよい。地面と同じ高さの所が残らないと、
-    // 踏切も交差点も置けない。
-    miss(trunk.above, 0, 14) +
-    miss(rail.below, 0, 10) * 1.5
+    // 中ほどは路面が地面と同じ高さで通ること。踏切・交差点・分岐器はここに
+    // 置くので、切土・盛土で路面が地面から離れていると場所が見つからない。
+    (miss(trunk.innerAbove, 0, 3) + miss(trunk.innerBelow, 0, 3)) * 2 +
+    (miss(rail.innerAbove, 0, 5) + miss(rail.innerBelow, 0, 5)) * 2 +
+    // 外側に、道路が渡る谷 (橋) と線路が抜ける丘 (トンネル) が 1 つずつ。
+    // 40 m の谷や 50 m の丘だと見本が延々と高架・トンネルになる。
+    miss(trunk.outerBelow, 10, 24) * 2 +
+    miss(rail.outerAbove, 16, 30) * 3 +
+    // 逆向きの起伏は少ないほどよい。
+    miss(trunk.outerAbove, 0, 16) * 0.5 +
+    miss(rail.outerBelow, 0, 14) * 0.5
   );
+}
+
+/** 中ほどと見なす範囲 [m]。踏切・交差点・分岐器がここに入る。 */
+const SITE_INNER = 150;
+
+interface CorridorGap {
+  innerAbove: number;
+  innerBelow: number;
+  outerAbove: number;
+  outerBelow: number;
 }
 
 /**
  * 中心から両側へ勾配を制限して地形を追い、地形が縦断からどれだけ離れるかを
  * 返す。`above` は追いつけない丘 (トンネル)、`below` は谷 (橋)。
+ * 中ほど (`SITE_INNER` 以内) と外側で分けて数える。
  * 通る範囲に水があれば null。
  */
 function corridorGap(
@@ -428,12 +441,11 @@ function corridorGap(
   uz: number,
   half: number,
   grade: number,
-): { above: number; below: number } | null {
+): CorridorGap | null {
   const step = 25;
   const start = field.baseHeightAt(x, z);
   if (start < DRY_Y) return null;
-  let above = 0;
-  let below = 0;
+  const gap: CorridorGap = { innerAbove: 0, innerBelow: 0, outerAbove: 0, outerBelow: 0 };
   for (const side of [1, -1]) {
     let profile = start;
     for (let t = step; t <= half; t += step) {
@@ -441,9 +453,16 @@ function corridorGap(
       if (y < DRY_Y) return null;
       const reach = grade * step;
       profile = Math.min(profile + reach, Math.max(profile - reach, y));
-      if (y - profile > above) above = y - profile;
-      if (profile - y > below) below = profile - y;
+      const above = y - profile;
+      const below = profile - y;
+      if (t <= SITE_INNER) {
+        if (above > gap.innerAbove) gap.innerAbove = above;
+        if (below > gap.innerBelow) gap.innerBelow = below;
+      } else {
+        if (above > gap.outerAbove) gap.outerAbove = above;
+        if (below > gap.outerBelow) gap.outerBelow = below;
+      }
     }
   }
-  return { above, below };
+  return gap;
 }

@@ -16,10 +16,24 @@ interface Chunk {
   iz0: number;
   cellsX: number;
   cellsZ: number;
+  /** 頂点を何マスおきに取るか (1 / 2 / 4)。遠いチャンクほど粗い。 */
+  step: number;
   position: BufferAttribute;
   normal: BufferAttribute;
   uv: BufferAttribute;
 }
+
+/**
+ * 段ごとの距離 [m] と間引き。近い順に見て、最初に届いた段を使う。
+ *
+ * 4 m 格子のまま遠クリップ面 (3,840 m) まで全部並べると 370 万頂点になる。
+ * 遠くの地形は 16 m 格子で描いても輪郭は変わらないので、距離で落とす。
+ */
+const LOD_RINGS: { distance: number; step: number }[] = [
+  { distance: 1200, step: 1 },
+  { distance: 2400, step: 2 },
+  { distance: Infinity, step: 4 },
+];
 
 /**
  * ハイトフィールドを描画するためのチャンク分割メッシュ。
@@ -163,9 +177,17 @@ export class TerrainMesh {
     const wanted = new Set<number>();
     for (let cz = cz0; cz <= cz1; cz++) {
       for (let cx = cx0; cx <= cx1; cx++) {
-        wanted.add(this.chunkKey(cx, cz));
-        if (this.resident.has(this.chunkKey(cx, cz))) continue;
-        this.acquire(cx, cz);
+        const key = this.chunkKey(cx, cz);
+        wanted.add(key);
+        const step = this.stepFor(cx, cz);
+        const current = this.resident.get(key);
+        if (current) {
+          // 段が変わったチャンクは、いまのジオメトリを返して取り直す。
+          if (current.step === step) continue;
+          this.resident.delete(key);
+          this.release(current);
+        }
+        this.acquire(cx, cz, step);
       }
     }
     for (const [key, chunk] of this.resident) {
@@ -173,10 +195,28 @@ export class TerrainMesh {
       this.resident.delete(key);
       this.release(chunk);
     }
+    // 継ぎ目の縫い方は隣の段で決まるので、段が動いたら常駐ぶんを描き直す。
+    for (const chunk of this.resident.values()) this.fill(chunk);
+  }
+
+  /**
+   * そのチャンクの間引き。
+   *
+   * チャンク座標だけから決まるので、隣り合う 2 枚は互いの段を同じに読む。
+   * 継ぎ目を縫うときに、両側が同じ判断に達することが要る。
+   */
+  private stepFor(cx: number, cz: number): number {
+    const f = this.field;
+    const size = TERRAIN_CHUNK_CELLS * f.cell;
+    const x = f.worldX(cx * TERRAIN_CHUNK_CELLS) + size * 0.5;
+    const z = f.worldZ(cz * TERRAIN_CHUNK_CELLS) + size * 0.5;
+    const distance = Math.hypot(x - this.centerX, z - this.centerZ);
+    for (const ring of LOD_RINGS) if (distance <= ring.distance) return ring.step;
+    return LOD_RINGS[LOD_RINGS.length - 1].step;
   }
 
   /** チャンクを 1 枚常駐させる。プールに同じ形があれば使い回す。 */
-  private acquire(cx: number, cz: number): void {
+  private acquire(cx: number, cz: number, step: number): void {
     const f = this.field;
     const size = TERRAIN_CHUNK_CELLS;
     const ix0 = cx * size;
@@ -184,9 +224,11 @@ export class TerrainMesh {
     const cellsX = Math.min(size, f.cells - ix0);
     const cellsZ = Math.min(size, f.cells - iz0);
     if (cellsX <= 0 || cellsZ <= 0) return;
-    const shape = cellsX * 4096 + cellsZ;
+    // 間引きは辺を割り切れる範囲で。端の半端なチャンクは細かいまま持つ。
+    const use = cellsX % step === 0 && cellsZ % step === 0 ? step : 1;
+    const shape = (cellsX * 4096 + cellsZ) * 8 + use;
     const free = this.pool.get(shape);
-    const chunk = free?.pop() ?? this.createChunk(cellsX, cellsZ, shape);
+    const chunk = free?.pop() ?? this.createChunk(cellsX, cellsZ, use, shape);
     chunk.ix0 = ix0;
     chunk.iz0 = iz0;
     chunk.mesh.name = `terrain-chunk-${ix0}-${iz0}`;
@@ -198,7 +240,7 @@ export class TerrainMesh {
 
   private release(chunk: Chunk): void {
     this.group.remove(chunk.mesh);
-    const shape = chunk.cellsX * 4096 + chunk.cellsZ;
+    const shape = (chunk.cellsX * 4096 + chunk.cellsZ) * 8 + chunk.step;
     const list = this.pool.get(shape);
     if (list) list.push(chunk);
     else this.pool.set(shape, [chunk]);
@@ -210,9 +252,9 @@ export class TerrainMesh {
     chunk.mesh.castShadow = false;
   }
 
-  private createChunk(cellsX: number, cellsZ: number, shape: number): Chunk {
-    const nx = cellsX + 1;
-    const nz = cellsZ + 1;
+  private createChunk(cellsX: number, cellsZ: number, step: number, shape: number): Chunk {
+    const nx = cellsX / step + 1;
+    const nz = cellsZ / step + 1;
     const count = nx * nz;
     const position = new BufferAttribute(new Float32Array(count * 3), 3);
     const normal = new BufferAttribute(new Float32Array(count * 3), 3);
@@ -222,8 +264,8 @@ export class TerrainMesh {
     let index = this.indices.get(shape);
     if (!index) {
       const list: number[] = [];
-      for (let z = 0; z < cellsZ; z++) {
-        for (let x = 0; x < cellsX; x++) {
+      for (let z = 0; z < nz - 1; z++) {
+        for (let x = 0; x < nx - 1; x++) {
           const i = x + z * nx;
           list.push(i, i + nx, i + 1);
           list.push(i + 1, i + nx, i + nx + 1);
@@ -243,33 +285,61 @@ export class TerrainMesh {
     geometry.setIndex(index);
 
     const mesh = new Mesh(geometry, this.material);
-    return { mesh, ix0: 0, iz0: 0, cellsX, cellsZ, position, normal, uv };
+    return { mesh, ix0: 0, iz0: 0, cellsX, cellsZ, step, position, normal, uv };
   }
 
   /** チャンクの頂点を、いまの高さ場から書き直す。 */
   private fill(chunk: Chunk): void {
     const f = this.field;
-    const nx = chunk.cellsX + 1;
-    const nz = chunk.cellsZ + 1;
+    const step = chunk.step;
+    const nx = chunk.cellsX / step + 1;
+    const nz = chunk.cellsZ / step + 1;
+    const size = TERRAIN_CHUNK_CELLS;
+    const cx = chunk.ix0 / size;
+    const cz = chunk.iz0 / size;
+    // 隣が自分より粗いと、共有する辺の上で相手が持っていない頂点ができる。
+    // その頂点を相手の線分の上に載せると、割れ目が開かない。隣の段は
+    // チャンク座標だけで決まるので、両側が必ず同じ判断に達する。
+    const west = this.stepFor(cx - 1, cz);
+    const east = this.stepFor(cx + 1, cz);
+    const north = this.stepFor(cx, cz - 1);
+    const south = this.stepFor(cx, cz + 1);
+
+    const heightAt = (ix: number, iz: number): number => f.work[f.index(ix, iz)];
+    /** `along` を `n` おきの格子に載せて線形補間する。 */
+    const onCoarse = (fixed: number, along: number, n: number, vertical: boolean): number => {
+      const a = Math.floor(along / n) * n;
+      const b = Math.min(f.cells, a + n);
+      const t = b === a ? 0 : (along - a) / (b - a);
+      const ha = vertical ? heightAt(fixed, a) : heightAt(a, fixed);
+      const hb = vertical ? heightAt(fixed, b) : heightAt(b, fixed);
+      return ha + (hb - ha) * t;
+    };
+
     for (let z = 0; z < nz; z++) {
-      const iz = chunk.iz0 + z;
+      const iz = chunk.iz0 + z * step;
       for (let x = 0; x < nx; x++) {
-        const ix = chunk.ix0 + x;
+        const ix = chunk.ix0 + x * step;
         const i = x + z * nx;
-        const wx = f.worldX(ix);
-        const wz = f.worldZ(iz);
-        chunk.position.setXYZ(i, wx, f.work[f.index(ix, iz)], wz);
+
+        let y = heightAt(ix, iz);
+        if (x === 0 && west > step) y = onCoarse(ix, iz, west, true);
+        else if (x === nx - 1 && east > step) y = onCoarse(ix, iz, east, true);
+        else if (z === 0 && north > step) y = onCoarse(iz, ix, north, false);
+        else if (z === nz - 1 && south > step) y = onCoarse(iz, ix, south, false);
+
+        chunk.position.setXYZ(i, f.worldX(ix), y, f.worldZ(iz));
         chunk.uv.setXY(i, ix / f.cells, iz / f.cells);
 
         // 隣接セルとの差分から法線を作る (端はクランプ)。
-        const xl = Math.max(0, ix - 1);
-        const xr = Math.min(f.cells, ix + 1);
-        const zd = Math.max(0, iz - 1);
-        const zu = Math.min(f.cells, iz + 1);
-        const hl = f.work[f.index(xl, iz)];
-        const hr = f.work[f.index(xr, iz)];
-        const hd = f.work[f.index(ix, zd)];
-        const hu = f.work[f.index(ix, zu)];
+        const xl = Math.max(0, ix - step);
+        const xr = Math.min(f.cells, ix + step);
+        const zd = Math.max(0, iz - step);
+        const zu = Math.min(f.cells, iz + step);
+        const hl = heightAt(xl, iz);
+        const hr = heightAt(xr, iz);
+        const hd = heightAt(ix, zd);
+        const hu = heightAt(ix, zu);
         const dx = (xr - xl) * f.cell;
         const dz = (zu - zd) * f.cell;
         let nxv = (hl - hr) * dz;
