@@ -9,6 +9,8 @@ import { Network } from './network/network';
 import { createPropMaterial, createTerrainMaterial, createWaterMaterial } from './render/materials';
 import { WaterView } from './render/water';
 import { TownView } from './render/townView';
+import { VegetationView } from './render/vegetationView';
+import { VegetationField } from './terrain/vegetation';
 import { TownPlans } from './terrain/town/plans';
 import { TownRoads } from './app/townRoads';
 import { SnapView } from './render/snapView';
@@ -45,6 +47,12 @@ const townPlans = new TownPlans(field);
 townPlans.setTowns(terrain.towns);
 const townView = new TownView(field, network, townPlans, createPropMaterial());
 viewport.scene.add(townView.group);
+
+// 木。濃さは水文モデルから決まるので、地形と一緒に作り直す。
+const vegetation = new VegetationField();
+vegetation.build(terrain.hydro, terrainSeed);
+const vegetationView = new VegetationView(field, vegetation, townPlans, createPropMaterial());
+viewport.scene.add(vegetationView.group);
 
 // 視点の近くの町は、街路を実際の道路として敷く。
 const townRoads = new TownRoads(network, field, townPlans, (index, paved) =>
@@ -124,6 +132,8 @@ const ui = new Ui(uiRoot, {
       townRoads.reset();
       townPlans.setTowns(next.towns);
       townView.reset();
+      vegetation.build(next.hydro, terrainSeed);
+      vegetationView.reset();
       // 地形が変われば、見本を建てるのに向いた場所も変わる。視点は動かさない
       // — 敷いたネットワークはそのまま残るので、そこから離れると困る。
       home = demoSite(field, next.towns);
@@ -239,6 +249,7 @@ function applyUndergroundView(on: boolean): void {
   // 水面は地形より手前に描くので、透かすときは一緒に消す。
   waterView.setUndergroundView(on);
   townView.setUndergroundView(on);
+  vegetationView.setUndergroundView(on);
   document.body.classList.toggle('underground-view', on);
 }
 
@@ -311,6 +322,7 @@ function lookHome(): void {
   viewport.controls.update();
   terrainMesh.setCenter(home.x, home.z);
   townView.setCenter(home.x, home.z);
+  vegetationView.setCenter(home.x, home.z);
 }
 
 // 動作確認・デバッグ用に主要オブジェクトを公開する。
@@ -325,6 +337,7 @@ declare global {
       ride: Ride;
       towns: typeof terrain.towns;
       townRoads: TownRoads;
+      vegetationView: VegetationView;
       /** 次のフレームで組み立て直す (ネットワークを直に触ったときに使う)。 */
       invalidate: () => void;
       /** 指定した地点を、指定した距離・方位から見る。 */
@@ -342,6 +355,7 @@ window.trackBuilder = {
   ride,
   towns: terrain.towns,
   townRoads,
+  vegetationView,
   invalidate: () => {
     dirty = true;
   },
@@ -599,8 +613,9 @@ function frame(): void {
   if (dirty) {
     dirty = false;
     const result = world.rebuild();
-    // 敷いた線形に掛かる町の建物は出さない。
+    // 敷いた線形に掛かる町の建物と木は出さない。
     townView.setObstacles(world.occupancy);
+    vegetationView.setObstacles(world.occupancy);
     ui.updateBuild(result);
   }
 
@@ -614,6 +629,7 @@ function frame(): void {
   // 地形は視界のぶんだけ常駐させる。カメラが見ている地面の点で決める。
   terrainMesh.setCenter(viewport.controls.target.x, viewport.controls.target.z);
   townView.setCenter(viewport.controls.target.x, viewport.controls.target.z);
+  vegetationView.setCenter(viewport.controls.target.x, viewport.controls.target.z);
   // 警告の目印は、しばらくしたら自分で消える。
   if (focusUntil > 0 && now >= focusUntil) {
     focusUntil = 0;
