@@ -62,6 +62,15 @@ export interface GraphLane {
    */
   reverse?: number;
   segment?: SegmentId;
+  /**
+   * セグメントの車線が切り取っている線形の範囲と向き。
+   *
+   * 車線は交差点の中を抜いた範囲だけを走り、向き違いの車線では弧長が反転する。
+   * 「線形の弧長」で書かれたもの (構造形式の区間・駅・標) を車線の弧長へ直す
+   * には、この 3 つが要る。`LanePath` の中には隠れているので、外から読めるよう
+   * ここに控える。
+   */
+  trim?: { s0: number; s1: number; forward: boolean };
   /** Platform-centre stop measured from this lane path's start. */
   stationStop?: { station: StationId; s: number };
   /** コネクタが属する交差点。 */
@@ -283,6 +292,7 @@ export function buildLaneGraph(
         ),
         speedLimit: speedOf(cls),
         segment: seg.id,
+        trim: { s0: range.s0, s1: range.s1, forward: lane.forward },
         stationStop,
       });
       bySegment.set(`${seg.id}:${lane.index}`, created.id);
