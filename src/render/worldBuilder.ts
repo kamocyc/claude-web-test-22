@@ -1137,6 +1137,16 @@ export class WorldBuilder {
     return this.structureRuns.get(segment) ?? [];
   }
 
+  /**
+   * 区間ごとの構造形式。
+   *
+   * 運転の経路を作るのに要る (トンネルの中では走行抵抗が増える)。区間ごとに
+   * 引くのではなく全部まとめて渡す口が要るので、控えをそのまま出す。
+   */
+  get structures(): ReadonlyMap<SegmentId, StructureRun[]> {
+    return this.structureRuns;
+  }
+
   /** サンプル列にカントを乗せる (踏切の補正の上に重ねる)。 */
   private withCant(samples: AlignmentSample[], segment: SegmentId): AlignmentSample[] {
     const profile = this.cant.get(segment);

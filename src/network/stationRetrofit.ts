@@ -69,6 +69,14 @@ const THROAT_MAX = 420;
 const THROAT_STAGGER = 25;
 /** 短くしていくときの縮め率。 */
 const THROAT_SHRINK = 1.3;
+/**
+ * のどの長さに見る余裕。
+ *
+ * `idealThroat` の式は「両端の接線が平行」を前提にした近似なので、曲線の
+ * 途中に置いた駅ではそのぶん実際の飛びが大きくなる。1.15 倍にしておくと
+ * 目標半径が 1.3 倍になり、上限に乗ってしまうことがない。
+ */
+const THROAT_MARGIN = 1.15;
 /** 高架とみなす、地形からの浮き [m]。 */
 const ELEVATED_RISE = 6;
 
@@ -537,11 +545,17 @@ function planThroat(
  * 上限は `findCurveBreaks` と同じ「縦方向の加速度」で決まるので、そこから
  * 必要な長さ `L = √(6dR)` を出す。`app/demo.ts` の終端駅が横距 2 m に対して
  * 180 m の喉を取っているのと同じ勘定。
+ *
+ * 式どおりの長さを狙うと、上限に**ちょうど**乗る。曲線の途中に置いた駅では
+ * 両端の接線が平行ではないので実際の飛びは式より少し大きくなり、そこで
+ * 警告が 1 つだけ出る。式が近似である以上、ぴったりを狙う意味は無いので、
+ * 余裕を見て少し長めから始める (`THROAT_MARGIN`)。短くする探索はそのままなので、
+ * 長く取れない所では今までどおり縮めて収まる。
  */
 function idealThroat(cls: NetworkClass, spread: number): number {
   const speed = (cls.designSpeed / 3.6) * SPEED_FACTOR;
   const radius = Math.max(speed * speed, 1) / CURVE_BREAK_ACCEL;
-  return Math.sqrt(6 * Math.max(spread, 0.5) * radius);
+  return THROAT_MARGIN * Math.sqrt(6 * Math.max(spread, 0.5) * radius);
 }
 
 /**

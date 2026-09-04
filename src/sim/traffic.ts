@@ -62,6 +62,23 @@ export interface Vehicle {
   line?: { id: LineId; plan: LinePlan; run: number; cursor: number };
   /** 動けないまま止まっている時間 [s]。駅の停車・折り返しは数えない。 */
   stuckFor?: number;
+  /**
+   * 運転している列車。
+   *
+   * 速さを決めているのが追従モデルではなく**運転士**である、という印。
+   * `Traffic` はこの車両の `head` と `speed` に手を出さず、外から書かれた
+   * ものをそのまま使う。他の車両から見れば、ふつうに走っている先行車と
+   * 何も変わらない (在線・車間・進路の取り合いはそのまま働く)。
+   */
+  driven?: boolean;
+  /**
+   * 両ごとの中心位置 (`route[0]` の起点から測った距離 [m]、先頭から順)。
+   *
+   * 運転している列車では、移植した多質点系が 1 両ずつ距離程を持つので、
+   * 先頭から等間隔に並べるのではなくその値で置く。勾配変化点での前後衝動が
+   * そのまま姿勢に出る。
+   */
+  carCentres?: number[];
 }
 
 export const STATION_DWELL = 5;
@@ -206,6 +223,64 @@ export class Traffic {
     );
   }
 
+  // ------------------------------------------------------------ 運転
+
+  /**
+   * 運転する列車を線路に置く。
+   *
+   * ふつうの `Vehicle` として置くので、カメラ (乗車モード)・描画・他の車両から
+   * 見た先行車の扱いは、すべて今までのまま働く。違うのは中身の決め方だけで、
+   * `head` と `speed` は `moveDriven` から外部 (運転シミュレータ) が書く。
+   */
+  addDriven(params: {
+    route: number[];
+    head: number;
+    cars: number;
+    size?: BodySize;
+    color?: RGB;
+  }): Vehicle {
+    this.removeDriven();
+    const vehicle: Vehicle = {
+      id: this.nextId++,
+      kind: 'train',
+      route: [...params.route],
+      head: params.head,
+      speed: 0,
+      size: params.size ?? TRAIN_SIZE,
+      cars: params.cars,
+      color: params.color ?? TRAIN_COLORS[0]!,
+      bodies: [],
+      driven: true,
+    };
+    this.updateBodies(vehicle);
+    this.vehicles.push(vehicle);
+    return vehicle;
+  }
+
+  /** 運転している列車。 */
+  get driven(): Vehicle | undefined {
+    return this.vehicles.find((v) => v.driven);
+  }
+
+  /** 運転している列車を降ろす。 */
+  removeDriven(): void {
+    const index = this.vehicles.findIndex((v) => v.driven);
+    if (index >= 0) this.vehicles.splice(index, 1);
+  }
+
+  /**
+   * 運転している列車を、外から決まった位置へ置き直す。
+   *
+   * `carCentres` を渡せば 1 両ずつその位置に置く (多質点系の前後衝動が姿勢に
+   * 出る)。渡さなければ先頭から等間隔に並べる。
+   */
+  moveDriven(vehicle: Vehicle, head: number, speed: number, carCentres?: number[]): void {
+    vehicle.head = head;
+    vehicle.speed = speed;
+    if (carCentres) vehicle.carCentres = carCentres;
+    this.updateBodies(vehicle);
+  }
+
   /** その車両がいま乗っている車線。 */
   laneOf(vehicle: Vehicle): number {
     return vehicle.route[this.locate(vehicle.route, vehicle.head).index];
@@ -259,12 +334,14 @@ export class Traffic {
 
     const space: JunctionSpace = { occupied, tailIn };
     for (const vehicle of this.vehicles) {
+      // 運転している列車の速さを決めるのは運転士なので、ここでは進めない。
+      if (vehicle.driven) continue;
       this.advance(vehicle, step, space);
     }
     this.vehicles.splice(
       0,
       this.vehicles.length,
-      ...this.vehicles.filter((v) => this.alive(v)),
+      ...this.vehicles.filter((v) => v.driven || this.alive(v)),
     );
     for (const vehicle of this.vehicles) this.updateBodies(vehicle);
   }
@@ -677,7 +754,8 @@ export class Traffic {
   private updateBodies(vehicle: Vehicle): void {
     const pitch = vehicle.size.length + COUPLING;
     for (let k = 0; k < vehicle.cars; k++) {
-      const centre = vehicle.head - vehicle.size.length / 2 - k * pitch;
+      // 運転している列車では 1 両ずつの位置が来る。連結器の伸縮が姿勢に出る。
+      const centre = vehicle.carCentres?.[k] ?? vehicle.head - vehicle.size.length / 2 - k * pitch;
       vehicle.bodies[k] = this.poseAt(vehicle, Math.max(0, centre));
     }
   }
@@ -689,11 +767,13 @@ export class Traffic {
     for (const kind of ['car', 'train'] as const) {
       const want = this.targetCount(kind);
       // 路線の列車は計画で決まった数だけ走るので、こちらでは数えない。
-      const have = this.vehicles.filter((v) => v.kind === kind && !v.line).length;
+      // 運転している列車も数えない (湧かせたものではないし、降ろしてもいけない)。
+      const spawned = (v: Vehicle): boolean => v.kind === kind && !v.line && !v.driven;
+      const have = this.vehicles.filter(spawned).length;
       // 1 フレームに 1 台ずつ。まとめて湧かせると団子になる。
       if (have < want) this.spawn(kind);
       else if (have > want + 1) {
-        const index = this.vehicles.findIndex((v) => v.kind === kind && !v.line);
+        const index = this.vehicles.findIndex(spawned);
         if (index >= 0) this.vehicles.splice(index, 1);
       }
     }

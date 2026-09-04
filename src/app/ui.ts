@@ -9,6 +9,7 @@ import { ZONE_LABELS, ZONE_TYPES, type ZoneType } from '../network/zoning';
 import type { LineId } from '../network/line';
 import type { LinePlan } from '../sim/lineRoute';
 import type { RideStatus } from './ride';
+import type { DrivingStatus } from './driving';
 import {
   GRAPH_W,
   formatCant,
@@ -44,6 +45,10 @@ export interface UiCallbacks {
   onRide: () => void;
   /** 乗る車両を次に変える。 */
   onRideNext: () => void;
+  /** 運転モードの出入り。 */
+  onDrive: () => void;
+  /** 運転して確かめるための路線を敷く。 */
+  onDrivingDemo: () => void;
   onClass: (classId: string) => void;
   onElevation: (steps: number) => void;
   /** 平行スナップの入り切りを変える。 */
@@ -91,6 +96,7 @@ export class Ui {
   private editingLine: LineId | null = null;
   private readonly elevationLabel: HTMLElement;
   private readonly rideButton: HTMLButtonElement;
+  private readonly driveButton: HTMLButtonElement;
   private readonly vehiclesToggle: HTMLInputElement;
   private readonly undergroundToggle: HTMLInputElement;
   private readonly statusBody: HTMLElement;
@@ -324,6 +330,13 @@ export class Ui {
       hint('乗る車両をクリックで選びます。運転台に乗ったら、ドラッグで見回し、Esc / F で降ります'),
     );
 
+    left.append(sectionTitle('運転'));
+    const driveRow = el('div', 'row');
+    this.driveButton = button('運転 (G)', callbacks.onDrive);
+    driveRow.append(this.driveButton, button('運転デモ路線', callbacks.onDrivingDemo));
+    left.append(driveRow);
+    left.append(hint('Z / A 力行 · Q 制動側 · S を N へ · . , ブレーキ · 1 非常 · ↑↓ 逆転機'));
+
     left.append(sectionTitle('マップ'));
     const mapRow = el('div', 'row');
     mapRow.append(
@@ -398,6 +411,12 @@ export class Ui {
       state === 'ride' ? '降りる (F)' : state === 'aim' ? '選択中 (Esc)' : '乗車 (F)';
   }
 
+  /** 運転モードの状態を反映する。 */
+  setDriving(on: boolean): void {
+    this.driveButton.classList.toggle('active', on);
+    this.driveButton.textContent = on ? '運転をやめる (G)' : '運転 (G)';
+  }
+
   /** 車両の走行表示のチェックを合わせる (乗車のために自動で入れたとき)。 */
   setVehicles(on: boolean): void {
     this.vehiclesToggle.checked = on;
@@ -421,13 +440,20 @@ export class Ui {
     }
   }
 
-  updateStatus(status: ToolStatus, ride: RideStatus | null = null): void {
+  updateStatus(
+    status: ToolStatus,
+    ride: RideStatus | null = null,
+    driving: DrivingStatus | null = null,
+  ): void {
     const elevationKind = status.elevation > 0 ? '高架' : status.elevation < 0 ? '地下' : '地表';
     this.elevationLabel.textContent = `${status.elevation >= 0 ? '+' : ''}${status.elevation} m · ${elevationKind}`;
 
     /** [見出し, 値, 値の色] */
     const rows: [string, string, string?][] = [];
-    if (ride) {
+    // 運転中は運転台の計器を出す。乗車の行より先に見たいものなので前に置く。
+    if (driving) {
+      rows.push(...drivingRows(driving));
+    } else if (ride) {
       rows.push(...rideRows(ride));
     } else if (status.drawing) {
       rows.push([status.mode === 'station' ? '線路総延長' : '延長', `${status.length.toFixed(1)} m`]);
@@ -933,5 +959,48 @@ function inspectRows(inspect: PointInspection | null): [string, string, string?]
   if (inspect.cant !== null) {
     rows.push(['カント', formatCant(inspect.cant, inspect.cantRoll)]);
   }
+  return rows;
+}
+
+/**
+ * 運転台の計器。
+ *
+ * 実車の運転台で目が行く順に並べる。速度と制限、次に手元のノッチ、次に
+ * 装置が出している力、最後に次の駅。
+ */
+function drivingRows(driving: DrivingStatus): [string, string, string?][] {
+  const notch = driving.emergency
+    ? '非常'
+    : driving.powerNotch > 0
+      ? `P${driving.powerNotch}`
+      : driving.holding
+        ? '抑速'
+        : driving.brakeNotch > 0
+          ? `B${driving.brakeNotch}`
+          : 'N';
+  const over = driving.speed > driving.limit + 0.5;
+  const reverser = driving.reverser === 1 ? '前' : driving.reverser === -1 ? '後' : '中立';
+  const rows: [string, string, string?][] = [
+    ['速度', `${driving.speed.toFixed(0)} km/h`, over ? '#e06a5a' : undefined],
+    ['制限', `${driving.limit.toFixed(0)} km/h`, over ? '#e06a5a' : undefined],
+    ['ノッチ', notch, driving.emergency ? '#e06a5a' : undefined],
+    ['逆転機', reverser],
+    ['引張力', `${driving.tractiveEffort.toFixed(0)} kN`],
+    ['BC 圧', `${driving.cylinderPressure.toFixed(0)} kPa`],
+    ['勾配', `${driving.gradePermil >= 0 ? '+' : ''}${driving.gradePermil.toFixed(1)} ‰`],
+  ];
+  if (driving.nextStation) {
+    const { name, distance, stopped } = driving.nextStation;
+    rows.push([
+      '次の駅',
+      stopped ? `${name} (停車中)` : `${name} まで ${Math.max(0, distance).toFixed(0)} m`,
+    ]);
+  } else {
+    rows.push(['次の駅', '終点まで停車なし']);
+  }
+  rows.push([
+    '距離程',
+    `${(driving.position / 1000).toFixed(2)} / ${(driving.routeLength / 1000).toFixed(2)} km`,
+  ]);
   return rows;
 }

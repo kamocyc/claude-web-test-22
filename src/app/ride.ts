@@ -296,6 +296,21 @@ export class Ride {
     return true;
   }
 
+  /**
+   * その車両に乗り込む。
+   *
+   * 運転モードのように「乗る相手が決まっている」場合に使う。近さで選ぶ
+   * (`board`) と、たまたま隣を走っている別の列車に乗ってしまう。
+   */
+  boardVehicle(vehicle: Vehicle): void {
+    this.active = true;
+    this.aiming = false;
+    this.target = null;
+    const body = vehicle.bodies[0];
+    if (body) this.eye.copy(body.pos);
+    this.reseat(vehicle);
+  }
+
   /** `near` にいちばん近い車両に乗り込む。 */
   board(vehicles: readonly Vehicle[], near: Vector3): void {
     this.active = true;

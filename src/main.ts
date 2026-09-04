@@ -2,6 +2,9 @@ import { Vector3 } from 'three';
 import { BuildTool, type ToolMode } from './app/buildTool';
 import { buildAutoWorld } from './app/autoWorld';
 import { buildDemoNetwork, buildInterchangeDemo } from './app/demo';
+import { Driving, longestRailStart } from './app/driving';
+import { buildDrivingDemo } from './app/drivingDemo';
+import { lookupDrivingKey } from './app/drivingKeys';
 import { Ride } from './app/ride';
 import { Ui } from './app/ui';
 import { Viewport } from './app/viewport';
@@ -46,6 +49,8 @@ viewport.scene.add(tool.previewGroup);
 
 // 乗車モード (一人称視点)。走っている車両の運転台にカメラを置く。
 const ride = new Ride();
+/** 運転モード。線路に 1 本だけ置いた列車を、運転士として動かす。 */
+let driving: Driving | null = null;
 let undergroundView = false;
 
 const ui = new Ui(uiRoot, {
@@ -90,6 +95,15 @@ const ui = new Ui(uiRoot, {
   onRideNext: () => {
     if (ride.active) ride.next(world.traffic.vehicles);
     else startRide();
+  },
+  onDrive: () => (driving ? stopDriving() : startDriving()),
+  onDrivingDemo: () => {
+    stopDriving();
+    buildDrivingDemo(network, field);
+    world.lines.clear();
+    ui.setCities([]);
+    tool.cancel();
+    dirty = true;
   },
   onRegenerate: () => {
     terrainSeed = (terrainSeed * 1664525 + 1013904223) >>> 0;
@@ -162,6 +176,7 @@ function focusOn(position: Vector3): void {
 
 function setMode(mode: ToolMode): void {
   // ツールを使うなら乗車モードから降りる (敷設中は俯瞰でないと使えない)。
+  stopDriving();
   stopRide();
   tool.setMode(mode);
   ui.setMode(mode);
@@ -212,6 +227,49 @@ function boardRide(): void {
   document.body.classList.remove('aiming');
   viewport.beginRide();
   ui.setRideState('ride');
+}
+
+/**
+ * 運転モードに入る。
+ *
+ * いちばん長く走れる線路に列車を置き、その運転台へ乗る。運転する列車も
+ * ふつうの `Vehicle` なので、乗車モードのカメラがそのまま使える。
+ */
+function startDriving(): void {
+  if (driving) return;
+  tool.cancel();
+  if (!world.showVehicles) {
+    world.showVehicles = true;
+    ui.setVehicles(true);
+  }
+  const start = longestRailStart(world.laneGraph);
+  if (start === null) {
+    ui.setDriving(false);
+    return;
+  }
+  driving = Driving.start(world.laneGraph, world.traffic, start, {
+    stations: network.stations,
+    structures: world.structures,
+  });
+  if (!driving) {
+    ui.setDriving(false);
+    return;
+  }
+  ui.setDriving(true);
+  // 運転台へ乗る。選ぶ手間は要らない (運転するのはこの 1 本と決まっている)。
+  stopRide();
+  ride.boardVehicle(driving.train);
+  viewport.beginRide();
+  ui.setRideState('ride');
+}
+
+/** 運転をやめ、列車を線路から降ろす。 */
+function stopDriving(): void {
+  if (!driving) return;
+  driving.stop();
+  driving = null;
+  ui.setDriving(false);
+  stopRide();
 }
 
 /** 乗車モードから降り (選択中ならやめ)、元の視点に戻す。 */
@@ -389,6 +447,18 @@ canvas.addEventListener('contextmenu', (event) => event.preventDefault());
 
 window.addEventListener('keydown', (event) => {
   if (isTextControl(event.target)) return;
+  // 運転中は運転台の表だけを引く。敷設の道具とキーが重なるが、ハンドルを
+  // 握っている間は線路を敷かないので取り合いにならない。運転をやめる
+  // (G / Esc) だけは通す。
+  if (driving && !isDrivingExit(event.key)) {
+    const action = lookupDrivingKey(event.key);
+    if (action) {
+      if (action.kind === 'driver') driving.apply(action.command);
+      else driving.hold(action.command);
+      event.preventDefault();
+    }
+    return;
+  }
   const panKey = event.key.toLowerCase();
   if (panKey in PAN_KEYS && !event.ctrlKey && !event.metaKey && !event.altKey) {
     heldPanKeys.add(panKey);
@@ -397,13 +467,19 @@ window.addEventListener('keydown', (event) => {
   }
   switch (event.key) {
     case 'Escape':
-      if (ride.active || ride.aiming) stopRide();
+      if (driving) stopDriving();
+      else if (ride.active || ride.aiming) stopRide();
       else tool.cancel();
       break;
     case 'f':
     case 'F':
       if (ride.active || ride.aiming) stopRide();
       else startRide();
+      break;
+    case 'g':
+    case 'G':
+      if (driving) stopDriving();
+      else startDriving();
       break;
     case 'n':
     case 'N':
@@ -458,16 +534,29 @@ window.addEventListener('keydown', (event) => {
   if (event.key === 'Control' || event.key === 'Meta') modifiers.noSnap = true;
 });
 
+/** 運転中でも通すキー (運転をやめる操作)。 */
+function isDrivingExit(key: string): boolean {
+  return key === 'Escape' || key === 'g' || key === 'G';
+}
+
 window.addEventListener('keyup', (event) => {
   heldPanKeys.delete(event.key.toLowerCase());
   if (isTextControl(event.target)) return;
+  if (driving) {
+    const action = lookupDrivingKey(event.key);
+    if (action?.kind === 'held') driving.release(action.command);
+  }
   if (event.key === 'Shift') modifiers.straight = false;
   if (event.key === 'Control' || event.key === 'Meta') modifiers.noSnap = false;
 });
 
 // 画面から離れている間のキーの上げ下げは届かない。押しっぱなしのまま
 // 動き続けないよう、戻ってきたら忘れる。
-window.addEventListener('blur', () => heldPanKeys.clear());
+window.addEventListener('blur', () => {
+  heldPanKeys.clear();
+  // 画面から離れている間のキーの上げは届かない。警笛が鳴りっぱなしになる。
+  driving?.releaseAll();
+});
 
 function isTextControl(target: EventTarget | null): boolean {
   return (
@@ -489,6 +578,9 @@ function frame(): void {
 
   if (dirty) {
     dirty = false;
+    // 敷設し直すと車線グラフが作り直され、走っている車両は捨てられる。
+    // 運転している列車もそこで居場所を失うので、先に降ろす。
+    stopDriving();
     const result = world.rebuild();
     ui.updateBuild(result);
   }
@@ -500,6 +592,9 @@ function frame(): void {
   }
 
   updateKeyboardPan(dt);
+  // 運転入力は `world.animate` (= `traffic.step`) より前に積む。他の車両は
+  // このフレームの列車の位置を見て車間を測るので、先に動かしておく。
+  driving?.update(dt);
   // 警告の目印は、しばらくしたら自分で消える。
   if (focusUntil > 0 && now >= focusUntil) {
     focusUntil = 0;
@@ -514,7 +609,7 @@ function frame(): void {
 
   // 乗車中・選択中は敷設のプレビューを出さない。
   tool.update(ride.active || ride.aiming ? null : cursor, modifiers);
-  ui.updateStatus(tool.status(), riding);
+  ui.updateStatus(tool.status(), riding, driving?.status() ?? null);
   viewport.render();
   requestAnimationFrame(frame);
 }
